@@ -1,33 +1,34 @@
 # RF Sentinel
 
-RF Sentinel is an autonomous, RX-only RF spectrum monitoring server for Raspberry Pi Compute Module 4 systems. It is intended to continuously observe configured spectrum ranges, detect notable RF activity, retain useful event and historical data, and make daily findings available through a Telegram bot.
+RF Sentinel — автономний сервер моніторингу RF-спектра, що працює лише на приймання (RX-only), для систем на базі Raspberry Pi Compute Module 4. Він призначений для безперервного спостереження за налаштованими діапазонами спектра, виявлення помітної RF-активності, збереження корисних даних про події та історії спостережень, а також надання щоденних результатів через Telegram-бота.
 
-The project focuses on spectrum observation and signal characterization. It is not intended to decrypt protected communications, bypass access controls, or intercept private communication content.
+Проєкт зосереджений на спостереженні за спектром і визначенні характеристик сигналів. Він не призначений для розшифрування захищених комунікацій, обходу контролю доступу або перехоплення вмісту приватних комунікацій.
 
-## Project status
+## Стан проєкту
 
-The project is in the **SYSTEM ARCHITECTURE** phase. See [the project definition](docs/PROJECT.md) and [current status](docs/STATUS.md).
+Проєкт перебуває на етапі **SYSTEM ARCHITECTURE**. Див. [визначення проєкту](docs/PROJECT.md) і [поточний стан](docs/STATUS.md).
 
-## Scope of the first prototype
+## Межі першого прототипу
 
-The first prototype will establish a safe, repeatable basis for unattended observation with supported SDR hardware. Requirements and the initial system architecture are documented, and the SDR device architecture has been drafted for review. Quantitative thresholds, final persistence technology, device-specific limits, and other evidence-dependent decisions remain unresolved pending architecture review and evidence from CM4 experiments.
+Перший прототип створить безпечну й відтворювану основу для спостереження без постійної участі оператора з використанням підтримуваного SDR-обладнання. Вимоги та початкова архітектура системи задокументовані, а проєкт архітектури SDR-пристроїв підготовлено до review. Кількісні пороги, остаточна технологія зберігання даних, обмеження конкретних пристроїв та інші рішення, що потребують підтвердження результатами досліджень, залишаються невизначеними до review архітектури й отримання результатів експериментів на CM4.
 
-## Target environment
+## Цільове середовище
 
 - Raspberry Pi Compute Module 4
 - Linux ARM64
-- RX-only operation
-- RTL-SDR and HackRF SDR devices
+- Робота лише на приймання (RX-only)
+- SDR-пристрої RTL-SDR і HackRF
 
-## Documentation
+## Документація
 
-- [Project definition](docs/PROJECT.md) — mission, scope, non-goals, and initial terminology.
-- [System requirements](docs/REQUIREMENTS.md) — normative behavior and acceptance expectations.
-- [Project status](docs/STATUS.md) — current phase and review status.
-- [Initial system architecture](docs/ARCHITECTURE.md) — accepted responsibility boundaries, components, and flows.
-- [Architecture decisions](docs/DECISIONS.md) — decision records and their status.
-- [Architecture questions](docs/ARCHITECTURE_QUESTIONS.md) — unresolved questions and required evidence.
-- [SDR device architecture](docs/design/SDR_DEVICE_ARCHITECTURE.md) — detailed Device Manager and Acquisition Adapter design, currently under review.
-- [Existing solutions research](docs/research/EXISTING_SOLUTIONS.md) — non-binding assessment of relevant SDR approaches.
-- [Technology candidates](docs/research/TECHNOLOGY_CANDIDATES.md) — non-binding options register and candidate directions.
-- [CM4 hardware experiments](docs/research/EXPERIMENTS.md) — planned evidence for hardware- and performance-dependent decisions.
+- [Визначення проєкту](docs/PROJECT.md) — місія, межі, те, що не входить до цілей, і початкова термінологія.
+- [Системні вимоги](docs/REQUIREMENTS.md) — нормативна поведінка й очікування щодо приймання.
+- [Стан проєкту](docs/STATUS.md) — поточний етап і стан review.
+- [Мовна політика](docs/LANGUAGE_POLICY.md) — мова документації, технічна термінологія та правила поступового перекладу.
+- [Початкова архітектура системи](docs/ARCHITECTURE.md) — прийняті межі відповідальності, компоненти й потоки.
+- [Архітектурні рішення](docs/DECISIONS.md) — записи рішень та їхні статуси.
+- [Архітектурні питання](docs/ARCHITECTURE_QUESTIONS.md) — невирішені питання й необхідні підтвердження.
+- [Архітектура SDR-пристроїв](docs/design/SDR_DEVICE_ARCHITECTURE.md) — детальний дизайн Device Manager і Acquisition Adapter, що наразі проходить review.
+- [Дослідження наявних рішень](docs/research/EXISTING_SOLUTIONS.md) — оцінка відповідних SDR-підходів, яка не встановлює обов'язкових рішень.
+- [Технологічні кандидати](docs/research/TECHNOLOGY_CANDIDATES.md) — реєстр варіантів і можливих напрямів, який не встановлює обов'язкових рішень.
+- [Експерименти з обладнанням CM4](docs/research/EXPERIMENTS.md) — заплановані перевірки для обґрунтування рішень, залежних від обладнання та продуктивності.

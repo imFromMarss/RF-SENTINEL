@@ -1,20 +1,20 @@
-# RF Sentinel — Status
+# RF Sentinel — Стан проєкту
 
-**Current phase:** SYSTEM ARCHITECTURE
+**Поточний етап:** SYSTEM ARCHITECTURE
 
-## Completed
+## Завершено
 
-- Repository initialization
-- Project definition
-- Requirements engineering
-- Existing solutions research
-- Technology candidate research
-- Initial system architecture
+- Ініціалізація репозиторію
+- Визначення проєкту
+- Розроблення вимог
+- Дослідження наявних рішень
+- Дослідження технологічних кандидатів
+- Початкова архітектура системи
 
-## Current work
+## Поточна робота
 
-- SDR Device Architecture review. The design document has been drafted and is present in `docs/design/SDR_DEVICE_ARCHITECTURE.md`; its existence does not indicate formal acceptance.
+- Review архітектури SDR-пристроїв (SDR Device Architecture). Проєкт документа підготовлено й розміщено в `docs/design/SDR_DEVICE_ARCHITECTURE.md`; його наявність не означає формального прийняття.
 
-## Next
+## Наступний крок
 
-- Remain in SYSTEM ARCHITECTURE until the SDR Device Architecture review is complete.
+- Залишатися на етапі SYSTEM ARCHITECTURE до завершення review архітектури SDR-пристроїв.

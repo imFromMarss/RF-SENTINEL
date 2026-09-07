@@ -10,7 +10,7 @@ The project is in the **SYSTEM ARCHITECTURE** phase. See [the project definition
 
 ## Scope of the first prototype
 
-The first prototype will establish a safe, repeatable basis for unattended observation with supported SDR hardware. Requirements and the initial system architecture are documented, and the SDR device architecture has been drafted for review. Quantitative thresholds, final persistence technology, device-specific limits, and other evidence-dependent decisions remain unresolved pending requirements, review, and CM4 experiments.
+The first prototype will establish a safe, repeatable basis for unattended observation with supported SDR hardware. Requirements and the initial system architecture are documented, and the SDR device architecture has been drafted for review. Quantitative thresholds, final persistence technology, device-specific limits, and other evidence-dependent decisions remain unresolved pending architecture review and evidence from CM4 experiments.
 
 ## Target environment
 

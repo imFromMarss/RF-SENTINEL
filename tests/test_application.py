@@ -1,6 +1,13 @@
 import subprocess
 import sys
 
+from rf_sentinel.application import main
+
+
+def test_main_returns_success_and_prints_identity(capsys):
+    assert main() == 0
+    assert capsys.readouterr().out == "RF Sentinel\n"
+
 
 def test_application_runs_without_hardware(tmp_path):
     result = subprocess.run(

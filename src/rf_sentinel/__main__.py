@@ -1,2 +1,5 @@
+from rf_sentinel.application import main
+
+
 if __name__ == "__main__":
-    print("RF Sentinel")
+    raise SystemExit(main())

@@ -101,7 +101,7 @@
 
 ## ADR-012: Use Python as the primary station application language
 
-- **Status:** PROPOSED
+- **Status:** ACCEPTED
 - **Контекст:** Station application RF Sentinel переважно виконує orchestration, scheduling, configuration/validation, керування станом, координацію SDR reservations, subprocess supervision, normalization/control flow, orchestration зберігання даних, reporting, Telegram integration та health/recovery. Початкова архітектура не вимагає виконувати весь real-time RF/DSP pipeline основною мовою станції: acquisition implementations можуть бути зовнішніми процесами за Acquisition Adapter boundary. `rtl_power` / `hackrf_sweep` залишаються evidence-gated experimental baseline candidates за ADR-003, а не постійно закріпленими implementations.
 - **Запропоноване рішення:** Використовувати Python як основну мову реалізації station application, не обмежуючи repository лише Python. Зберігати Acquisition Adapter та інші архітектурні межі незалежними від мови реалізації. Допускати майбутні C/C++/Rust та інші native implementations через явні контракти, якщо їхню потребу підтвердять profiling та evidence. Не переносити performance-critical DSP у pure Python без вимірювань, які підтверджують його придатність для цільового навантаження.
 - **Організація source/package:** Для початкової організації рекомендується `src/` з одним основним application package та окремі `tests/`. Це наслідок рішення для організації repository/package, який можна переглянути, а не незмінне обмеження архітектури системи. Логічні компоненти можуть бути modules/interfaces усередині одного package; відповідність «architecture component = package» не запроваджується. Цей ADR не створює source code або scaffold.

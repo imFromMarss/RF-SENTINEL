@@ -23,5 +23,3 @@ def test_real_waterfall_render(scan_result, tmp_path):
         assert image.format == "PNG"
         assert image.width > 800 and image.height > 300
         assert image.convert("L").getextrema()[0] < image.convert("L").getextrema()[1]
-
-

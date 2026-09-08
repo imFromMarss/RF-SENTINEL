@@ -35,7 +35,8 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 
 ## Локальний survey pipeline
 
-Доступний diagnostic prototype: `rtl_power → report/waterfall → optional Telegram`.
+Доступний diagnostic pipeline: `rtl_power → report/heatmap → optional Telegram`.
 `python -m rf_sentinel` зберігає попередню identity-only поведінку; режими `survey`
-і `schedule` запускають application workflow. Налаштування, локальні команди,
-hardware-free tests і поточні обмеження описані в [LOCAL_SURVEY.md](docs/LOCAL_SURVEY.md).
+і `schedule` запускають одноразовий або continuous application workflow. Налаштування,
+історичні артефакти, logging, recovery, локальні команди та hardware-free tests описані
+в [LOCAL_SURVEY.md](docs/LOCAL_SURVEY.md).

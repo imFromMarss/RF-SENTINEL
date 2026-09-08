@@ -1,120 +1,153 @@
-# Локальний survey prototype
+# Локальний огляд спектра
 
-Реалізований pipeline: `RTL-SDR → rtl_power → normalized spectrum → report/PNG → Telegram`.
-Це diagnostic survey, без RFEvent, detection, inbound commands чи SDR control через Telegram.
-Майбутній backend реалізує `SpectrumScanner` і повертає `ScanResult`: reporting та transport
-не залежать від CSV або конкретного SDR.
+RF Sentinel виконує RX-only pipeline:
 
-## Встановлення та запуск
+`RTL-SDR → rtl_power → parser → звіт → heatmap → Telegram → наступний огляд`.
 
-Потрібен Python 3.12+. Встановлення Python dependencies:
+Це діагностичне широкосмугове спостереження. Воно не визначає `RFEvent`, не декодує
+вміст і не приймає команди з Telegram. Transport залишається лише вихідним.
+
+## Робочий профіль
+
+Для підключеного `RTL2838UHIDIR` з tuner `R820T` локальна `librtlsdr 2.0.3`
+підтвердила налаштування від `24 MHz` до `1766 MHz` без direct sampling. Перевірка
+включала обидві межі та точки через 10 MHz; driver не повернув помилок або PLL warning
+після початкового калібрування.
+
+Default profile:
+
+| Параметр | Значення |
+| --- | --- |
+| Початок | `24 000 000 Hz` |
+| Кінець | `1 766 000 000 Hz` |
+| Максимальна запитана ширина комірки | `500 000 Hz` |
+| Інтервал накопичення | `60 s` |
+| Тривалість огляду | `1800 s` |
+
+На локальному hardware один контрольний full-range sweep тривав приблизно `23,4 s`.
+Поточний `rtl_power` обрав близько 4984 комірок по `349,518 kHz`. За 30 хвилин
+очікується приблизно 30 часових зрізів. Фактичні межі, ширина комірки й кількість
+проходів записуються в кожному `report.json`; requested values — у `request.json`.
+
+Ці межі є перевіреним профілем поточного tuner, але вони не зашиті в reporting layer.
+Інший backend або діапазон передається через `ScanProfile` та environment configuration.
+
+## Heatmap
+
+`heatmap.png` відображає:
+
+- X — частоту в МГц;
+- Y — локальний час у `RF_SENTINEL_TIMEZONE`;
+- один горизонтальний рядок — один завершений sweep/time slice;
+- колір — виміряний рівень потужності.
+
+Слабкі рівні темні, далі йдуть фіолетовий, червоний, помаранчевий, жовтий і світлий.
+Візуалізація не інтерполює комірки й не створює проміжні RF-дані. Межі кольорів
+визначаються детермінованими percentile P2/P98 для конкретного огляду: одиничний
+сильний transmitter не приховує решту спектра. Це змінює лише кольори. Peak у звіті
+завжди обчислюється з raw values.
+
+Рівні dB від `rtl_power` не калібровані й придатні для відносного порівняння в межах
+узгодженого setup. Вони не є підтвердженим абсолютним dBm.
+
+## Історичні артефакти
+
+Кожен запуск створює окремий каталог:
+
+```text
+runtime/surveys/YYYYMMDDTHHMMSS.ffffffZ-xxxxxxxx/
+├── request.json
+├── spectrum.csv
+├── spectrum.json
+├── report.json
+├── report.txt
+├── heatmap.png
+└── delivery.json
+```
+
+Каталоги не перезаписуються. `spectrum.csv` — raw output `rtl_power`; `report.json`
+має стабільні machine-readable keys; `report.txt` — український текст для людини;
+`delivery.json` зберігає статус і Telegram message IDs. При помилці acquisition
+залишаються request, доступний raw CSV та failed report. При помилці Telegram локальні
+дані й heatmap зберігаються.
+
+`runtime/status.json` містить поточний process state та лічильники. Operational log:
+`runtime/logs/rf-sentinel.log`. Увесь `runtime/` і `.env` ігноруються Git.
+
+## Continuous operation і відмови
+
+Режим `schedule` запускає перший 30-хвилинний survey одразу. Після успішного report і
+delivery наступний survey починається одразу; scans не перекриваються. Отже нормальний
+темп — приблизно два звіти на годину плюс час rendering/network.
+
+Telegram message та heatmap мають окремий bounded retry: default три спроби з паузою
+5 секунд. Після вичерпання спроб monitoring продовжується. Failed SDR/parser/artifact
+cycle збільшує health counters і використовує 60-секундний recovery delay, щоб уникнути
+tight retry loop. Один failed cycle не завершує process.
+
+`status.json` показує application start, останній start survey, останній успішний survey,
+останню успішну Telegram delivery, послідовні помилки та загальні лічильники.
+Логи мають timestamp, severity і component name; credentials, Telegram URL та response
+body не логуються.
+
+Ctrl+C і `SIGTERM` переривають активний `rtl_power`; child process kill/reap виконується
+в `finally`. Новий cycle після сигналу не запускається. Exit status — 130.
+
+## Configuration
+
+Application читає environment. `.env.example` — безпечний tracked приклад; `.env` не
+завантажується автоматично, тому локально його потрібно експортувати в process:
+
+```sh
+set -a
+source .env
+set +a
+```
+
+Основні поля:
+
+- `RF_SENTINEL_SURVEY_START_HZ`, `RF_SENTINEL_SURVEY_STOP_HZ`;
+- `RF_SENTINEL_SURVEY_BIN_HZ`, `RF_SENTINEL_SURVEY_INTEGRATION_SECONDS`;
+- `RF_SENTINEL_SURVEY_DURATION_SECONDS`;
+- `RF_SENTINEL_RTL_DEVICE_INDEX`, `RF_SENTINEL_RTL_GAIN`;
+- `RF_SENTINEL_TELEGRAM_BOT_TOKEN`, `RF_SENTINEL_TELEGRAM_CHAT_ID`;
+- `RF_SENTINEL_TELEGRAM_ATTEMPTS`, `RF_SENTINEL_TELEGRAM_BACKOFF_SECONDS`;
+- `RF_SENTINEL_SURVEY_RECOVERY_SECONDS`, `RF_SENTINEL_TIMEZONE`;
+- `RF_SENTINEL_DATA_DIR`.
+
+`RF_SENTINEL_REPORT_INTERVAL_MINUTES=30` збережено для сумісності з раннім prototype;
+continuous runner визначає cadence тривалістю survey й запускає наступний успішний cycle
+одразу.
+
+## Запуск і перевірки
 
 ```sh
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e '.[dev]'
-.venv/bin/python -m rf_sentinel
-```
-
-Остання команда, як і раніше, друкує `RF Sentinel` та завершується без hardware/network.
-`rtl_power` встановлюється окремо як host dependency, наприклад із пакета RTL-SDR.
-Наявність executable не означає доступності USB-пристрою.
-
-Application читає лише environment; `.env` автоматично не завантажується.
-`.env.example` містить безпечний приклад. Для локального запуску без Telegram:
-
-```sh
-export RF_SENTINEL_TELEGRAM_BOT_TOKEN=
-export RF_SENTINEL_TELEGRAM_CHAT_ID=
-export RF_SENTINEL_REPORT_INTERVAL_MINUTES=30
-export RF_SENTINEL_RTL_DEVICE_INDEX=0
-export RF_SENTINEL_RTL_GAIN=auto
-export RF_SENTINEL_DATA_DIR=runtime
+.venv/bin/python -m pytest -q
 .venv/bin/python -m rf_sentinel survey
 .venv/bin/python -m rf_sentinel schedule
 ```
 
-`survey` виконує один scan. `schedule` виконує перший scan одразу, потім чекає задану
-кількість хвилин **після завершення** попередньої спроби. Scans послідовні, без overlap
-або catch-up. Ctrl-C завершує application; активний child process примусово зупиняється
-і reap-иться. Systemd/timers поки не інтегровані.
-
-Для Telegram заповніть обидві credentials через локальне захищене environment.
-Не записуйте справжні значення в документацію, shell-команди для спільного review або Git.
-Порожні обидва поля вимикають outbound transport; лише одне заповнене поле — configuration error.
-Підтримуються числовий chat ID або `@channel_username`.
-
-| Параметр | Default | Межі |
-| --- | --- | --- |
-| `RF_SENTINEL_REPORT_INTERVAL_MINUTES` | `30` | Ціле 1–1440 |
-| `RF_SENTINEL_RTL_DEVICE_INDEX` | `0` | Ціле 0–255 |
-| `RF_SENTINEL_RTL_GAIN` | `auto` | `auto`, порожнє або finite 0–50 dB |
-| `RF_SENTINEL_DATA_DIR` | `runtime` | Непорожній шлях; custom directory потребує власного ignore rule |
-
-Requested gain може бути округлений драйвером до підтримуваного значення.
-FM profile — `88–108 MHz`, максимальна ширина bin `125 kHz`, integration `10 s`,
-scan duration `30 s`. Параметри — immutable `ScanProfile` application layer.
-Backend має додатковий timeout `15 s`, CSV limit `16 MiB` і parser limit `250000` values.
-Він не приймає command, executable, додаткові flags чи shell text із configuration.
-Child environment містить тільки `PATH`, `TZ=UTC`, `LC_ALL=C`; stderr відкидається.
-
-## Артефакти та помилки
-
-У data directory зарезервовані чотири application-owned файли:
-
-- `spectrum.json` — останній normalized scan, profile і timestamps;
-- `report.json` — структурований diagnostic report;
-- `report.txt` — текст для локального читання і notification;
-- `waterfall.png` — frequency/time plot із power intensity.
-
-Наступний survey замінює ці файли: довгострокового архіву тут немає.
-Failed scan записує report зі статусом `scan_failed`, без peak та старого waterfall.
-Неповні, неузгоджені або non-finite CSV measurements відхиляються; це не «тихий спектр».
-Parser об'єднує tuning hops за UTC timestamp, перевіряє geometry і враховує дубль
-останнього bin у CSV Osmocom. Peak frequency — центр bin. Power — **некалібровані dB**;
-це не підтверджене абсолютне значення dBm. Sample count — сума поля samples CSV rows,
-а не кількість power values або незалежних фізичних IQ samples.
-
-Waterfall використовує фактичні timestamps integration ends; Y axis — секунди від початку
-scan. Для першого рядка початок інтервалу оцінюється через requested integration time.
-PNG працює через headless Agg backend; graphical desktop не потрібен.
-
-Transport використовує standard-library HTTPS із timeout `15 s`, обмеженим response size
-та без redirects/retries. Non-2xx, Telegram `ok=false`, invalid JSON та network errors
-перетворюються на фіксовані safe errors без URL/token/body. Реалізовані тільки `send_message`
-і `send_photo`; scanner imports у transport відсутні. Локальні artifacts записуються перед
-notification. Delivery failure повертає `notification_status=failed`, не зупиняє scheduler
-і не видаляє локальний scan. Автоматичної черги повторного надсилання поки немає.
-
-`survey` повертає 0 після успішного scan навіть при Telegram failure, 1 при scan/configuration/
-artifact error, 130 при Ctrl-C. Підсумок stdout окремо показує стан Telegram.
-Scheduler записує безпечні статуси та повторює спробу після інтервалу.
-
-## Перевірки
-
-```sh
-.venv/bin/python -m pytest -q
-```
-
-За замовчуванням tests не використовують SDR або Telegram network.
-Hardware test запускається **окремо**, коли під'єднаний вільний RTL-SDR:
+Без аргументів `python -m rf_sentinel` зберігає identity-only поведінку й не торкається
+hardware або network. Default pytest hardware-free. Окремі opt-in перевірки:
 
 ```sh
 RF_SENTINEL_TEST_HARDWARE=1 .venv/bin/python -m pytest -q -m hardware
+RF_SENTINEL_TEST_FULL_RANGE=1 .venv/bin/python -m pytest -q tests/test_hardware.py::test_real_full_range_survey
 ```
 
-Цей test виконує реальний FM scan default device 0, без Telegram.
-Для не-0 device використовуйте `survey` з відповідним environment.
+Другий command займає 30 хвилин і не надсилає Telegram. Для повного operational test
+краще використовувати `python -m rf_sentinel schedule`, бо він перевіряє artifacts,
+delivery, retries, health та logging разом.
 
-## Межі prototype
+Локальний foreground process надалі інтегрується з production supervision через
+`systemd` на Raspberry Pi CM4. Deployment, `systemd` і будь-які дії на Raspberry Pi
+до цього етапу не входять.
 
-Поки запускайте лише один RF Sentinel process для одного SDR. Повний Device Manager,
-міжпроцесні reservations, hotplug recovery, production retention, транзакційне збереження
-групи artifacts та Linux ARM64 endurance verification — наступні етапи. Окремі файли
-замінюються атомарно, але вся група не є транзакцією при process/power failure.
-Історичні architecture documents описують цільову систему, а не повністю реалізовані capabilities.
-
-Єдина пряма runtime Python dependency — `matplotlib`: потрібні headless PNG, підписані осі,
-frequency/time geometry та colorbar. HTTP/config/scheduler використовують standard library.
-
-Формати звірені з [Osmocom rtl_power source](https://github.com/osmocom/rtl-sdr/blob/master/src/rtl_power.c)
-та [Telegram Bot API](https://core.telegram.org/bots/api).
+Формат CSV і поведінку sweep звірено з
+[Osmocom rtl_power](https://github.com/osmocom/rtl-sdr/blob/master/src/rtl_power.c).
+Візуальну концепцію порівняно з
+[keenerd heatmap](https://github.com/keenerd/rtl-sdr-misc/tree/master/heatmap), але код
+RF Sentinel реалізовано самостійно. Delivery відповідає
+[Telegram Bot API](https://core.telegram.org/bots/api).

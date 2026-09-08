@@ -13,6 +13,13 @@ def test_defaults():
     assert settings.rtl_device_index == 0
     assert settings.rtl_gain is None
     assert settings.data_dir == Path("runtime")
+    assert settings.survey_low_hz == 24_000_000
+    assert settings.survey_high_hz == 1_766_000_000
+    assert settings.survey_bin_hz == 500_000
+    assert settings.survey_integration_seconds == 60
+    assert settings.survey_duration_seconds == 1800
+    assert settings.telegram_attempts == 3
+    assert settings.survey_recovery_seconds == 60
     assert not settings.telegram_enabled
 
 
@@ -22,10 +29,22 @@ def test_environment_parsing():
         "RF_SENTINEL_RTL_DEVICE_INDEX": "1",
         "RF_SENTINEL_RTL_GAIN": "20.7",
         "RF_SENTINEL_DATA_DIR": "data/surveys",
+        "RF_SENTINEL_SURVEY_START_HZ": "25000000",
+        "RF_SENTINEL_SURVEY_STOP_HZ": "1700000000",
+        "RF_SENTINEL_SURVEY_BIN_HZ": "600000",
+        "RF_SENTINEL_SURVEY_INTEGRATION_SECONDS": "90",
+        "RF_SENTINEL_SURVEY_DURATION_SECONDS": "1800",
+        "RF_SENTINEL_TELEGRAM_ATTEMPTS": "2",
+        "RF_SENTINEL_TELEGRAM_BACKOFF_SECONDS": "1",
+        "RF_SENTINEL_SURVEY_RECOVERY_SECONDS": "30",
     })
     assert (settings.report_interval_minutes, settings.rtl_device_index) == (5, 1)
     assert settings.rtl_gain == 20.7
     assert settings.data_dir == Path("data/surveys")
+    assert settings.survey_low_hz == 25_000_000
+    assert settings.survey_high_hz == 1_700_000_000
+    assert settings.survey_bin_hz == 600_000
+    assert settings.survey_duration_seconds == 1800
 
 
 @pytest.mark.parametrize("name,value", [
@@ -34,6 +53,11 @@ def test_environment_parsing():
     ("RTL_DEVICE_INDEX", "256"), ("RTL_GAIN", "nan"), ("RTL_GAIN", "inf"),
     ("RTL_GAIN", "-1"), ("RTL_GAIN", "51"), ("DATA_DIR", ""),
     ("DATA_DIR", "a\0b"), ("TELEGRAM_CHAT_ID", "1"),
+    ("SURVEY_START_HZ", "23000000"), ("SURVEY_STOP_HZ", "1766000001"),
+    ("SURVEY_BIN_HZ", "100000"), ("SURVEY_INTEGRATION_SECONDS", "10"),
+    ("SURVEY_DURATION_SECONDS", "1801"), ("TELEGRAM_ATTEMPTS", "0"),
+    ("TELEGRAM_ATTEMPTS", "6"), ("TELEGRAM_BACKOFF_SECONDS", "301"),
+    ("SURVEY_RECOVERY_SECONDS", "0"), ("TIMEZONE", "Mars/Olympus"),
 ])
 def test_invalid_configuration(name, value):
     with pytest.raises(ConfigurationError):

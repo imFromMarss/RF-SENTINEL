@@ -7,7 +7,7 @@ from rf_sentinel.telegram import TelegramNotifier
 
 
 class Connection:
-    def __init__(self, status=200, payload=b'{"ok":true}', failure=None):
+    def __init__(self, status=200, payload=b'{"ok":true,"result":{"message_id":17}}', failure=None):
         self.status = status
         self.payload = payload
         self.failure = failure
@@ -39,7 +39,7 @@ def notifier(connection):
 
 def test_message_post():
     connection = Connection()
-    notifier(connection).send_message("survey complete")
+    assert notifier(connection).send_message("survey complete") == 17
     args, kwargs = connection.calls[0]
     assert args[0] == "POST"
     assert args[1].endswith("/sendMessage")
@@ -51,11 +51,12 @@ def test_photo_upload(tmp_path):
     path = tmp_path / "local-name.png"
     path.write_bytes(b"\x89PNG\r\n\x1a\nsynthetic")
     connection = Connection()
-    notifier(connection).send_photo(path)
+    assert notifier(connection).send_photo(path, "Карта спектра") == 17
     args, kwargs = connection.calls[0]
     assert args[1].endswith("/sendPhoto")
     assert path.read_bytes() in kwargs["body"]
-    assert b'filename="waterfall.png"' in kwargs["body"]
+    assert b'filename="heatmap.png"' in kwargs["body"]
+    assert "Карта спектра".encode() in kwargs["body"]
     assert b"local-name" not in kwargs["body"]
 
 

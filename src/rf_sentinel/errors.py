@@ -1,5 +1,5 @@
 class SentinelError(Exception):
-    """Application failure with a fixed, safe public message."""
+    """Помилка application з фіксованим безпечним повідомленням."""
 
 
 class ConfigurationError(SentinelError):

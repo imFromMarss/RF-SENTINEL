@@ -87,7 +87,7 @@ def test_subprocess_is_bounded_and_environment_isolated(monkeypatch):
     ]
     assert process.kwargs["shell"] is False
     assert process.kwargs["stdin"] == subprocess.DEVNULL
-    assert process.kwargs["stderr"] == subprocess.DEVNULL
+    assert hasattr(process.kwargs["stderr"], "read")
     assert process.kwargs["env"]["TZ"] == "UTC"
     assert "RF_SENTINEL_TELEGRAM_BOT_TOKEN" not in process.kwargs["env"]
     assert result.backend == "rtl_power"
@@ -143,5 +143,22 @@ def test_out_of_range_spectrum_rejected(monkeypatch):
         kwargs["stdout"].write(CSV.splitlines()[0].encode())
         return process
     monkeypatch.setattr(subprocess, "Popen", spawn)
-    with pytest.raises(ScanError, match="cover"):
+    with pytest.raises(ScanError, match="покривають"):
         RTLPowerScanner().scan(ScanProfile())
+
+
+def test_full_range_profile_and_raw_file(monkeypatch, tmp_path):
+    processes = []
+    def spawn(command, **kwargs):
+        process = FakeProcess(command, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    raw = tmp_path / "spectrum.csv"
+    profile = ScanProfile.full_range(24_000_000, 1_766_000_000)
+    with pytest.raises(ScanError, match="покривають"):
+        RTLPowerScanner().scan(profile, raw)
+    assert raw.exists()
+    assert raw.read_text() == CSV
+    assert processes[0].command[2] == "24000000:1766000000:500000"
+    assert processes[0].command[4:7] == ["60", "-e", "1800"]

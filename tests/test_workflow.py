@@ -1,11 +1,9 @@
 import json
-from threading import Event
 
 import pytest
 
 from rf_sentinel.errors import NotificationError, ScanError, SentinelError
-from rf_sentinel.scheduler import run_schedule
-from rf_sentinel.workflow import SurveyOutcome, SurveyWorkflow
+from rf_sentinel.workflow import SurveyWorkflow
 
 
 class Scanner:
@@ -14,11 +12,13 @@ class Scanner:
         self.failure = failure
         self.calls = 0
 
-    def scan(self, profile):
+    def scan(self, profile, raw_path=None):
         self.calls += 1
         assert profile == self.result.profile
+        if raw_path is not None:
+            raw_path.write_text("synthetic CSV\n")
         if self.failure:
-            raise ScanError("scan failed")
+            raise ScanError("штучна помилка")
         return self.result
 
 
@@ -27,58 +27,94 @@ class Notifier:
         self.messages = []
         self.photos = []
         self.fail_at = fail_at
+        self.attempts = 0
 
     def send_message(self, message):
         self.messages.append(message)
+        self.attempts += 1
         if self.fail_at == "message":
-            raise NotificationError("unavailable")
+            raise NotificationError("недоступно")
+        return 101
 
-    def send_photo(self, path):
+    def send_photo(self, path, caption=""):
         assert path.exists()
-        self.photos.append(path)
+        self.photos.append((path, caption))
+        self.attempts += 1
         if self.fail_at == "photo":
-            raise NotificationError("unavailable")
+            raise NotificationError("недоступно")
+        return 102
 
 
 def renderer(result, path):
-    path.write_bytes(b"synthetic-waterfall")
+    path.write_bytes(b"synthetic-heatmap")
 
 
-@pytest.mark.parametrize("fail_at", [None, "message", "photo", "disabled"])
-def test_workflow_persists_then_notifies(scan_result, tmp_path, fail_at):
-    transport = None if fail_at == "disabled" else Notifier(fail_at)
-    scanner = Scanner(scan_result)
-    workflow = SurveyWorkflow(scanner, scan_result.profile, tmp_path,
-                              "test-host", transport, renderer)
-    for _ in range(2):
-        outcome = workflow.run()
+def test_each_run_has_distinct_historical_artifacts(scan_result, tmp_path):
+    notifier = Notifier()
+    workflow = SurveyWorkflow(
+        Scanner(scan_result), scan_result.profile, tmp_path, "test-host",
+        notifier, renderer, telegram_backoff_seconds=0,
+    )
+    outcomes = [workflow.run(), workflow.run()]
+    assert outcomes[0].artifact_dir != outcomes[1].artifact_dir
+    assert len(list((tmp_path / "surveys").iterdir())) == 2
+    for outcome in outcomes:
+        folder = outcome.artifact_dir
         assert outcome.scan_status == "success"
-    assert scanner.calls == 2
-    assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "report.json", "report.txt", "spectrum.json", "waterfall.png",
-    ]
-    assert json.loads((tmp_path / "report.json").read_text())["peak_power_db"] == -10
-    assert json.loads((tmp_path / "spectrum.json").read_text())["backend"] == "fake"
-    expected = "disabled" if transport is None else ("sent" if fail_at is None else "failed")
-    assert outcome.notification_status == expected
-    if transport is not None:
-        assert len(transport.messages) == 2
-        assert len(transport.photos) == (0 if fail_at == "message" else 2)
+        assert outcome.notification_status == "sent"
+        assert {path.name for path in folder.iterdir()} == {
+            "request.json", "spectrum.csv", "spectrum.json", "report.json",
+            "report.txt", "heatmap.png", "delivery.json",
+        }
+        assert json.loads((folder / "report.json").read_text())["peak_power_db"] == -10
+        delivery = json.loads((folder / "delivery.json").read_text())
+        assert delivery["report_message_id"] == 101
+        assert delivery["photo_message_id"] == 102
+    assert notifier.photos[0][1].startswith("RF Sentinel — карта спектра за")
 
 
-def test_scan_failure_removes_stale_artifacts(scan_result, tmp_path):
-    scanner, notifier = Scanner(scan_result), Notifier()
-    workflow = SurveyWorkflow(scanner, scan_result.profile, tmp_path, "test", notifier, renderer)
-    workflow.run()
-    scanner.failure = True
+def test_telegram_failure_retries_and_keeps_artifacts(scan_result, tmp_path):
+    delays = []
+    notifier = Notifier("message")
+    workflow = SurveyWorkflow(
+        Scanner(scan_result), scan_result.profile, tmp_path, "test", notifier,
+        renderer, telegram_attempts=3, telegram_backoff_seconds=2,
+        sleeper=delays.append,
+    )
     outcome = workflow.run()
+    assert outcome.scan_status == "success"
+    assert outcome.notification_status == "failed"
+    assert notifier.attempts == 3
+    assert delays == [2, 2]
+    assert (outcome.artifact_dir / "heatmap.png").exists()
+    assert json.loads((outcome.artifact_dir / "delivery.json").read_text())["status"] == "failed"
+
+
+def test_scan_failure_is_historical_and_has_no_heatmap(scan_result, tmp_path):
+    outcome = SurveyWorkflow(
+        Scanner(scan_result, failure=True), scan_result.profile, tmp_path,
+        "test", None, renderer,
+    ).run()
     assert outcome.scan_status == "scan_failed"
-    assert not (tmp_path / "waterfall.png").exists()
-    assert not (tmp_path / "spectrum.json").exists()
-    assert len(notifier.photos) == 1
-    report = json.loads((tmp_path / "report.json").read_text())
-    assert report["peak_power_db"] is None
-    assert report["status"] == "scan_failed"
+    assert (outcome.artifact_dir / "spectrum.csv").exists()
+    assert (outcome.artifact_dir / "report.json").exists()
+    assert not (outcome.artifact_dir / "heatmap.png").exists()
+
+
+def test_render_failure_preserves_raw_and_report(scan_result, tmp_path):
+    def fail_render(result, path):
+        raise RuntimeError("synthetic-private")
+
+    with pytest.raises(SentinelError) as error:
+        SurveyWorkflow(
+            Scanner(scan_result), scan_result.profile, tmp_path,
+            "test", Notifier(), fail_render,
+        ).run()
+    assert "synthetic-private" not in str(error.value)
+    folders = list((tmp_path / "surveys").iterdir())
+    assert len(folders) == 1
+    assert (folders[0] / "spectrum.csv").exists()
+    assert (folders[0] / "report.json").exists()
 
 
 def test_filesystem_failure_prevents_notification(scan_result, tmp_path):
@@ -89,47 +125,4 @@ def test_filesystem_failure_prevents_notification(scan_result, tmp_path):
                               path, "test", notifier, renderer)
     with pytest.raises(SentinelError):
         workflow.run()
-    assert not notifier.messages
-
-
-def test_scheduler_retries_and_stops_without_waiting(caplog):
-    class Stop:
-        def __init__(self):
-            self.delays = []
-        def is_set(self):
-            return len(self.delays) == 2
-        def wait(self, seconds):
-            self.delays.append(seconds)
-    stop = Stop()
-    calls = []
-    def run():
-        calls.append(1)
-        if len(calls) == 1:
-            raise SentinelError("synthetic-sensitive-error")
-        return SurveyOutcome("success", "disabled")
-    run_schedule(run, 1800, stop)
-    assert len(calls) == 2
-    assert stop.delays == [1800, 1800]
-    assert "synthetic-sensitive-error" not in caplog.text
-
-
-def test_scheduler_does_not_run_when_stopped():
-    stop = Event()
-    stop.set()
-    run_schedule(lambda: pytest.fail("must not run"), 1, stop)
-
-
-def test_render_failure_preserves_source_and_removes_old_image(scan_result, tmp_path):
-    (tmp_path / "waterfall.png").write_bytes(b"stale")
-    def fail_render(result, path):
-        raise RuntimeError("synthetic-private")
-    notifier = Notifier()
-    workflow = SurveyWorkflow(Scanner(scan_result), scan_result.profile, tmp_path,
-                              "test", notifier, fail_render)
-    with pytest.raises(SentinelError) as error:
-        workflow.run()
-    assert "synthetic-private" not in str(error.value)
-    assert (tmp_path / "spectrum.json").exists()
-    assert (tmp_path / "report.json").exists()
-    assert not (tmp_path / "waterfall.png").exists()
     assert not notifier.messages

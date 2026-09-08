@@ -46,15 +46,18 @@ def test_schedule_mode_uses_recovery_delay_and_status_path(monkeypatch, tmp_path
     monkeypatch.setenv("RF_SENTINEL_TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("RF_SENTINEL_TELEGRAM_CHAT_ID", "")
     monkeypatch.setenv("RF_SENTINEL_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("RF_SENTINEL_SURVEY_RECOVERY_SECONDS", "7")
+    monkeypatch.setenv("RF_SENTINEL_SURVEY_RECOVERY_DELAY_SECONDS", "7")
     calls = []
     monkeypatch.setattr(
         "rf_sentinel.scheduler.run_continuous",
-        lambda run, recovery, stop, status: calls.append((run, recovery, stop, status)),
+        lambda run, recovery, stop, status, notify_status=None:
+            calls.append((run, recovery, stop, status, notify_status)),
     )
     assert main(["schedule"]) == 0
     assert calls[0][1] == 7
     assert calls[0][3] == tmp_path / "status.json"
+    assert callable(calls[0][4])
+    assert calls[0][0].__self__.send_failure_reports is False
 
 
 def test_invalid_configuration_has_safe_output(monkeypatch, capsys):
@@ -79,7 +82,7 @@ def test_survey_scan_failure_exit_status(monkeypatch, capsys):
 def test_scheduler_keyboard_interrupt_exit(monkeypatch):
     monkeypatch.setenv("RF_SENTINEL_TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("RF_SENTINEL_TELEGRAM_CHAT_ID", "")
-    def interrupt(*args):
+    def interrupt(*args, **kwargs):
         raise KeyboardInterrupt
     monkeypatch.setattr("rf_sentinel.scheduler.run_continuous", interrupt)
     assert main(["schedule"]) == 130

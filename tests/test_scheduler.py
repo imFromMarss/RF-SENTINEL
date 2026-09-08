@@ -2,8 +2,15 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from rf_sentinel.errors import SentinelError
-from rf_sentinel.scheduler import HealthState, run_continuous
+from rf_sentinel.scheduler import (
+    FAILURE_NOTIFICATION,
+    RECOVERY_NOTIFICATION,
+    HealthState,
+    run_continuous,
+)
 from rf_sentinel.workflow import SurveyOutcome
 
 
@@ -63,3 +70,48 @@ def test_application_error_is_safe_and_retried(tmp_path, caplog):
     assert stop.delays == [20]
     assert state.total_failed_surveys == 1
     assert "synthetic-sensitive-value" not in caplog.text
+
+
+def test_repeated_failures_wait_each_time_and_notify_transitions_only(tmp_path):
+    outcomes = iter((
+        SurveyOutcome("scan_failed", "suppressed", Path("bad-1"),
+                      "2026-09-08T00:00:00+00:00"),
+        SurveyOutcome("scan_failed", "suppressed", Path("bad-2"),
+                      "2026-09-08T00:01:00+00:00"),
+        SurveyOutcome("success", "sent", Path("good"),
+                      "2026-09-08T00:02:00+00:00"),
+    ))
+    notifications = []
+    stop = Stop(3)
+
+    def notify(message):
+        notifications.append(message)
+        return "sent"
+
+    state = run_continuous(
+        lambda: next(outcomes), 60, stop, tmp_path / "status.json",
+        notify_status=notify,
+    )
+
+    assert stop.delays == [60, 60]
+    assert notifications == [FAILURE_NOTIFICATION, RECOVERY_NOTIFICATION]
+    assert state.total_failed_surveys == 2
+    assert state.total_completed_surveys == 1
+    assert state.consecutive_survey_failures == 0
+
+
+def test_shutdown_interrupts_recovery_wait_and_persists_stopped(tmp_path):
+    class InterruptingStop(Stop):
+        def wait(self, seconds):
+            self.delays.append(seconds)
+            raise KeyboardInterrupt
+
+    stop = InterruptingStop(10)
+    with pytest.raises(KeyboardInterrupt):
+        run_continuous(
+            lambda: SurveyOutcome("scan_failed", "suppressed"),
+            60, stop, tmp_path / "status.json",
+        )
+
+    assert stop.delays == [60]
+    assert json.loads((tmp_path / "status.json").read_text())["current_state"] == "stopped"

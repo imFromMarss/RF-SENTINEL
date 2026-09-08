@@ -62,14 +62,17 @@ runtime/surveys/YYYYMMDDTHHMMSS.ffffffZ-xxxxxxxx/
 ├── report.json
 ├── report.txt
 ├── heatmap.png
+├── rtl_power.stderr.txt
+├── scan-diagnostics.json
 └── delivery.json
 ```
 
 Каталоги не перезаписуються. `spectrum.csv` — raw output `rtl_power`; `report.json`
 має стабільні machine-readable keys; `report.txt` — український текст для людини;
 `delivery.json` зберігає статус і Telegram message IDs. При помилці acquisition
-залишаються request, доступний raw CSV та failed report. При помилці Telegram локальні
-дані й heatmap зберігаються.
+залишаються request, доступний raw CSV, bounded stderr, machine-readable diagnostics та
+failed report. `scan-diagnostics.json` фіксує reason і subprocess return code. При
+помилці Telegram локальні дані й heatmap зберігаються.
 
 `runtime/status.json` містить поточний process state та лічильники. Operational log:
 `runtime/logs/rf-sentinel.log`. Увесь `runtime/` і `.env` ігноруються Git.
@@ -84,6 +87,11 @@ Telegram message та heatmap мають окремий bounded retry: default �
 5 секунд. Після вичерпання спроб monitoring продовжується. Failed SDR/parser/artifact
 cycle збільшує health counters і використовує 60-секундний recovery delay, щоб уникнути
 tight retry loop. Один failed cycle не завершує process.
+
+Перший failed cycle у послідовності надсилає один Telegram alert про автоматичне
+відновлення. Однакові alerts для наступних consecutive failures пригнічуються й
+залишаються лише в локальному log. Перший успішний survey після failure state надсилає
+окреме повідомлення про відновлення, після чого normal report delivery продовжується.
 
 `status.json` показує application start, останній start survey, останній успішний survey,
 останню успішну Telegram delivery, послідовні помилки та загальні лічильники.
@@ -112,7 +120,7 @@ set +a
 - `RF_SENTINEL_RTL_DEVICE_INDEX`, `RF_SENTINEL_RTL_GAIN`;
 - `RF_SENTINEL_TELEGRAM_BOT_TOKEN`, `RF_SENTINEL_TELEGRAM_CHAT_ID`;
 - `RF_SENTINEL_TELEGRAM_ATTEMPTS`, `RF_SENTINEL_TELEGRAM_BACKOFF_SECONDS`;
-- `RF_SENTINEL_SURVEY_RECOVERY_SECONDS`, `RF_SENTINEL_TIMEZONE`;
+- `RF_SENTINEL_SURVEY_RECOVERY_DELAY_SECONDS`, `RF_SENTINEL_TIMEZONE`;
 - `RF_SENTINEL_DATA_DIR`.
 
 `RF_SENTINEL_REPORT_INTERVAL_MINUTES=30` збережено для сумісності з раннім prototype;

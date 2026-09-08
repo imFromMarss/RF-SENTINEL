@@ -7,7 +7,11 @@ class ConfigurationError(SentinelError):
 
 
 class ScanError(SentinelError):
-    pass
+    def __init__(self, message: str, *, reason: str = "unknown",
+                 returncode: int | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.returncode = returncode
 
 
 class ParseError(ScanError):

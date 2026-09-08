@@ -99,7 +99,10 @@ class Settings:
             duration = int(read("SURVEY_DURATION_SECONDS", "1800"))
             telegram_attempts = int(read("TELEGRAM_ATTEMPTS", "3"))
             telegram_backoff = int(read("TELEGRAM_BACKOFF_SECONDS", "5"))
-            recovery = int(read("SURVEY_RECOVERY_SECONDS", "60"))
+            recovery = int(read(
+                "SURVEY_RECOVERY_DELAY_SECONDS",
+                read("SURVEY_RECOVERY_SECONDS", "60"),
+            ))
         except (ValueError, OverflowError):
             raise ConfigurationError("Некоректна числова конфігурація application") from None
         directory = read("DATA_DIR", "runtime")

@@ -29,7 +29,7 @@ class SurveyWorkflow:
                  identity: str, notifier: Notifier | None = None,
                  renderer=None, timezone: str = "Europe/Kyiv",
                  telegram_attempts: int = 3, telegram_backoff_seconds: float = 5,
-                 sleeper=time.sleep):
+                 sleeper=time.sleep, send_failure_reports: bool = True):
         self.scanner = scanner
         self.profile = profile
         self.data_dir = data_dir
@@ -40,6 +40,7 @@ class SurveyWorkflow:
         self.telegram_attempts = telegram_attempts
         self.telegram_backoff_seconds = telegram_backoff_seconds
         self.sleeper = sleeper
+        self.send_failure_reports = send_failure_reports
 
     def _deliver(self, operation, label: str):
         for attempt in range(1, self.telegram_attempts + 1):
@@ -56,6 +57,16 @@ class SurveyWorkflow:
                     self.telegram_backoff_seconds,
                 )
                 self.sleeper(self.telegram_backoff_seconds)
+
+    def notify_status(self, message: str) -> str:
+        if self.notifier is None:
+            return "disabled"
+        try:
+            self._deliver(lambda: self.notifier.send_message(message), "стан monitoring")
+            return "sent"
+        except NotificationError:
+            logger.error("Telegram: не вдалося доставити повідомлення про стан")
+            return "failed"
 
     def run(self) -> SurveyOutcome:
         started = datetime.now(UTC)
@@ -77,10 +88,23 @@ class SurveyWorkflow:
                 result = self.scanner.scan(self.profile, raw_path=folder / "spectrum.csv")
                 report = make_report(result, self.identity, self.timezone)
                 logger.info("Прийом завершено: %d проходів", len(result.spectrum.frames))
-            except ScanError:
+            except ScanError as error:
                 report = failed_report(self.profile, self.identity, started,
                                        time.monotonic() - clock, self.timezone)
-                logger.error("Огляд завершився помилкою прийому або parser")
+                diagnostics = {
+                    "status": "scan_failed",
+                    "reason": error.reason,
+                    "subprocess_returncode": error.returncode,
+                    "stderr_file": (
+                        "rtl_power.stderr.txt"
+                        if (folder / "rtl_power.stderr.txt").exists() else None
+                    ),
+                }
+                (folder / "scan-diagnostics.json").write_text(
+                    json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8"
+                )
+                logger.error("Огляд завершився помилкою: reason=%s returncode=%s",
+                             error.reason, error.returncode)
             (folder / "report.json").write_text(
                 json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
@@ -96,7 +120,7 @@ class SurveyWorkflow:
             raise SentinelError("Не вдалося зберегти або візуалізувати результати огляду") from None
         notification_status = "disabled"
         delivery = {"status": notification_status, "report_message_id": None, "photo_message_id": None}
-        if self.notifier is not None:
+        if self.notifier is not None and (result is not None or self.send_failure_reports):
             try:
                 delivery["report_message_id"] = self._deliver(
                     lambda: self.notifier.send_message(report.to_text()), "звіт"
@@ -111,6 +135,8 @@ class SurveyWorkflow:
             except NotificationError:
                 notification_status = "failed"
                 logger.error("Telegram: вичерпано спроби доставки; локальні артефакти збережено")
+        elif self.notifier is not None:
+            notification_status = "suppressed"
         delivery["status"] = notification_status
         try:
             (folder / "delivery.json").write_text(json.dumps(delivery, indent=2) + "\n", encoding="utf-8")

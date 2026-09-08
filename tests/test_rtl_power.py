@@ -49,6 +49,7 @@ class FakeProcess:
         self.kwargs = kwargs
         self.returncode = 0
         self.killed = False
+        self.terminated = False
         self.waited = False
         kwargs["stdout"].write(CSV.encode())
         kwargs["stdout"].flush()
@@ -66,7 +67,11 @@ class FakeProcess:
         self.killed = True
         self.returncode = -9
 
-    def wait(self):
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout=None):
         self.waited = True
         return self.returncode
 
@@ -95,7 +100,7 @@ def test_subprocess_is_bounded_and_environment_isolated(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["timeout", "exit", "missing", "io", "interrupt", "size"])
-def test_subprocess_failures_and_cleanup(monkeypatch, kind):
+def test_subprocess_failures_and_cleanup(monkeypatch, kind, tmp_path):
     processes = []
     def spawn(command, **kwargs):
         if kind == "missing":
@@ -104,6 +109,9 @@ def test_subprocess_failures_and_cleanup(monkeypatch, kind):
             raise OSError("private")
         process = FakeProcess(command, **kwargs)
         process.returncode = 1 if kind == "exit" else None
+        if kind == "exit":
+            kwargs["stderr"].write(b"synthetic usb failure\n")
+            kwargs["stderr"].flush()
         processes.append(process)
         return process
     monkeypatch.setattr(subprocess, "Popen", spawn)
@@ -117,11 +125,16 @@ def test_subprocess_failures_and_cleanup(monkeypatch, kind):
     if kind == "size":
         monkeypatch.setattr("rf_sentinel.rtl_power.MAX_CSV_BYTES", 10)
     with pytest.raises(KeyboardInterrupt if kind == "interrupt" else ScanError) as error:
-        RTLPowerScanner().scan(ScanProfile())
+        RTLPowerScanner().scan(ScanProfile(), tmp_path / "spectrum.csv")
     assert "private" not in "".join(traceback.format_exception(error.value))
     if processes:
         assert processes[0].waited
-        assert processes[0].killed == (kind != "exit")
+        assert processes[0].terminated == (kind != "exit")
+        assert not processes[0].killed
+    if kind == "exit":
+        assert error.value.reason == "subprocess_exit"
+        assert error.value.returncode == 1
+        assert (tmp_path / "rtl_power.stderr.txt").read_text() == "synthetic usb failure\n"
 
 
 @pytest.mark.parametrize("kwargs", [

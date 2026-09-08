@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
             profile, settings.data_dir, f"RF Sentinel / {socket.gethostname()}", notifier,
             timezone=settings.timezone, telegram_attempts=settings.telegram_attempts,
             telegram_backoff_seconds=settings.telegram_backoff_seconds,
+            send_failure_reports=args.mode == "survey",
         )
         if args.mode == "survey":
             configure_logging(settings.data_dir)
@@ -73,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
             run_continuous(
                 workflow.run, settings.survey_recovery_seconds, stop,
                 settings.data_dir / "status.json",
+                notify_status=workflow.notify_status,
             )
         finally:
             signal.signal(signal.SIGTERM, previous)

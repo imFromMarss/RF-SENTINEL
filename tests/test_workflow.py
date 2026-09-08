@@ -98,7 +98,24 @@ def test_scan_failure_is_historical_and_has_no_heatmap(scan_result, tmp_path):
     assert outcome.scan_status == "scan_failed"
     assert (outcome.artifact_dir / "spectrum.csv").exists()
     assert (outcome.artifact_dir / "report.json").exists()
+    diagnostic = json.loads((outcome.artifact_dir / "scan-diagnostics.json").read_text())
+    assert diagnostic["status"] == "scan_failed"
+    assert diagnostic["reason"] == "unknown"
     assert not (outcome.artifact_dir / "heatmap.png").exists()
+
+
+def test_continuous_failure_report_is_suppressed_for_scheduler_alert(scan_result, tmp_path):
+    notifier = Notifier()
+    outcome = SurveyWorkflow(
+        Scanner(scan_result, failure=True), scan_result.profile, tmp_path,
+        "test", notifier, renderer, send_failure_reports=False,
+    ).run()
+
+    assert outcome.scan_status == "scan_failed"
+    assert outcome.notification_status == "suppressed"
+    assert notifier.messages == []
+    delivery = json.loads((outcome.artifact_dir / "delivery.json").read_text())
+    assert delivery["status"] == "suppressed"
 
 
 def test_render_failure_preserves_raw_and_report(scan_result, tmp_path):

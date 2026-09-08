@@ -79,7 +79,10 @@ def parse_rtl_power(lines: Iterable[str]) -> SpectrumData:
             frames.append(SpectrumFrame(stamp, tuple(powers), samples))
         return SpectrumData(shared_edges, tuple(frames))
     except (ValueError, IndexError, OverflowError, csv.Error):
-        raise ParseError("Некоректні або неузгоджені дані спектра rtl_power") from None
+        raise ParseError(
+            "Некоректні або неузгоджені дані спектра rtl_power",
+            reason="parser_malformed",
+        ) from None
 
 
 class RTLPowerScanner:
@@ -108,7 +111,10 @@ class RTLPowerScanner:
             with ExitStack() as stack:
                 output = stack.enter_context(raw_path.open("xb+") if raw_path is not None
                                              else tempfile.TemporaryFile())
-                diagnostics = stack.enter_context(tempfile.TemporaryFile())
+                diagnostics = stack.enter_context(
+                    raw_path.with_name("rtl_power.stderr.txt").open("xb+")
+                    if raw_path is not None else tempfile.TemporaryFile()
+                )
                 # Файлові буфери обмежують використання RAM; raw CSV зберігається і при відмові.
                 with subprocess.Popen(
                     command, shell=False, stdin=subprocess.DEVNULL, stdout=output,
@@ -117,18 +123,37 @@ class RTLPowerScanner:
                     try:
                         while process.poll() is None:
                             if time.monotonic() - started > profile.duration_seconds + max(15, profile.integration_seconds + 30):
-                                raise ScanError("Перевищено час очікування сканування rtl_power")
+                                raise ScanError(
+                                    "Перевищено час очікування сканування rtl_power",
+                                    reason="timeout",
+                                )
                             if os.fstat(output.fileno()).st_size > MAX_CSV_BYTES:
-                                raise ScanError("Дані rtl_power перевищили ліміт розміру")
+                                raise ScanError(
+                                    "Дані rtl_power перевищили ліміт розміру",
+                                    reason="output_too_large",
+                                )
                             if os.fstat(diagnostics.fileno()).st_size > 1024 * 1024:
-                                raise ScanError("Діагностика rtl_power перевищила ліміт розміру")
+                                raise ScanError(
+                                    "Діагностика rtl_power перевищила ліміт розміру",
+                                    reason="stderr_too_large",
+                                )
                             time.sleep(0.05)
                     finally:
                         if process.poll() is None:
-                            process.kill()
-                        process.wait()
+                            process.terminate()
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
+                        else:
+                            process.wait()
                     if process.returncode != 0:
-                        raise ScanError("Помилка rtl_power; перевірте доступність пристрою")
+                        raise ScanError(
+                            "Помилка rtl_power; перевірте доступність пристрою",
+                            reason="subprocess_exit",
+                            returncode=process.returncode,
+                        )
                 diagnostics.seek(0)
                 diagnostic = diagnostics.read(1024 * 1024 + 1)
                 tuner = "R820T" if b"R820T" in diagnostic else "невідомо"
@@ -136,20 +161,34 @@ class RTLPowerScanner:
                     tuner = "R828D"
                 # Один PLL warning можливий при початковому калібруванні до налаштування частоти.
                 if diagnostic.count(b"PLL not locked") > 1 or b"No valid PLL" in diagnostic:
-                    raise ScanError("Тюнер не підтвердив стабільне налаштування частоти")
+                    raise ScanError(
+                        "Тюнер не підтвердив стабільне налаштування частоти",
+                        reason="tuner_pll",
+                    )
                 output.seek(0)
                 raw = output.read(MAX_CSV_BYTES + 1)
                 if len(raw) > MAX_CSV_BYTES:
-                    raise ScanError("Дані rtl_power перевищили ліміт розміру")
+                    raise ScanError(
+                        "Дані rtl_power перевищили ліміт розміру",
+                        reason="output_too_large",
+                    )
             spectrum = parse_rtl_power(raw.decode("ascii").splitlines())
         except FileNotFoundError:
-            raise ScanError("Програму rtl_power не встановлено") from None
+            raise ScanError(
+                "Програму rtl_power не встановлено", reason="executable_missing"
+            ) from None
         except (OSError, UnicodeError):
-            raise ScanError("Помилка введення/виведення під час прийому rtl_power") from None
+            raise ScanError(
+                "Помилка введення/виведення під час прийому rtl_power",
+                reason="io_error",
+            ) from None
         if (spectrum.edges_hz[0] > profile.low_hz + profile.bin_hz
                 or spectrum.edges_hz[-1] < profile.high_hz - profile.bin_hz
                 or spectrum.edges_hz[0] < profile.low_hz - profile.bin_hz
                 or spectrum.edges_hz[-1] > profile.high_hz + profile.bin_hz):
-            raise ScanError("Дані rtl_power не покривають запитаний діапазон огляду")
+            raise ScanError(
+                "Дані rtl_power не покривають запитаний діапазон огляду",
+                reason="incomplete_coverage",
+            )
         return ScanResult("rtl_power", profile, started_at,
                           time.monotonic() - started, spectrum, "RTL-SDR", tuner, self._gain)

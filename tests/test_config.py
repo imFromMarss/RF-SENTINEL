@@ -36,7 +36,7 @@ def test_environment_parsing():
         "RF_SENTINEL_SURVEY_DURATION_SECONDS": "1800",
         "RF_SENTINEL_TELEGRAM_ATTEMPTS": "2",
         "RF_SENTINEL_TELEGRAM_BACKOFF_SECONDS": "1",
-        "RF_SENTINEL_SURVEY_RECOVERY_SECONDS": "30",
+        "RF_SENTINEL_SURVEY_RECOVERY_DELAY_SECONDS": "30",
     })
     assert (settings.report_interval_minutes, settings.rtl_device_index) == (5, 1)
     assert settings.rtl_gain == 20.7
@@ -45,6 +45,7 @@ def test_environment_parsing():
     assert settings.survey_high_hz == 1_700_000_000
     assert settings.survey_bin_hz == 600_000
     assert settings.survey_duration_seconds == 1800
+    assert settings.survey_recovery_seconds == 30
 
 
 @pytest.mark.parametrize("name,value", [
@@ -57,11 +58,24 @@ def test_environment_parsing():
     ("SURVEY_BIN_HZ", "100000"), ("SURVEY_INTEGRATION_SECONDS", "10"),
     ("SURVEY_DURATION_SECONDS", "1801"), ("TELEGRAM_ATTEMPTS", "0"),
     ("TELEGRAM_ATTEMPTS", "6"), ("TELEGRAM_BACKOFF_SECONDS", "301"),
-    ("SURVEY_RECOVERY_SECONDS", "0"), ("TIMEZONE", "Mars/Olympus"),
+    ("SURVEY_RECOVERY_DELAY_SECONDS", "0"), ("TIMEZONE", "Mars/Olympus"),
 ])
 def test_invalid_configuration(name, value):
     with pytest.raises(ConfigurationError):
         Settings.from_env({"RF_SENTINEL_" + name: value})
+
+
+def test_legacy_recovery_setting_remains_supported():
+    assert Settings.from_env({
+        "RF_SENTINEL_SURVEY_RECOVERY_SECONDS": "17",
+    }).survey_recovery_seconds == 17
+
+
+def test_preferred_recovery_setting_overrides_legacy_name():
+    assert Settings.from_env({
+        "RF_SENTINEL_SURVEY_RECOVERY_DELAY_SECONDS": "23",
+        "RF_SENTINEL_SURVEY_RECOVERY_SECONDS": "17",
+    }).survey_recovery_seconds == 23
 
 
 def test_sensitive_invalid_value_not_in_traceback():

@@ -14,6 +14,12 @@ from rf_sentinel.errors import SentinelError
 
 logger = logging.getLogger(__name__)
 
+FAILURE_NOTIFICATION = (
+    "RF Sentinel: сканування завершилося помилкою. "
+    "Система спробує відновити роботу автоматично."
+)
+RECOVERY_NOTIFICATION = "RF Sentinel: моніторинг спектра відновлено."
+
 
 @dataclass
 class HealthState:
@@ -53,6 +59,13 @@ class HealthState:
         elif outcome.notification_status == "failed":
             self.consecutive_telegram_failures += 1
 
+    def record_notification(self, status: str) -> None:
+        if status == "sent":
+            self.consecutive_telegram_failures = 0
+            self.last_telegram_success_at = datetime.now(UTC).isoformat()
+        elif status == "failed":
+            self.consecutive_telegram_failures += 1
+
 
 def write_status(path: Path, state: HealthState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +81,8 @@ def write_status(path: Path, state: HealthState) -> None:
 
 
 def run_continuous(run_survey: Callable, recovery_seconds: float, stop: Event,
-                   status_path: Path, state: HealthState | None = None) -> HealthState:
+                   status_path: Path, state: HealthState | None = None,
+                   notify_status: Callable[[str], str] | None = None) -> HealthState:
     if not 0 < recovery_seconds <= 3600:
         raise ValueError("Некоректна затримка відновлення")
     state = state or HealthState.started()
@@ -79,6 +93,7 @@ def run_continuous(run_survey: Callable, recovery_seconds: float, stop: Event,
             state.current_state = "scanning"
             state.last_survey_started_at = datetime.now(UTC).isoformat()
             write_status(status_path, state)
+            failures_before_cycle = state.consecutive_survey_failures
             try:
                 outcome = run_survey()
             except SentinelError:
@@ -86,11 +101,22 @@ def run_continuous(run_survey: Callable, recovery_seconds: float, stop: Event,
                 state.total_failed_surveys += 1
                 state.consecutive_survey_failures += 1
                 state.current_state = "recovering"
+                if failures_before_cycle == 0 and notify_status is not None:
+                    state.record_notification(notify_status(FAILURE_NOTIFICATION))
+                elif failures_before_cycle > 0:
+                    logger.info("Повторна помилка; Telegram alert пригнічено")
                 write_status(status_path, state)
                 if stop.wait(recovery_seconds):
                     break
                 continue
             state.record(outcome)
+            if outcome.scan_status != "success":
+                if failures_before_cycle == 0 and notify_status is not None:
+                    state.record_notification(notify_status(FAILURE_NOTIFICATION))
+                elif failures_before_cycle > 0:
+                    logger.info("Повторна помилка; Telegram alert пригнічено")
+            elif failures_before_cycle > 0 and notify_status is not None:
+                state.record_notification(notify_status(RECOVERY_NOTIFICATION))
             write_status(status_path, state)
             logger.info(
                 "Цикл завершено: сканування=%s, Telegram=%s, успішних=%d, невдалих=%d",

@@ -32,3 +32,10 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 - [Дослідження наявних рішень](docs/research/EXISTING_SOLUTIONS.md) — оцінка відповідних SDR-підходів, яка не встановлює обов'язкових рішень.
 - [Технологічні кандидати](docs/research/TECHNOLOGY_CANDIDATES.md) — реєстр варіантів і можливих напрямів, який не встановлює обов'язкових рішень.
 - [Експерименти з обладнанням CM4](docs/research/EXPERIMENTS.md) — заплановані перевірки для обґрунтування рішень, залежних від обладнання та продуктивності.
+
+## Локальний survey pipeline
+
+Доступний diagnostic prototype: `rtl_power → report/waterfall → optional Telegram`.
+`python -m rf_sentinel` зберігає попередню identity-only поведінку; режими `survey`
+і `schedule` запускають application workflow. Налаштування, локальні команди,
+hardware-free tests і поточні обмеження описані в [LOCAL_SURVEY.md](docs/LOCAL_SURVEY.md).

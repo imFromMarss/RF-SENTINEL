@@ -17,6 +17,10 @@
   scanner/parser, normalized spectrum, persistent SQLite storage, report/PNG,
   calendar report scheduler та outbound/inbound Telegram boundary.
   Запуск і обмеження: [LOCAL_SURVEY.md](LOCAL_SURVEY.md).
+- Stage 6A–6C сформували canonical `station` runtime: один process із internal
+  acquisition, async SQLite persistence, report scheduler, Telegram boundary та
+  process-wide lock `DATA_DIR/station.lock`. Standalone `acquire` і
+  `report-schedule` залишаються diagnostic modes.
 - Звичайні tests hardware-free; реальні SDR/Telegram та Linux ARM64 verification
   залишаються окремими integration/host перевірками.
 

@@ -87,11 +87,25 @@ Continuous `acquire` зберігає sweep-и й bounded incident history у
 snapshot і counters; operational log — `runtime/logs/rf-sentinel.log`. Увесь `runtime/`
 і `.env` ігноруються Git.
 
+## Canonical station deployment
+
+Для deployment topology використовується один process:
+
+```sh
+python -m rf_sentinel station
+```
+
+Він містить internal continuous acquisition, async SQLite persistence, report scheduler,
+Telegram inbound/outbound і supervised `rtl_power` child processes. Process-wide exclusive
+lock розташований у `DATA_DIR/station.lock`; другий `station` instance fail-fast із safe
+diagnostic і не запускає жоден компонент. `acquire` і `report-schedule` залишаються
+standalone/diagnostic режимами, але не є production topology.
+
 ## Continuous operation і відмови
 
 Для production-подібного current pipeline
-використовуються `acquire` і `report-schedule`: acquisition має власний cadence,
-а report scheduler доставляє hourly report на початку кожної години та daily report
+використовується `station`: acquisition має власний cadence,
+а internal report scheduler доставляє hourly report на початку кожної години та daily report
 о 00:00 у `Europe/Kyiv` за замовчуванням. Report generation/delivery не зупиняє acquisition.
 Його рекомендований full-range baseline — `24–1766 MHz`, requested bin `250 kHz`
 і operational cadence budget `60 s`; legacy `500 kHz`/`1800 s` values above do not
@@ -101,6 +115,14 @@ Telegram message, waterfall і heatmap мають окремий bounded retry: 
 5 секунд. Після вичерпання спроб monitoring продовжується. Failed SDR/parser/artifact
 cycle збільшує health counters і використовує 60-секундний recovery delay, щоб уникнути
 tight retry loop. Один failed cycle не завершує process.
+
+Scheduled Telegram delivery має at-least-once semantics. Якщо process падає після send і
+до durable update delivery ledger, відповідний hourly/daily report може бути доставлений
+повторно після restart. Inbound last-hour request також може повторитися після crash до
+Telegram acknowledgement. Exactly-once delivery не заявляється.
+
+Hard crash може втратити bounded queued-but-not-persisted sweeps із async sink. Committed
+SQLite records залишаються authoritative після restart.
 
 Перший failed cycle у послідовності надсилає один Telegram alert про автоматичне
 відновлення. Однакові alerts для наступних consecutive failures пригнічуються й

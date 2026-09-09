@@ -85,9 +85,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_acquisition(settings: Settings) -> int:
     """Складає незалежний acquisition без імпорту reporting і Telegram."""
-    from rf_sentinel.acquisition import LatestSweepSink, SpectrumAcquisitionWorker, SweepProfile
+    from rf_sentinel.acquisition import SpectrumAcquisitionWorker, SweepProfile
     from rf_sentinel.observability import AcquisitionObserver, configure_operational_logging
     from rf_sentinel.rtl_power import RTLPowerScanner
+    from rf_sentinel.storage import SQLiteMeasurementSink
 
     configure_operational_logging(settings.data_dir / "logs", settings.log_max_bytes,
                                   settings.log_backups)
@@ -102,8 +103,9 @@ def run_acquisition(settings: Settings) -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, _shutdown_signal)
+        sink = SQLiteMeasurementSink(settings.data_dir / "sweeps.sqlite3")
         SpectrumAcquisitionWorker(
-            RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), LatestSweepSink(),
+            RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), sink,
             profile, observer, stop, settings.acquisition_cadence_budget_seconds,
             settings.acquisition_recovery_seconds,
         ).run()

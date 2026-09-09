@@ -31,7 +31,7 @@ class AcquisitionHealth:
     configured_start_hz: int
     configured_stop_hz: int
     configured_bin_width_hz: int
-    target_cadence_seconds: float
+    cadence_budget_seconds: float
     recovery_delay_seconds: float
     application_status: str = "starting"
     started_at: str | None = None
@@ -39,6 +39,7 @@ class AcquisitionHealth:
     last_sweep_completed_at: str | None = None
     last_successful_sweep_at: str | None = None
     last_sweep_duration_seconds: float | None = None
+    last_sweep_cadence_seconds: float | None = None
     actual_bin_width_hz: float | None = None
     actual_start_hz: float | None = None
     actual_stop_hz: float | None = None
@@ -52,10 +53,10 @@ class AcquisitionHealth:
 
 
 class AcquisitionObserver:
-    def __init__(self, path, profile, target_seconds, recovery_seconds):
+    def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds):
         self.path = path
         self.state = AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz,
-                                       profile.bin_hz, target_seconds, recovery_seconds)
+                                       profile.bin_hz, cadence_budget_seconds, recovery_seconds)
         self.logger = logging.getLogger("rf_sentinel.acquisition")
 
     def event(self, event, message, **context):
@@ -73,14 +74,15 @@ class AcquisitionObserver:
                    start_hz=self.state.configured_start_hz,
                    stop_hz=self.state.configured_stop_hz,
                    bin_width_hz=self.state.configured_bin_width_hz,
-                   target_seconds=self.state.target_cadence_seconds,
+                   cadence_budget_seconds=self.state.cadence_budget_seconds,
                    recovery_seconds=self.state.recovery_delay_seconds)
         self.event("backend_initialized", "SDR backend підготовлено; пристрій відкриється під час проходу",
                    backend=self.state.backend)
 
-    def sweep_started(self, now):
+    def sweep_started(self, now, cadence_seconds=None):
         self.state.application_status = "acquiring"
         self.state.last_sweep_started_at = now.isoformat()
+        self.state.last_sweep_cadence_seconds = cadence_seconds
         self.save()
         self.event("sweep_started", "Розпочато прохід спектра")
 

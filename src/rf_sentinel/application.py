@@ -95,7 +95,7 @@ def run_acquisition(settings: Settings) -> int:
                            settings.acquisition_bin_hz)
     stop = Event()
     observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
-                                   settings.acquisition_target_seconds,
+                                   settings.acquisition_cadence_budget_seconds,
                                    settings.acquisition_recovery_seconds)
     previous = {}
     try:
@@ -104,7 +104,7 @@ def run_acquisition(settings: Settings) -> int:
             signal.signal(sig, _shutdown_signal)
         SpectrumAcquisitionWorker(
             RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), LatestSweepSink(),
-            profile, observer, stop, settings.acquisition_target_seconds,
+            profile, observer, stop, settings.acquisition_cadence_budget_seconds,
             settings.acquisition_recovery_seconds,
         ).run()
         return 0

@@ -18,6 +18,7 @@ def test_defaults():
     assert settings.survey_bin_hz == 500_000
     assert settings.survey_integration_seconds == 60
     assert settings.survey_duration_seconds == 1800
+    assert settings.acquisition_cadence_budget_seconds == 60
     assert settings.telegram_attempts == 3
     assert settings.survey_recovery_seconds == 60
     assert not settings.telegram_enabled
@@ -37,6 +38,7 @@ def test_environment_parsing():
         "RF_SENTINEL_TELEGRAM_ATTEMPTS": "2",
         "RF_SENTINEL_TELEGRAM_BACKOFF_SECONDS": "1",
         "RF_SENTINEL_SURVEY_RECOVERY_DELAY_SECONDS": "30",
+        "RF_SENTINEL_ACQUISITION_CADENCE_BUDGET_SECONDS": "75",
     })
     assert (settings.report_interval_minutes, settings.rtl_device_index) == (5, 1)
     assert settings.rtl_gain == 20.7
@@ -46,6 +48,7 @@ def test_environment_parsing():
     assert settings.survey_bin_hz == 600_000
     assert settings.survey_duration_seconds == 1800
     assert settings.survey_recovery_seconds == 30
+    assert settings.acquisition_cadence_budget_seconds == 75
 
 
 @pytest.mark.parametrize("name,value", [

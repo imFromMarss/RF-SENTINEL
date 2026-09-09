@@ -58,7 +58,7 @@ class ClockStop:
         return self.stopped
 
 
-@pytest.mark.parametrize("duration, expected", [(7, [3, 3]), (10, []), (12, [])])
+@pytest.mark.parametrize("duration, expected", [(7, [53, 53]), (60, []), (62, [])])
 def test_cadence_sink_no_overlap(tmp_path, duration, expected):
     clock = ClockStop()
     sink = LatestSweepSink()
@@ -70,16 +70,19 @@ def test_cadence_sink_no_overlap(tmp_path, duration, expected):
         if len(starts) == 2:
             clock.set()
         return frame(duration)
-    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60)
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 60, 60)
     SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), sink, SweepProfile(),
                               observer, clock, monotonic=lambda: clock.time, now=lambda: NOW).run()
-    assert starts == [0, max(10, duration)]
+    assert starts == [0, max(60, duration)]
     assert clock.waits == expected
     assert sink.latest == frame(duration)
     health = json.loads((tmp_path / "health.json").read_text())
     assert health["total_sweeps"] == 2
     assert health["application_status"] == "stopped"
     assert health["actual_bin_width_hz"] == 1e6
+    assert health["cadence_budget_seconds"] == 60
+    assert health["last_sweep_duration_seconds"] == duration
+    assert health["last_sweep_cadence_seconds"] == max(60, duration)
 
 
 def test_failure_recovery_and_secret_safe_logs(tmp_path, caplog):
@@ -167,7 +170,7 @@ def test_lock_excludes_second_scanner(monkeypatch):
             RTLPowerScanner(254).acquire(SweepProfile())
 
 
-@pytest.mark.parametrize("env", [{"ACQUISITION_TARGET_SECONDS": "nan"},
+@pytest.mark.parametrize("env", [{"ACQUISITION_CADENCE_BUDGET_SECONDS": "nan"},
     {"ACQUISITION_RECOVERY_SECONDS": "0"}, {"LOG_BACKUPS": "0"},
     {"ACQUISITION_START_HZ": "1"}, {"ACQUISITION_BIN_HZ": "secret"}])
 def test_configuration_bounds(env):
@@ -267,4 +270,4 @@ def test_acquisition_ignores_legacy_report_configuration():
     settings = Settings.from_env({"RF_SENTINEL_SURVEY_BIN_HZ": "invalid",
                                   "RF_SENTINEL_TELEGRAM_ATTEMPTS": "invalid"},
                                  acquisition_only=True)
-    assert settings.acquisition_target_seconds == 10
+    assert settings.acquisition_cadence_budget_seconds == 60

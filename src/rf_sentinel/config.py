@@ -39,7 +39,7 @@ class Settings:
     acquisition_low_hz: int = 24_000_000
     acquisition_high_hz: int = 1_766_000_000
     acquisition_bin_hz: int = 500_000
-    acquisition_target_seconds: float = 10
+    acquisition_cadence_budget_seconds: float = 60
     acquisition_recovery_seconds: float = 60
     log_max_bytes: int = 5_000_000
     log_backups: int = 3
@@ -48,7 +48,7 @@ class Settings:
         validate_device(self.rtl_device_index, self.rtl_gain)
         from rf_sentinel.acquisition import SweepProfile
         SweepProfile(self.acquisition_low_hz, self.acquisition_high_hz, self.acquisition_bin_hz)
-        for value, minimum in ((self.acquisition_target_seconds, 0.001),
+        for value, minimum in ((self.acquisition_cadence_budget_seconds, 0.001),
                                (self.acquisition_recovery_seconds, 1)):
             if type(value) not in (int, float) or not math.isfinite(value) or not minimum <= value <= 3600:
                 raise ConfigurationError("Некоректний інтервал acquisition")
@@ -112,7 +112,9 @@ class Settings:
                 acquisition_low_hz=int(read("ACQUISITION_START_HZ", "24000000")),
                 acquisition_high_hz=int(read("ACQUISITION_STOP_HZ", "1766000000")),
                 acquisition_bin_hz=int(read("ACQUISITION_BIN_HZ", "500000")),
-                acquisition_target_seconds=float(read("ACQUISITION_TARGET_SECONDS", "10")),
+                acquisition_cadence_budget_seconds=float(
+                    read("ACQUISITION_CADENCE_BUDGET_SECONDS", "60")
+                ),
                 acquisition_recovery_seconds=float(read("ACQUISITION_RECOVERY_SECONDS", "60")),
                 log_max_bytes=int(read("LOG_MAX_BYTES", "5000000")),
                 log_backups=int(read("LOG_BACKUPS", "3")),

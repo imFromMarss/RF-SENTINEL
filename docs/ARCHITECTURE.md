@@ -518,5 +518,6 @@ The architecture intentionally does not settle adapter/tool adequacy, SoapySDR m
 Цільова модель — незалежний producer спектра та downstream consumers.
 Режим `acquire` додає sweep domain model, MeasurementSink і operational health/logging.
 Один sweep — один timestamped spectrum frame; reporting не затримує наступний прийом.
-Hardware benchmark спростував target ~10 с для повного 24–1766 МГц range через
-сотні послідовних tuner hops. Деталі та компроміси: [Continuous acquisition](CONTINUOUS_ACQUISITION.md).
+Hardware benchmark спростував target ≤10 с для повного 24–1766 МГц range через
+сотні послідовних tuner hops; operational budget встановлено на 60 с до точного
+вимірювання natural completion. Деталі та компроміси: [Continuous acquisition](CONTINUOUS_ACQUISITION.md).

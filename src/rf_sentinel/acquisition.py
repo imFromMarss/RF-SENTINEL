@@ -79,23 +79,26 @@ class LatestSweepSink:
 
 class SpectrumAcquisitionWorker:
     def __init__(self, source: SweepSource, sink: MeasurementSink, profile: SweepProfile,
-                 observer, stop, target_seconds=10.0, recovery_seconds=60.0,
+                 observer, stop, cadence_budget_seconds=60.0, recovery_seconds=60.0,
                  monotonic=time.monotonic, now=lambda: datetime.now(UTC)):
-        if (not math.isfinite(target_seconds) or not 0 < target_seconds <= 3600
+        if (not math.isfinite(cadence_budget_seconds) or not 0 < cadence_budget_seconds <= 3600
                 or not math.isfinite(recovery_seconds) or not 1 <= recovery_seconds <= 3600):
             raise ConfigurationError("Некоректний інтервал проходу або відновлення")
         self.source, self.sink, self.profile = source, sink, profile
         self.observer, self.stop = observer, stop
-        self.target_seconds, self.recovery_seconds = target_seconds, recovery_seconds
+        self.cadence_budget_seconds, self.recovery_seconds = cadence_budget_seconds, recovery_seconds
         self.monotonic, self.now = monotonic, now
 
     def run(self):
         failed = False
+        previous_started = None
         try:
             self.observer.start(self.now())
             while not self.stop.is_set():
                 started = self.monotonic()
-                self.observer.sweep_started(self.now())
+                cadence = None if previous_started is None else started - previous_started
+                previous_started = started
+                self.observer.sweep_started(self.now(), cadence)
                 try:
                     sweep = self.source.acquire(self.profile)
                 except ScanError as error:
@@ -105,7 +108,7 @@ class SpectrumAcquisitionWorker:
                     continue
                 self.sink.store_sweep(sweep)
                 self.observer.completed(sweep)
-                remaining = max(0, self.target_seconds - (self.monotonic() - started))
+                remaining = max(0, self.cadence_budget_seconds - (self.monotonic() - started))
                 if remaining and self.stop.wait(remaining):
                     break
         except KeyboardInterrupt:

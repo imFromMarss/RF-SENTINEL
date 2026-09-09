@@ -23,9 +23,10 @@ Backend запускає RX-only `rtl_power -f START:STOP:BIN -i 1 -1 -d INDEX -
 За [реалізацією Osmocom](https://github.com/osmocom/rtl-sdr/blob/master/src/rtl_power.c)
 single-shot завершується після циклу сканування й виведення frame.
 
-Ціль — близько 10 секунд між початками проходів. Worker враховує весь цикл,
-включно з передачею sink та записом health: після 7 секунд залишається до 3 секунд
-interruptible wait, після 10 або 12 секунд наступний прохід починається відразу.
+`ACQUISITION_CADENCE_BUDGET_SECONDS` — configured operational budget між початками
+проходів; default 60 секунд для full-range baseline. Це не прогноз фактичної тривалості
+sweep: worker враховує весь цикл. Якщо sweep триває довше budget, наступний прохід
+починається відразу після нього.
 Overlap та catch-up відсутні. `flock` на локальному lock-файлі для device index
 також виключає другий scanner RF Sentinel; сторонні SDR-програми цим lock не керуються.
 Пристрій відкривається заново для кожного проходу; цей overhead входить у benchmark.
@@ -59,7 +60,7 @@ report та legacy survey configuration, включно з некоректни�
 | `ACQUISITION_START_HZ` | 24000000 |
 | `ACQUISITION_STOP_HZ` | 1766000000 |
 | `ACQUISITION_BIN_HZ` | 500000, попередній |
-| `ACQUISITION_TARGET_SECONDS` | 10 |
+| `ACQUISITION_CADENCE_BUDGET_SECONDS` | 60 |
 | `ACQUISITION_RECOVERY_SECONDS` | 60 |
 | `DATA_DIR` | runtime |
 | `LOG_MAX_BYTES` | 5000000 |
@@ -81,8 +82,11 @@ TZ та LC_ALL. Нові acquire events використовують явний 
 `runtime/status/health.json` містить application status, started_at, timestamps
 останнього початку/успішного завершення, останню duration, total_sweeps (успішні плюс
 невдалі завершені спроби), failed_sweeps, consecutive_sweep_failures, backend,
-configured/actual range та bin width, target/recovery intervals, bin count і безпечну
+configured/actual range та bin width, cadence budget/recovery intervals, bin count і безпечну
 останню помилку. Перерваний сигналом прохід не рахується завершеним.
+`cadence_budget_seconds` — configured budget; `last_sweep_duration_seconds` — фактична
+тривалість останньої спроби; `last_sweep_cadence_seconds` — фактично виміряний
+інтервал між початками поточного та попереднього проходу.
 Поточну тривалість читач оцінює від `last_sweep_started_at`, коли status=`acquiring`.
 Оновлення: temporary file у тому самому каталозі → atomic replace; це захист від
 half-written JSON, а не гарантія durability після втрати живлення.
@@ -115,7 +119,7 @@ timeout shutdown, але subprocess не завершився природно. 
 а не фактична стала cadence. 1000 кГц не завершив scan pass і не записав frame.
 Machine-readable результати та raw diagnostics: `runtime/benchmarks/20260908T191649Z/`.
 
-Target 10 с для одного full-range RTL-SDR через `rtl_power` недосяжний у перевіреній
+Target ≤10 с для одного full-range RTL-SDR через `rtl_power` недосяжний у перевіреній
 конфігурації. Bottleneck — послідовне перестроювання тюнера: 250/500 кГц потребують
 623 hops. Для 1000 кГц внутрішня евристика зменшує dongle bandwidth до 1 МГц і
 збільшує план до 1742 hops, тому грубіший requested bin тут повільніший.
@@ -123,9 +127,9 @@ Target 10 с для одного full-range RTL-SDR через `rtl_power` не�
 Практичний full-range компроміс — 250 кГц і operational cadence budget не менше
 60 с: він дає вдвічі більше bins за той самий hop count, що й 500 кГц. Це budget,
 підтриманий виміряними нижніми межами та попереднім 60-секундним режимом, але не
-новий вимір природного завершення. Поточні code defaults 500 кГц/10 с не змінено
-за прямою вимогою benchmark-сеансу; worker не створює overlap і фактичний cadence
-залишається довжиною sweep.
+новий вимір природного завершення. Поточний code default cadence budget — 60 с.
+Worker не створює overlap; фактичний cadence визначається тривалістю sweep та
+overhead sink/health і записується окремо від configured budget.
 
 Для cadence близько 10 с можна сканувати послідовні вікна приблизно 300–400 МГц;
 повне покриття тоді оновлюватиметься раз на 5–6 вікон. Persistent in-process

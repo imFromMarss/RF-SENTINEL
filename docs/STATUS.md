@@ -24,7 +24,7 @@
 
 ## Наступний крок
 
-- Завершити review архітектури SDR-пристроїв та перевірити FM survey на реальному RTL-SDR.
+- Final verification → PR → Raspberry Pi/systemd deployment → soak test.
 
 ## Stage 1: незалежний acquisition (2026-09-09)
 

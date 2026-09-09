@@ -9,14 +9,18 @@ RF Sentinel виконує RX-only pipeline:
 вміст. Acquisition не залежить від reporting/Telegram. Telegram має authorization
 boundary для inbound запитів і підтримує кнопку `📊 Звіт за останню годину`.
 
-## Робочий профіль
+## Legacy 30-minute survey workflow
+
+The `survey`/`schedule` modes are the legacy 30-minute workflow retained for
+compatibility. Their historical profile and measurements below are not the
+current production-like continuous-acquisition baseline.
 
 Для підключеного `RTL2838UHIDIR` з tuner `R820T` локальна `librtlsdr 2.0.3`
 підтвердила налаштування від `24 MHz` до `1766 MHz` без direct sampling. Перевірка
 включала обидві межі та точки через 10 MHz; driver не повернув помилок або PLL warning
 після початкового калібрування.
 
-Default profile:
+Legacy default profile:
 
 | Параметр | Значення |
 | --- | --- |
@@ -26,7 +30,8 @@ Default profile:
 | Інтервал накопичення | `60 s` |
 | Тривалість огляду | `1800 s` |
 
-На локальному hardware один контрольний full-range sweep тривав приблизно `23,4 s`.
+У legacy workflow один контрольний full-range sweep на локальному hardware
+тривав приблизно `23,4 s`.
 Поточний `rtl_power` обрав близько 4984 комірок по `349,518 kHz`. За 30 хвилин
 очікується приблизно 30 часових зрізів. Фактичні межі, ширина комірки й кількість
 проходів записуються в кожному `report.json`; requested values — у `request.json`.
@@ -84,10 +89,13 @@ snapshot і counters; operational log — `runtime/logs/rf-sentinel.log`. Уве
 
 ## Continuous operation і відмови
 
-Режим `schedule` — legacy survey workflow. Для production-подібного розділення
+Для production-подібного current pipeline
 використовуються `acquire` і `report-schedule`: acquisition має власний cadence,
 а report scheduler доставляє hourly report на початку кожної години та daily report
 о 00:00 у `Europe/Kyiv` за замовчуванням. Report generation/delivery не зупиняє acquisition.
+Його рекомендований full-range baseline — `24–1766 MHz`, requested bin `250 kHz`
+і operational cadence budget `60 s`; legacy `500 kHz`/`1800 s` values above do not
+describe this pipeline.
 
 Telegram message, waterfall і heatmap мають окремий bounded retry: default три спроби з паузою
 5 секунд. Після вичерпання спроб monitoring продовжується. Failed SDR/parser/artifact

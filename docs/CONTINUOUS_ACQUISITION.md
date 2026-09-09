@@ -77,7 +77,7 @@ report та legacy survey configuration, включно з некоректни�
 |---|---:|
 | `ACQUISITION_START_HZ` | 24000000 |
 | `ACQUISITION_STOP_HZ` | 1766000000 |
-| `ACQUISITION_BIN_HZ` | 500000, попередній |
+| `ACQUISITION_BIN_HZ` | 500000, application default |
 | `ACQUISITION_CADENCE_BUDGET_SECONDS` | 60 |
 | `ACQUISITION_RECOVERY_SECONDS` | 60 |
 | `DATA_DIR` | runtime |
@@ -85,8 +85,9 @@ report та legacy survey configuration, включно з некоректни�
 | `LOG_BACKUPS` | 3 |
 
 Також застосовуються `RTL_DEVICE_INDEX`, `RTL_GAIN`.
-Межі 24–1766 МГц — консервативний дозволений envelope R820T; фактичний practical
-range саме під’єднаного hardware ще потрібно перевірити локально.
+Межі 24–1766 МГц підтверджені benchmark для під’єднаного RTL2838UHIDIR/R820T.
+Практичний current full-range baseline використовує 250 kHz requested bin і
+60-секундний cadence budget.
 
 ## Observability
 

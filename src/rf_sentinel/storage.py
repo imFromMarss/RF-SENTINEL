@@ -111,7 +111,10 @@ class SQLiteMeasurementSink(MeasurementSink):
         self.storage_error: str | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._db = sqlite3.connect(self.path)
+            # Acquisition persistence runs on AsyncMeasurementSink's writer
+            # thread; the observer may use this same connection for metrics
+            # and incidents on the application thread.
+            self._db = sqlite3.connect(self.path, check_same_thread=False)
             self._db.execute("PRAGMA busy_timeout=5000")
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.execute("PRAGMA journal_mode=WAL")

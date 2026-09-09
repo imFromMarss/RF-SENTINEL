@@ -7,12 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from rf_sentinel.acquisition import (ErrorClassification, LatestSweepSink,
+from rf_sentinel.acquisition import (AsyncMeasurementSink, ErrorClassification, LatestSweepSink,
                                      SpectrumAcquisitionWorker, SpectrumSweep,
                                      SweepCoverage, SweepProfile, SweepProfileMetadata,
                                      SweepQuality)
 from rf_sentinel.config import Settings
-from rf_sentinel.errors import ConfigurationError, ScanError
+from rf_sentinel.errors import ConfigurationError, MeasurementPersistenceError, ScanError
 from rf_sentinel.observability import AcquisitionObserver, OperationalFormatter
 from rf_sentinel.rtl_power import RTLPowerScanner
 
@@ -211,6 +211,27 @@ def test_sink_failure_stops_without_retry(tmp_path):
     assert clock.waits == []
     assert observer.state.application_status == "failed"
     assert "synthetic-secret" not in (tmp_path / "health.json").read_text()
+
+
+def test_async_sink_failure_is_observable_during_worker_shutdown(tmp_path):
+    clock = ClockStop()
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60)
+
+    def fail(_sweep):
+        raise OSError("backend unavailable")
+
+    sink = AsyncMeasurementSink(fail, enqueue_timeout=0)
+
+    def acquire(_profile):
+        clock.set()
+        return frame()
+
+    with pytest.raises(MeasurementPersistenceError):
+        SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), sink, SweepProfile(),
+                                  observer, clock).run()
+    assert not sink._writer.is_alive()
+    assert observer.state.application_status == "failed"
+    assert json.loads((tmp_path / "health.json").read_text())["failed_persists"] == 0
 
 
 def test_storage_metrics_are_observable(tmp_path):

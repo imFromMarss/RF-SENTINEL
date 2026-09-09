@@ -1,6 +1,7 @@
 import subprocess
 import signal
 import sys
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -91,3 +92,41 @@ def test_scheduler_keyboard_interrupt_exit(monkeypatch):
 def test_sigterm_requests_graceful_interrupt():
     with pytest.raises(KeyboardInterrupt):
         _shutdown_signal(signal.SIGTERM, None)
+
+
+def test_acquisition_composes_async_sink_over_sqlite(monkeypatch, tmp_path):
+    from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumSweep
+    from rf_sentinel.application import run_acquisition
+    from rf_sentinel.config import Settings
+    from rf_sentinel.storage import SQLiteMeasurementSink
+
+    now = datetime(2026, 9, 8, tzinfo=UTC)
+    sweep = SpectrumSweep(now, now + timedelta(seconds=1), 1, 24e6, 26e6,
+                          (24.5e6, 25.5e6), 1e6, (-40.0, -50.0), "test")
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, source, sink, *args):
+            captured["sink"] = sink
+
+        def run(self):
+            assert captured["sink"].store_sweep(sweep).status == "accepted"
+            captured["sink"].close()
+
+    monkeypatch.setattr("rf_sentinel.observability.configure_operational_logging",
+                        lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.application.signal.signal", lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.application.signal.getsignal", lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.acquisition.SpectrumAcquisitionWorker", FakeWorker)
+    monkeypatch.setattr("rf_sentinel.rtl_power.RTLPowerScanner", lambda *args: object())
+
+    assert run_acquisition(Settings(data_dir=tmp_path)) == 0
+    assert isinstance(captured["sink"], AsyncMeasurementSink)
+    assert isinstance(captured["sink"]._downstream, SQLiteMeasurementSink)
+    assert captured["sink"].persisted_count == 1
+
+    stored = SQLiteMeasurementSink(tmp_path / "sweeps.sqlite3")
+    try:
+        assert stored.fetch_sweep(sweep.sweep_id) == sweep
+    finally:
+        stored.close()

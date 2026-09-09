@@ -1,10 +1,21 @@
 # Continuous acquisition
 
-Stage 1 додає незалежний producer: `RTLPowerScanner.acquire` →
+Canonical deployment entrypoint Stage 6A–6C — `python -m rf_sentinel station`.
+Він запускає один RF Sentinel process із internal continuous acquisition, async SQLite
+persistence, report scheduler, Telegram inbound/outbound і supervised `rtl_power`
+child processes. `station` утримує process-wide exclusive lock у
+`DATA_DIR/station.lock`; другий instance fail-fast і не запускає компоненти.
+
+`python -m rf_sentinel acquire` залишається standalone/diagnostic режимом для producer-а;
+`python -m rf_sentinel report-schedule` — standalone/diagnostic режимом для scheduler-а.
+Вони не є цільовою production deployment topology.
+
+Runtime acquisition boundary: `RTLPowerScanner.acquire` →
 `SpectrumAcquisitionWorker` → `MeasurementSink.store_sweep`.
 Acquisition не імпортує Telegram або reporting, не будує PNG і не чекає звітів.
 `survey` та `schedule` залишаються попередніми workflows; нова цільова точка входу —
-`python -m rf_sentinel acquire`. Не запускайте їх одночасно для одного SDR.
+`python -m rf_sentinel station`. Не запускайте standalone режими одночасно з station для
+одного SDR.
 
 `SpectrumSweep` — canonical durable record одного acquisition attempt. Він має
 `schema_version`, `sweep_id`, `sequence`, timestamps, optional `correlation_id`,
@@ -53,8 +64,9 @@ sticky і піднімається через `flush`/`close`, тому не с�
 
 `flush` чекає завершення всіх accepted frames і помиляється, якщо будь-який не став
 `persisted`. `close` спочатку drains queue, закриває downstream і зупиняє writer;
-після process crash queued-but-not-persisted frames не вважаються durable й можуть
-бути втрачені. `LatestSweepSink` залишається lightweight RAM implementation для
+після hard crash queued-but-not-persisted frames не вважаються durable й можуть
+бути втрачені в межах bounded queue. Committed SQLite records залишаються authoritative;
+`LatestSweepSink` залишається lightweight RAM implementation для
 hardware-free tests, але не production storage.
 
 ## Відмови та завершення
@@ -155,6 +167,10 @@ instantaneous-bandwidth limit. Фундаментально менше hops по
 або ширшосмугового hardware backend, наприклад майбутнього HackRF.
 
 SSH використовувався лише для benchmark; deployment та systemd не змінювалися.
-Report scheduler і report handler працюють як окремий downstream consumer: hourly report
-доставляється на початку кожної години, daily report — о 00:00 у configured timezone
-(default `Europe/Kyiv`). Acquisition під час report generation не зупиняється.
+У canonical `station` report scheduler і report handler працюють як internal downstream
+components: hourly report доставляється на початку кожної години, daily report — о 00:00
+у configured timezone (default `Europe/Kyiv`). Acquisition під час report generation не
+зупиняється. Scheduled Telegram delivery має at-least-once semantics: у вузькому crash
+window після успішного send і до durable ledger update можливий duplicate report. Inbound
+last-hour request також може повторитися після crash до Telegram acknowledgement. Exactly-once
+delivery не заявляється.

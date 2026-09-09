@@ -49,9 +49,9 @@
 
 - **Status:** ACCEPTED
 - **Context:** A CM4 station benefits from simple deployment and local data consistency. External sweep tools already introduce a useful process-failure boundary. Many services introduce distributed ownership complexity.
-- **Decision:** Use one systemd-supervised RF Sentinel service with internal logical components and supervised external acquisition processes. Preserve interfaces that permit a later small-service split.
+- **Decision:** Use one systemd-supervised RF Sentinel service with internal logical components and supervised external acquisition processes. The canonical entrypoint is `python -m rf_sentinel station`; it owns a process-wide exclusive lock at `DATA_DIR/station.lock` so only one station process is active. Preserve interfaces that permit a later small-service split.
 - **Alternatives:** Separate acquisition and analytics services now; microservices; a monolith with no child-process supervision.
-- **Consequences:** A station-process crash briefly affects all internal functions but systemd restarts it. Tool crashes can be contained and recovered separately. Internal component fault containment must be designed deliberately.
+- **Consequences:** A station-process crash briefly affects all internal functions but systemd restarts it. Tool crashes can be contained and recovered separately. Internal component fault containment must be designed deliberately. Standalone `acquire` and `report-schedule` remain diagnostic modes, not the production topology.
 - **Evidence required:** Reboot/automatic-recovery, long-running, resource, and fault-injection experiments demonstrate whether the model is adequate.
 
 ## ADR-007: Treat source, domain, derived, and operational data separately

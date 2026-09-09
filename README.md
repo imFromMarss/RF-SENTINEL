@@ -10,7 +10,7 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 
 ## Межі першого прототипу
 
-Поточний прототип створює безпечну й відтворювану основу для спостереження без постійної участі оператора. Continuous acquisition вже працює незалежно від reporting/Telegram і зберігає sweep-и в SQLite; локальні reports читають це сховище. Raspberry Pi/systemd deployment ще не завершений, а частина production-рішень і hardware validation залишається предметом review.
+Поточний прототип створює безпечну й відтворювану основу для спостереження без постійної участі оператора. Canonical deployment entrypoint — `python -m rf_sentinel station`: один RF Sentinel process об'єднує continuous acquisition, async SQLite persistence, report scheduler і Telegram inbound/outbound та запускає supervised `rtl_power` child processes. Raspberry Pi/systemd deployment ще не завершений, а частина production-рішень і hardware validation залишається предметом review.
 
 ## Цільове середовище
 
@@ -33,9 +33,24 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 - [Технологічні кандидати](docs/research/TECHNOLOGY_CANDIDATES.md) — реєстр варіантів і можливих напрямів, який не встановлює обов'язкових рішень.
 - [Експерименти з обладнанням CM4](docs/research/EXPERIMENTS.md) — заплановані перевірки для обґрунтування рішень, залежних від обладнання та продуктивності.
 
-## Локальний survey pipeline
+## Canonical station runtime
 
-Доступні два локальні контури: незалежний `acquire` (`rtl_power → SQLite`) та report/Telegram (`SQLite → report.json/report.txt/waterfall.png/heatmap.png → Telegram`).
+Запуск production-like topology:
+
+```sh
+python -m rf_sentinel station
+```
+
+`station` утримує process-wide exclusive lock у `DATA_DIR/station.lock`. Другий instance
+завершується fail-fast із safe diagnostic і не запускає acquisition, report scheduler або
+Telegram polling. Per-SDR lock залишається окремою hardware safety boundary.
+
+## Локальні та diagnostic режими
+
+Доступні standalone/diagnostic контури: `python -m rf_sentinel acquire`
+(`rtl_power → SQLite`) та `python -m rf_sentinel report-schedule`
+(`SQLite → report.json/report.txt/waterfall.png/heatmap.png → Telegram`).
+Вони не є цільовою production deployment topology.
 `python -m rf_sentinel` зберігає попередню identity-only поведінку; режими `survey`
 і `schedule` запускають одноразовий або continuous application workflow. Налаштування,
 історичні артефакти, logging, recovery, локальні команди та hardware-free tests описані
@@ -43,7 +58,8 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 
 ## Continuous acquisition
 
-`python -m rf_sentinel acquire` запускає незалежний RX producer без Telegram і report generation.
+`python -m rf_sentinel station` запускає canonical unified runtime. `python -m rf_sentinel acquire`
+залишається незалежним RX producer без Telegram і report generation для standalone/diagnostic use.
 Hardware benchmark показав, що full-range cadence ≤10 с через `rtl_power` недосяжний:
 practical full-range baseline — 24–1766 МГц із cadence budget 60 с.
 Sweep-и та bounded incident history зберігаються persistent у SQLite, а logs і atomic health snapshot доповнюють observability.

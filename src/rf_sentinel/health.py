@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from threading import RLock
 
 
 @dataclass
@@ -91,6 +92,19 @@ class AcquisitionHealth:
             self.last_telegram_success_at = datetime.now(UTC).isoformat()
         elif status == "failed":
             self.consecutive_telegram_failures += 1
+
+
+class HealthOwner:
+    """Own the one in-process health state and its one snapshot writer."""
+
+    def __init__(self, path: Path, state: AcquisitionHealth):
+        self.path = Path(path)
+        self.state = state
+        self.lock = RLock()
+
+    def save(self) -> None:
+        with self.lock:
+            write_health_snapshot(self.path, self.state)
 
 
 def write_health_snapshot(path: Path, state: AcquisitionHealth) -> None:

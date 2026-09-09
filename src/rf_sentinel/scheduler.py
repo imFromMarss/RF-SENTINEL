@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from rf_sentinel.acquisition import run_continuous_loop
 from rf_sentinel.errors import SentinelError
-from rf_sentinel.health import (AcquisitionHealth, load_health_snapshot,
+from rf_sentinel.health import (AcquisitionHealth, HealthOwner, load_health_snapshot,
                                 write_health_snapshot)
 from rf_sentinel.errors import MeasurementPersistenceError
 from rf_sentinel.reporting import (completed_calendar_day, completed_calendar_hour,
@@ -112,7 +112,8 @@ class ScheduledReportRunner:
                  *, timezone: str = "Europe/Kyiv", clock: Callable[[], datetime] | None = None,
                  delivery_attempts: int = 1, sleeper: Callable[[float], object] | None = None,
                  storage=None, health_path: str | Path | None = None,
-                 state: AcquisitionHealth | None = None):
+                 state: AcquisitionHealth | None = None,
+                 health_owner: HealthOwner | None = None):
         if delivery_attempts < 1:
             raise ValueError("delivery_attempts must be positive")
         self.report_engine = report_engine
@@ -124,8 +125,10 @@ class ScheduledReportRunner:
         self.delivery_attempts = delivery_attempts
         self.sleeper = sleeper
         self.state_path = self.data_dir / "reports" / "scheduled" / "delivery-state.json"
+        self.health_owner = health_owner
         self.health_path = Path(health_path or self.data_dir / "status" / "health.json")
-        self.state = state or load_health_snapshot(self.health_path)
+        self.state = state or (health_owner.state if health_owner is not None else
+                               load_health_snapshot(self.health_path))
         if storage is None:
             from rf_sentinel.storage import SQLiteMeasurementSink
             storage = SQLiteMeasurementSink(self.data_dir / "sweeps.sqlite3")
@@ -135,7 +138,10 @@ class ScheduledReportRunner:
 
     def _save_health(self) -> None:
         try:
-            write_health_snapshot(self.health_path, self.state)
+            if self.health_owner is not None:
+                self.health_owner.save()
+            else:
+                write_health_snapshot(self.health_path, self.state)
         except (OSError, ValueError):
             logger.error("Scheduled reports: health snapshot unavailable")
 
@@ -149,29 +155,33 @@ class ScheduledReportRunner:
             logger.error("Scheduled reports: incident history unavailable")
 
     def _failure(self, classification: str, message: str) -> None:
-        self._report_failures += 1
-        self.state.report_status = "failed"
-        self.state.total_failed_reports += 1
-        self.state.consecutive_report_failures = self._report_failures
-        self.state.last_report_error_reason = classification
-        if self.state.application_status not in ("recovering", "failed"):
-            self.state.application_status = "degraded"
-        self._incident(classification, message, "retry_scheduled")
-        self._save_health()
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self._report_failures += 1
+            self.state.report_status = "failed"
+            self.state.total_failed_reports += 1
+            self.state.consecutive_report_failures = self._report_failures
+            self.state.last_report_error_reason = classification
+            if self.state.application_status not in ("recovering", "failed"):
+                self.state.application_status = "degraded"
+            self._incident(classification, message, "retry_scheduled")
+            self._save_health()
 
     def _success(self) -> None:
-        recovered = self._report_failures > 0
-        self.state.report_status = "running"
-        self.state.total_completed_reports += 1
-        self.state.consecutive_report_failures = 0
-        self.state.last_successful_report_at = datetime.now(UTC).isoformat()
-        self.state.last_report_error_reason = None
-        if recovered:
-            self._incident("recovery", "Запланована доставка звітів відновлена", "recovered")
-            if self.state.application_status == "degraded":
-                self.state.application_status = "running"
-        self._report_failures = 0
-        self._save_health()
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            recovered = self._report_failures > 0
+            self.state.report_status = "running"
+            self.state.total_completed_reports += 1
+            self.state.consecutive_report_failures = 0
+            self.state.last_successful_report_at = datetime.now(UTC).isoformat()
+            self.state.last_report_error_reason = None
+            if recovered:
+                self._incident("recovery", "Запланована доставка звітів відновлена", "recovered")
+                if self.state.application_status == "degraded":
+                    self.state.application_status = "running"
+            self._report_failures = 0
+            self._save_health()
 
     @staticmethod
     def _key(kind: str, start: datetime, end: datetime) -> str:
@@ -268,3 +278,11 @@ def run_report_scheduler(runner: ScheduledReportRunner, stop: Event,
         next_hour = (local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
         delay = max(0.0, (next_hour - local).total_seconds())
         stop.wait(delay)
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False

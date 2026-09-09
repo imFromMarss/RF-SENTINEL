@@ -101,7 +101,7 @@ def run_acquisition(settings: Settings) -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, _shutdown_signal)
-        sink = SQLiteMeasurementSink(settings.data_dir / "sweeps.sqlite3",
+        sink = SQLiteMeasurementSink(settings.sweeps_path,
                                      incident_retention=settings.incident_retention)
         observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
                                        settings.acquisition_cadence_budget_seconds,

@@ -269,31 +269,7 @@ class SQLiteMeasurementSink(MeasurementSink):
             raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
 
     def _decode(self, row) -> SpectrumSweep:
-        data = json.loads(row[0])
-        frequencies = _unpack(row[2], row[1], "frequency")
-        powers = _unpack(row[4], row[3], "power")
-
-        def profile(value):
-            return None if value is None else SweepProfileMetadata(**value)
-
-        coverage = SweepCoverage(**data["coverage"])
-        quality = SweepQuality(data["quality"]["status"], tuple(data["quality"]["flags"]))
-        device = DeviceIdentity(**data["device"])
-        error = data["error_classification"]
-        return SpectrumSweep(
-            started_at=datetime.fromisoformat(data["started_at"]),
-            finished_at=datetime.fromisoformat(data["finished_at"]),
-            duration_seconds=data["duration_seconds"], start_hz=data["start_hz"],
-            stop_hz=data["stop_hz"], frequencies_hz=frequencies,
-            bin_width_hz=data["bin_width_hz"], powers=powers, backend=data["backend"],
-            receiver=data["receiver"], tuner=data["tuner"], status=data["status"],
-            schema_version=data["schema_version"], sweep_id=data["sweep_id"],
-            sequence=data["sequence"], correlation_id=data["correlation_id"],
-            requested_profile=profile(data["requested_profile"]),
-            actual_profile=profile(data["actual_profile"]), device=device,
-            tool_version=data["tool_version"], coverage=coverage, quality=quality,
-            error_classification=None if error is None else ErrorClassification(**error),
-        )
+        return _decode_sweep_row(row)
 
     def close(self) -> None:
         try:
@@ -301,5 +277,70 @@ class SQLiteMeasurementSink(MeasurementSink):
         except sqlite3.Error as error:
             raise MeasurementPersistenceError("Could not close SQLite measurement store") from error
 
+
+class SQLiteSweepReader:
+    """Read-only view of the durable sweep database.
+
+    The reader opens SQLite in ``mode=ro`` and never initializes or mutates the
+    database.  It is the boundary used by reporting, so report generation
+    cannot accidentally start acquisition or block its writer.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise MeasurementPersistenceError("Could not open SQLite measurement store")
+        try:
+            self._db = sqlite3.connect(
+                f"file:{self.path.absolute()}?mode=ro", uri=True,
+            )
+            self._db.execute("PRAGMA query_only=ON")
+        except (OSError, sqlite3.Error) as error:
+            raise MeasurementPersistenceError("Could not open SQLite measurement store") from error
+
+    def query_sweeps(self, start: datetime, end: datetime) -> list[SpectrumSweep]:
+        try:
+            start_us, end_us = _timestamp(start), _timestamp(end)
+            rows = self._db.execute(
+                "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
+                "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
+                "ORDER BY started_at_us, sweep_id", (start_us, end_us)).fetchall()
+            return [_decode_sweep_row(row) for row in rows]
+        except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
+            raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
+
+    def close(self) -> None:
+        try:
+            self._db.close()
+        except sqlite3.Error as error:
+            raise MeasurementPersistenceError("Could not close SQLite measurement store") from error
+
+
+def _decode_sweep_row(row) -> SpectrumSweep:
+    data = json.loads(row[0])
+    frequencies = _unpack(row[2], row[1], "frequency")
+    powers = _unpack(row[4], row[3], "power")
+
+    def profile(value):
+        return None if value is None else SweepProfileMetadata(**value)
+
+    coverage = SweepCoverage(**data["coverage"])
+    quality = SweepQuality(data["quality"]["status"], tuple(data["quality"]["flags"]))
+    device = DeviceIdentity(**data["device"])
+    error = data["error_classification"]
+    return SpectrumSweep(
+        started_at=datetime.fromisoformat(data["started_at"]),
+        finished_at=datetime.fromisoformat(data["finished_at"]),
+        duration_seconds=data["duration_seconds"], start_hz=data["start_hz"],
+        stop_hz=data["stop_hz"], frequencies_hz=frequencies,
+        bin_width_hz=data["bin_width_hz"], powers=powers, backend=data["backend"],
+        receiver=data["receiver"], tuner=data["tuner"], status=data["status"],
+        schema_version=data["schema_version"], sweep_id=data["sweep_id"],
+        sequence=data["sequence"], correlation_id=data["correlation_id"],
+        requested_profile=profile(data["requested_profile"]),
+        actual_profile=profile(data["actual_profile"]), device=device,
+        tool_version=data["tool_version"], coverage=coverage, quality=quality,
+        error_classification=None if error is None else ErrorClassification(**error),
+    )
 
 SQLiteSweepStore = SQLiteMeasurementSink

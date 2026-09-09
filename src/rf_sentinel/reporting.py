@@ -5,7 +5,144 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from rf_sentinel.storage import SQLiteSweepReader
 from rf_sentinel.spectrum import ScanProfile, ScanResult
+
+
+@dataclass(frozen=True)
+class ReportGap:
+    """An observed interval with no persisted sweep start/finish coverage."""
+
+    start: datetime
+    end: datetime
+    kind: str
+    previous_sweep_id: str | None = None
+    next_sweep_id: str | None = None
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+
+@dataclass(frozen=True)
+class ReportSweep:
+    """One ordered sweep summary; failed sweeps intentionally have no payload."""
+
+    sweep_id: str
+    started_at: datetime
+    finished_at: datetime
+    outcome: str
+    coverage: float
+    frequencies_hz: tuple[float, ...] = ()
+    powers: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReportData:
+    """Canonical data contract for a persisted time-window report.
+
+    ``coverage`` is weighted persisted-bin coverage: sum(observed_bins) /
+    sum(expected_bins), including failed sweeps when their expected count is
+    known.  ``gaps`` includes the window edges and every positive interval
+    between sweep finish and the next sweep start; failed sweeps remain in the
+    ordered timeline and in all outcome counts.
+    """
+
+    window_start: datetime
+    window_end: datetime
+    sweep_count: int
+    success_count: int
+    partial_count: int
+    failed_count: int
+    coverage: float
+    frequency_range_hz: tuple[float, float] | None
+    time_ordering: tuple[str, ...]
+    peak_frequency_hz: float | None
+    peak_power_db: float | None
+    sweeps: tuple[ReportSweep, ...]
+    gaps: tuple[ReportGap, ...]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def last_hour_window(end: datetime) -> tuple[datetime, datetime]:
+    """Return a one-hour half-open window ending at ``end``."""
+    return end - timedelta(hours=1), end
+
+
+def completed_calendar_hour(now: datetime, timezone: str = "Europe/Kyiv") -> tuple[datetime, datetime]:
+    """Return the most recently completed local calendar hour."""
+    local = now.astimezone(ZoneInfo(timezone)).replace(minute=0, second=0, microsecond=0)
+    return local - timedelta(hours=1), local
+
+
+def completed_calendar_day(now: datetime, timezone: str = "Europe/Kyiv") -> tuple[datetime, datetime]:
+    """Return the most recently completed local calendar day."""
+    local = now.astimezone(ZoneInfo(timezone)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return local - timedelta(days=1), local
+
+
+class SQLiteReportEngine:
+    """Build report data from SQLite only, without an acquisition dependency."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def build(self, start: datetime, end: datetime) -> ReportData:
+        if (start.tzinfo is None or start.utcoffset() is None
+                or end.tzinfo is None or end.utcoffset() is None):
+            raise ValueError("report window timestamps must be timezone-aware")
+        if end <= start:
+            raise ValueError("report window must be non-empty")
+        reader = SQLiteSweepReader(self.path)
+        try:
+            sweeps = reader.query_sweeps(start, end)
+        finally:
+            reader.close()
+        ordered = tuple(sorted(sweeps, key=lambda item: (item.started_at, item.sweep_id)))
+        counts = {outcome: sum(item.outcome == outcome for item in ordered)
+                  for outcome in ("success", "partial", "failed")}
+        expected = sum(item.coverage.expected_bins for item in ordered)
+        observed = sum(item.coverage.observed_bins for item in ordered)
+        coverage = observed / expected if expected else 0.0
+        payloads = tuple(
+            ReportSweep(item.sweep_id, item.started_at, item.finished_at, item.outcome,
+                        item.coverage.fraction,
+                        item.frequencies_hz if item.outcome != "failed" else (),
+                        item.powers if item.outcome != "failed" else ())
+            for item in ordered
+        )
+        measurements = [
+            (frequency, power)
+            for item in payloads
+            for frequency, power in zip(item.frequencies_hz, item.powers)
+        ]
+        peak_frequency, peak_power = (max(measurements, key=lambda value: value[1])
+                                      if measurements else (None, None))
+        ranges = [(item.start_hz, item.stop_hz) for item in ordered if item.outcome != "failed"]
+        frequency_range = ((min(value[0] for value in ranges), max(value[1] for value in ranges))
+                           if ranges else None)
+        gaps = []
+        if not ordered:
+            gaps.append(ReportGap(start, end, "window"))
+        else:
+            if ordered[0].started_at > start:
+                gaps.append(ReportGap(start, ordered[0].started_at, "leading",
+                                      next_sweep_id=ordered[0].sweep_id))
+            for previous, current in zip(ordered, ordered[1:]):
+                gap_start = max(previous.finished_at, start)
+                if current.started_at > gap_start:
+                    gaps.append(ReportGap(gap_start, current.started_at, "between",
+                                          previous.sweep_id, current.sweep_id))
+            if ordered[-1].finished_at < end:
+                gaps.append(ReportGap(ordered[-1].finished_at, end, "trailing",
+                                      previous_sweep_id=ordered[-1].sweep_id))
+        return ReportData(
+            start, end, len(ordered), counts["success"], counts["partial"], counts["failed"],
+            coverage, frequency_range, tuple(item.sweep_id for item in ordered),
+            peak_frequency, peak_power, payloads, tuple(gaps),
+        )
 
 
 def duration_text(seconds: float) -> str:

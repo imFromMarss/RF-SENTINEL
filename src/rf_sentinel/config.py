@@ -98,6 +98,11 @@ class Settings:
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token)
 
+    @property
+    def sweeps_path(self) -> Path:
+        """Canonical persistent sweep database shared by acquisition/reporting."""
+        return self.data_dir / "sweeps.sqlite3"
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None, *, acquisition_only: bool = False) -> "Settings":
         source = os.environ if env is None else env

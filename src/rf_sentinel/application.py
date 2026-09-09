@@ -23,7 +23,7 @@ def _shutdown_signal(signum, frame) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rf_sentinel")
-    parser.add_argument("mode", nargs="?", choices=("survey", "schedule", "acquire"))
+    parser.add_argument("mode", nargs="?", choices=("survey", "schedule", "report-schedule", "acquire"))
     # main() без аргументів не читає аргументи pytest або host process.
     args = parser.parse_args([] if argv is None else argv)
     if args.mode is None:
@@ -33,6 +33,30 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env(acquisition_only=True) if args.mode == "acquire" else Settings.from_env()
         if args.mode == "acquire":
             return run_acquisition(settings)
+        if args.mode == "report-schedule":
+            from rf_sentinel.reporting import SQLiteReportEngine
+            from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler
+            from rf_sentinel.telegram import TelegramNotifier
+
+            configure_logging(settings.data_dir)
+            notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id) \
+                if settings.telegram_enabled else None
+            if notifier is None:
+                logger = logging.getLogger("rf_sentinel.application")
+                logger.error("Report scheduler requires Telegram configuration")
+                return 1
+            runner = ScheduledReportRunner(
+                SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
+                timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
+            )
+            stop = Event()
+            previous = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _shutdown_signal)
+            try:
+                run_report_scheduler(runner, stop)
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+            return 0
         from rf_sentinel.rtl_power import RTLPowerSurveyAdapter
         from rf_sentinel.scheduler import run_continuous
         from rf_sentinel.spectrum import ScanProfile

@@ -1,6 +1,7 @@
 """Точка складання application зі збереженою identity-only поведінкою."""
 
 import argparse
+import fcntl
 import logging
 from pathlib import Path
 import signal
@@ -56,7 +57,49 @@ class _DisabledNotifier:
         return None
 
 
+class _StationProcessLock:
+    """Own the station-wide Linux lock for the complete process lifecycle."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._stream = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("a+")
+        try:
+            fcntl.flock(self._stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._stream.close()
+            self._stream = None
+            return False
+        return True
+
+    def release(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            fcntl.flock(self._stream, fcntl.LOCK_UN)
+        finally:
+            self._stream.close()
+            self._stream = None
+
+
 def run_station(settings: Settings) -> int:
+    """Acquire the station lock, then run the unified station lifecycle."""
+    configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
+    lock = _StationProcessLock(settings.data_dir / "station.lock")
+    if not lock.acquire():
+        logging.getLogger("rf_sentinel.application").error(
+            "RF Sentinel station is already running; refusing second instance")
+        return 1
+    try:
+        return _run_station_lifecycle(settings)
+    finally:
+        lock.release()
+
+
+def _run_station_lifecycle(settings: Settings) -> int:
     """Run acquisition, scheduled reports, and inbound Telegram in one process."""
     from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumAcquisitionWorker, SweepProfile
     from rf_sentinel.health import AcquisitionHealth, HealthOwner
@@ -67,7 +110,6 @@ def run_station(settings: Settings) -> int:
     from rf_sentinel.storage import SQLiteMeasurementSink
     from rf_sentinel.telegram import TelegramNotifier
 
-    configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
     stop = Event()
     health_path = settings.data_dir / "status" / "health.json"
     profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,

@@ -1,16 +1,16 @@
 # RF Sentinel
 
-RF Sentinel — автономний сервер моніторингу RF-спектра, що працює лише на приймання (RX-only), для систем на базі Raspberry Pi Compute Module 4. Він призначений для безперервного спостереження за налаштованими діапазонами спектра, виявлення помітної RF-активності, збереження корисних даних про події та історії спостережень, а також надання щоденних результатів через Telegram-бота.
+RF Sentinel — автономний сервер моніторингу RF-спектра, що працює лише на приймання (RX-only), для систем на базі Raspberry Pi Compute Module 4. Він призначений для безперервного спостереження за налаштованими діапазонами спектра, збереження історії спостережень і надання hourly/daily та on-demand звітів через Telegram-бота.
 
 Проєкт зосереджений на спостереженні за спектром і визначенні характеристик сигналів. Він не призначений для розшифрування захищених комунікацій, обходу контролю доступу або перехоплення вмісту приватних комунікацій.
 
 ## Стан проєкту
 
-Проєкт перебуває на етапі **SYSTEM ARCHITECTURE**. Див. [визначення проєкту](docs/PROJECT.md) і [поточний стан](docs/STATUS.md).
+Проєкт перебуває на етапі **LOCAL SURVEY PROTOTYPE / architecture review**. Див. [визначення проєкту](docs/PROJECT.md) і [поточний стан](docs/STATUS.md).
 
 ## Межі першого прототипу
 
-Перший прототип створить безпечну й відтворювану основу для спостереження без постійної участі оператора з використанням підтримуваного SDR-обладнання. Вимоги та початкова архітектура системи задокументовані, а проєкт архітектури SDR-пристроїв підготовлено до review. Кількісні пороги, остаточна технологія зберігання даних, обмеження конкретних пристроїв та інші рішення, що потребують підтвердження результатами досліджень, залишаються невизначеними до review архітектури й отримання результатів експериментів на CM4.
+Поточний прототип створює безпечну й відтворювану основу для спостереження без постійної участі оператора. Continuous acquisition вже працює незалежно від reporting/Telegram і зберігає sweep-и в SQLite; локальні reports читають це сховище. Raspberry Pi/systemd deployment ще не завершений, а частина production-рішень і hardware validation залишається предметом review.
 
 ## Цільове середовище
 
@@ -35,7 +35,7 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 
 ## Локальний survey pipeline
 
-Доступний diagnostic pipeline: `rtl_power → report/heatmap → optional Telegram`.
+Доступні два локальні контури: незалежний `acquire` (`rtl_power → SQLite`) та report/Telegram (`SQLite → report.json/report.txt/waterfall.png/heatmap.png → Telegram`).
 `python -m rf_sentinel` зберігає попередню identity-only поведінку; режими `survey`
 і `schedule` запускають одноразовий або continuous application workflow. Налаштування,
 історичні артефакти, logging, recovery, локальні команди та hardware-free tests описані
@@ -43,8 +43,8 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 
 ## Continuous acquisition
 
-`python -m rf_sentinel acquire` запускає незалежний RX producer без Telegram і reports.
+`python -m rf_sentinel acquire` запускає незалежний RX producer без Telegram і report generation.
 Hardware benchmark показав, що full-range cadence ≤10 с через `rtl_power` недосяжний:
-практичний budget становить близько 60 с, або потрібні менші frequency windows.
-Stage 1 зберігає останній frame у RAM, operational logs і atomic health snapshot.
+practical full-range baseline — 24–1766 МГц із cadence budget 60 с.
+Sweep-и та bounded incident history зберігаються persistent у SQLite, а logs і atomic health snapshot доповнюють observability.
 Конфігурація, діагностика та обмеження: [Continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).

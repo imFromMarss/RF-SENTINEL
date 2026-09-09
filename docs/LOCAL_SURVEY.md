@@ -2,10 +2,12 @@
 
 RF Sentinel виконує RX-only pipeline:
 
-`RTL-SDR → rtl_power → parser → звіт → heatmap → Telegram → наступний огляд`.
+`RTL-SDR → rtl_power → SQLite acquisition` та незалежний
+`SQLite → report.json/report.txt/waterfall.png/heatmap.png → Telegram`.
 
 Це діагностичне широкосмугове спостереження. Воно не визначає `RFEvent`, не декодує
-вміст і не приймає команди з Telegram. Transport залишається лише вихідним.
+вміст. Acquisition не залежить від reporting/Telegram. Telegram має authorization
+boundary для inbound запитів і підтримує кнопку `📊 Звіт за останню годину`.
 
 ## Робочий профіль
 
@@ -61,6 +63,7 @@ runtime/surveys/YYYYMMDDTHHMMSS.ffffffZ-xxxxxxxx/
 ├── spectrum.json
 ├── report.json
 ├── report.txt
+├── waterfall.png
 ├── heatmap.png
 ├── rtl_power.stderr.txt
 ├── scan-diagnostics.json
@@ -72,18 +75,21 @@ runtime/surveys/YYYYMMDDTHHMMSS.ffffffZ-xxxxxxxx/
 `delivery.json` зберігає статус і Telegram message IDs. При помилці acquisition
 залишаються request, доступний raw CSV, bounded stderr, machine-readable diagnostics та
 failed report. `scan-diagnostics.json` фіксує reason і subprocess return code. При
-помилці Telegram локальні дані й heatmap зберігаються.
+помилці Telegram локальні дані та обидві PNG зберігаються.
 
-`runtime/status/health.json` містить canonical health snapshot і лічильники. Operational log:
-`runtime/logs/rf-sentinel.log`. Увесь `runtime/` і `.env` ігноруються Git.
+Continuous `acquire` зберігає sweep-и й bounded incident history у
+`runtime/sweeps.sqlite3`. `runtime/status/health.json` містить canonical health
+snapshot і counters; operational log — `runtime/logs/rf-sentinel.log`. Увесь `runtime/`
+і `.env` ігноруються Git.
 
 ## Continuous operation і відмови
 
-Режим `schedule` запускає перший 30-хвилинний survey одразу. Після успішного report і
-delivery наступний survey починається одразу; scans не перекриваються. Отже нормальний
-темп — приблизно два звіти на годину плюс час rendering/network.
+Режим `schedule` — legacy survey workflow. Для production-подібного розділення
+використовуються `acquire` і `report-schedule`: acquisition має власний cadence,
+а report scheduler доставляє hourly report на початку кожної години та daily report
+о 00:00 у `Europe/Kyiv` за замовчуванням. Report generation/delivery не зупиняє acquisition.
 
-Telegram message та heatmap мають окремий bounded retry: default три спроби з паузою
+Telegram message, waterfall і heatmap мають окремий bounded retry: default три спроби з паузою
 5 секунд. Після вичерпання спроб monitoring продовжується. Failed SDR/parser/artifact
 cycle збільшує health counters і використовує 60-секундний recovery delay, щоб уникнути
 tight retry loop. Один failed cycle не завершує process.
@@ -124,8 +130,8 @@ set +a
 - `RF_SENTINEL_DATA_DIR`.
 
 `RF_SENTINEL_REPORT_INTERVAL_MINUTES=30` збережено для сумісності з раннім prototype;
-continuous runner визначає cadence тривалістю survey й запускає наступний успішний cycle
-одразу.
+calendar report scheduler не використовує це поле. Continuous acquisition має окремий
+`RF_SENTINEL_ACQUISITION_CADENCE_BUDGET_SECONDS=60`.
 
 ## Запуск і перевірки
 
@@ -149,9 +155,8 @@ RF_SENTINEL_TEST_FULL_RANGE=1 .venv/bin/python -m pytest -q tests/test_hardware.
 краще використовувати `python -m rf_sentinel schedule`, бо він перевіряє artifacts,
 delivery, retries, health та logging разом.
 
-Локальний foreground process надалі інтегрується з production supervision через
-`systemd` на Raspberry Pi CM4. Deployment, `systemd` і будь-які дії на Raspberry Pi
-до цього етапу не входять.
+Локальний foreground process ще має бути інтегрований з production supervision через
+`systemd` на Raspberry Pi CM4. Raspberry Pi/systemd deployment наразі не завершений.
 
 Формат CSV і поведінку sweep звірено з
 [Osmocom rtl_power](https://github.com/osmocom/rtl-sdr/blob/master/src/rtl_power.c).

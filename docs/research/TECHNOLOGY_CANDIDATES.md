@@ -44,7 +44,7 @@ This document turns research into an options register. It does not select an arc
 
 | Candidate | Maturity | Advantages | Disadvantages | ARM64 / Raspberry Pi suitability | Hardware compatibility | Project risk | Recommended role |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| SQLite | Very mature | Embedded, transactional, simple backup/query path | Write/concurrency/retention design still required | Strong Linux ARM64 fit | Device-neutral | Low | Candidate metadata/events/config audit store |
+| SQLite | Very mature | Embedded, transactional, simple backup/query path | Write/concurrency/retention design still required | Strong Linux ARM64 fit | Device-neutral | Low | Local-prototype baseline for persistent sweeps/reports/incidents; production validation pending |
 | Time-partitioned PSD files (CSV/Parquet or equivalent) | Established pattern | Simple append/archive and external analysis | Format/schema/compaction and query strategy needed | Depends on chosen tooling and disk results | Device-neutral | Medium | Candidate raw/aggregated measurement archive |
 | SigMF for optional IQ | Active standard | Portable raw IQ + metadata provenance | Not event/history database; large files | Strong format fit; storage cost must be bounded | Device-neutral | Low | Candidate optional IQ evidence format |
 

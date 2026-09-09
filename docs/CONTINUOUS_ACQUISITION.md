@@ -39,7 +39,11 @@ Overlap та catch-up відсутні. `flock` на локальному lock-�
 Пристрій відкривається заново для кожного проходу; цей overhead входить у benchmark.
 Safety timeout одноразового subprocess — 90 секунд, CSV ≤64 MiB, stderr ≤1 MiB.
 
-Sink має швидко приймати frame без rendering/reporting. `AsyncMeasurementSink` має
+Runtime sink має швидко приймати frame без rendering/reporting. Production `acquire`
+використовує persistent `SQLiteMeasurementSink` у `runtime/sweeps.sqlite3`: один
+SQLite row на sweep, payload і metadata з reopen support. `SQLiteReportEngine` читає
+це сховище окремо, тому generation reports не зупиняє acquisition.
+`AsyncMeasurementSink` має
 bounded in-process queue і один non-daemon writer: acquisition чекає лише bounded
 `enqueue_timeout`, а не latency storage. Результат hand-off має чотири стани:
 `accepted` означає ownership queue (не durability), `persisted` — downstream підтвердив
@@ -51,7 +55,7 @@ sticky і піднімається через `flush`/`close`, тому не с�
 `persisted`. `close` спочатку drains queue, закриває downstream і зупиняє writer;
 після process crash queued-but-not-persisted frames не вважаються durable й можуть
 бути втрачені. `LatestSweepSink` залишається lightweight RAM implementation для
-hardware-free runtime; final persistent storage не обирається цим етапом.
+hardware-free tests, але не production storage.
 
 ## Відмови та завершення
 
@@ -105,10 +109,8 @@ configured/actual range та bin width, cadence budget/recovery intervals, bin c
 Оновлення: temporary file у тому самому каталозі → atomic replace; це захист від
 half-written JSON, а не гарантія durability після втрати живлення.
 
-Майбутній короткий Codex-сеанс читає health та поточний/ротовані logs, зіставляє
-sweep/recovery timestamps, counters та metadata. Stage 1 не гарантує 12 годин історії:
-її тривалість залежить від rotation та кількості events. Incident retention і persistent
-measurements поки відсутні. Runtime artifacts Git ignored.
+Health, JSON-lines logs і bounded SQLite incident history (default 1000 records)
+утворюють поточний observability baseline. Runtime artifacts Git ignored.
 
 ## Короткий benchmark і поточне обмеження
 
@@ -152,5 +154,6 @@ instantaneous-bandwidth limit. Фундаментально менше hops по
 або ширшосмугового hardware backend, наприклад майбутнього HackRF.
 
 SSH використовувався лише для benchmark; deployment та systemd не змінювалися.
-Stage 2 — persistent measurement storage + full observability/incident retention
-для hourly/on-demand/daily reports.
+Report scheduler і report handler працюють як окремий downstream consumer: hourly report
+доставляється на початку кожної години, daily report — о 00:00 у configured timezone
+(default `Europe/Kyiv`). Acquisition під час report generation не зупиняється.

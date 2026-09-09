@@ -72,14 +72,14 @@
 - **Consequences:** The normalized contract protects downstream components. A hybrid per-device adapter strategy remains valid.
 - **Evidence required:** Device discovery, supported profile settings, sample/stream stability, disconnect/reconnect, USB, CPU/RAM, and packaging tests on target CM4.
 
-## ADR-009: Do not select final persistence technology yet
+## ADR-009: Use SQLite for the local prototype persistence boundary
 
-- **Status:** DEFERRED
-- **Context:** Requirements distinguish structured records, high-volume measurements, binary captures, artifacts, and logs, but CM4 disk/load/query evidence is absent.
-- **Decision:** Define repository/artifact boundaries and authoritative data categories only. Defer database/file-format selection and retention values.
+- **Status:** ACCEPTED FOR LOCAL PROTOTYPE; production retention/deployment validation pending
+- **Context:** The continuous acquisition and report consumers need a durable local hand-off. The implementation persists canonical sweeps, measurement payloads, metadata, and bounded incidents in one SQLite database.
+- **Decision:** Use `runtime/sweeps.sqlite3` as the persistent local store for acquisition and report queries. Keep report artifacts as separate files and retain storage/production-capacity thresholds as deployment concerns.
 - **Alternatives:** Select one embedded database now; CSV-only; time-series database now.
-- **Consequences:** Architecture work remains technology-neutral. Storage interfaces must accommodate source-volume and artifact differences.
-- **Evidence required:** Disk, retention, historical query/report, and recovery experiments.
+- **Consequences:** Acquisition and reporting share a durable local source without coupling their lifecycles. SQLite does not become a claim that all future domain, IQ, or production-retention needs are solved.
+- **Evidence required:** Raspberry Pi endurance, capacity, retention, and recovery validation before production deployment.
 
 ## ADR-010: Keep IQ capture and classification optional
 

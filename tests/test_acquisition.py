@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from rf_sentinel.acquisition import LatestSweepSink, SpectrumAcquisitionWorker, SpectrumSweep, SweepProfile
+from rf_sentinel.acquisition import (ErrorClassification, LatestSweepSink,
+                                     SpectrumAcquisitionWorker, SpectrumSweep,
+                                     SweepCoverage, SweepProfile, SweepProfileMetadata,
+                                     SweepQuality)
 from rf_sentinel.config import Settings
 from rf_sentinel.errors import ConfigurationError, ScanError
 from rf_sentinel.observability import AcquisitionObserver, OperationalFormatter
@@ -29,6 +32,25 @@ def frame(duration=7):
 def test_invalid_sweep(change):
     with pytest.raises(ValueError):
         replace(frame(), **change)
+
+
+def test_durable_contract_supports_all_terminal_outcomes():
+    partial = replace(frame(), status="partial",
+                      coverage=SweepCoverage("partial", 4, 2, 0.5),
+                      quality=SweepQuality("degraded", ("missing_bins",)))
+    failed = SpectrumSweep(
+        NOW, NOW + timedelta(seconds=1), 1, 0, 0, (), 0, (), "rtl_power",
+        status="failed", error_classification=ErrorClassification("device", "timeout"),
+        requested_profile=SweepProfileMetadata(24e6, 26e6, 1e6, 1, 1),
+        coverage=SweepCoverage("none", 2, 0, 0),
+        quality=SweepQuality("unavailable"), correlation_id="attempt-1")
+
+    assert partial.outcome == "partial"
+    assert partial.coverage.status == "partial"
+    assert failed.outcome == "failed"
+    assert failed.powers == ()
+    assert failed.error_classification.code == "timeout"
+    assert failed.schema_version == "spectrum-sweep.v1"
 
 
 class ClockStop:
@@ -66,7 +88,10 @@ def test_cadence_sink_no_overlap(tmp_path, duration, expected):
                               observer, clock, monotonic=lambda: clock.time, now=lambda: NOW).run()
     assert starts == [0, max(60, duration)]
     assert clock.waits == expected
-    assert sink.latest == frame(duration)
+    assert sink.latest is not None
+    assert sink.latest.powers == frame(duration).powers
+    assert sink.latest.status == "success"
+    assert sink.latest.sweep_id
     health = json.loads((tmp_path / "health.json").read_text())
     assert health["total_sweeps"] == 2
     assert health["application_status"] == "stopped"

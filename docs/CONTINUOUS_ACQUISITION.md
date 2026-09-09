@@ -6,12 +6,19 @@ Acquisition не імпортує Telegram або reporting, не будує PNG
 `survey` та `schedule` залишаються попередніми workflows; нова цільова точка входу —
 `python -m rf_sentinel acquire`. Не запускайте їх одночасно для одного SDR.
 
-Один `SpectrumSweep` — один timestamped spectrum frame: UTC початок/завершення,
-monotonic duration, фактичні межі та центри комірок, фактична ширина, powers,
-backend, receiver/tuner metadata та `success`. Невдалий прохід не створює frame;
-його стан фіксує observability. UTC завершення обчислюється від початку та monotonic
-тривалості, щоб зміна wall clock усередині проходу не зробила duration від’ємним.
-CSV залишається форматом адаптера `rtl_power`, а не domain contract.
+`SpectrumSweep` — canonical durable record одного acquisition attempt. Він має
+`schema_version`, `sweep_id`, `sequence`, timestamps, optional `correlation_id`,
+requested/actual profile, device identity, backend/tool version, coverage/quality
+та terminal `status`: `success`, `partial` або `failed`. `error_classification`
+зберігає стабільну категорію/код, а не raw exception text.
+
+`success` вимагає повний spectrum payload, complete coverage і valid quality.
+`partial` зберігає record із degraded quality та partial coverage; payload може
+бути неповним. `failed` є durable attempt metadata contract навіть без payload:
+coverage=`none`, quality=`unavailable` і обов’язкова error classification. Це
+відрізняє відсутність покриття від тихого спектра. `schema_version` — explicit
+compatibility boundary (`spectrum-sweep.v1`); storage engine не є частиною цього
+контракту. CSV залишається форматом адаптера `rtl_power`, а не domain contract.
 
 ## Прийом і cadence
 

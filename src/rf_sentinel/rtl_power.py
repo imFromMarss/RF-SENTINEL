@@ -11,7 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
-from rf_sentinel.acquisition import SpectrumSweep, SweepProfile
+from rf_sentinel.acquisition import (DeviceIdentity, SpectrumSweep, SweepCoverage,
+                                     SweepProfile, SweepProfileMetadata, SweepQuality)
 from rf_sentinel.config import validate_device
 from rf_sentinel.errors import ParseError, ScanError
 from rf_sentinel.spectrum import ScanProfile, ScanResult, SpectrumData, SpectrumFrame
@@ -239,4 +240,14 @@ def _sweep_from_result(result: ScanResult) -> SpectrumSweep:
         tuple((a + b) / 2 for a, b in zip(edges, edges[1:])),
         sum(widths) / len(widths), result.spectrum.frames[0].powers,
         result.backend, result.receiver, result.tuner,
+        requested_profile=SweepProfileMetadata(
+            result.profile.low_hz, result.profile.high_hz, result.profile.bin_hz,
+            result.profile.integration_seconds, result.profile.duration_seconds),
+        actual_profile=SweepProfileMetadata(
+            edges[0], edges[-1], sum(widths) / len(widths),
+            result.profile.integration_seconds, result.duration_seconds),
+        device=DeviceIdentity(str(result.receiver), result.receiver, result.tuner),
+        coverage=SweepCoverage("complete", len(result.spectrum.frames[0].powers),
+                               len(result.spectrum.frames[0].powers), 1.0),
+        quality=SweepQuality("valid"),
     )

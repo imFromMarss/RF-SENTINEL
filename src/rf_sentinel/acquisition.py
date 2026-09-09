@@ -1,10 +1,11 @@
 """Незалежний producer спектра з послідовним прийомом і обмеженим recovery."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import math
 import time
-from typing import Callable, Protocol, TypeVar
+from typing import Callable, Literal, Protocol, TypeVar
+from uuid import uuid4
 
 from rf_sentinel.errors import ConfigurationError, ScanError
 
@@ -25,6 +26,53 @@ class SweepProfile:
             raise ConfigurationError("Некоректний профіль одноразового проходу тюнера")
 
 
+SweepStatus = Literal["success", "partial", "failed"]
+CoverageStatus = Literal["complete", "partial", "none"]
+QualityStatus = Literal["valid", "degraded", "unavailable"]
+
+
+@dataclass(frozen=True)
+class SweepProfileMetadata:
+    """Serializable profile shape shared by requested and applied settings."""
+
+    low_hz: float
+    high_hz: float
+    bin_hz: float
+    integration_seconds: float
+    duration_seconds: float
+
+
+@dataclass(frozen=True)
+class DeviceIdentity:
+    """Physical receiver identity; unknown values remain explicit, not omitted."""
+
+    device_id: str = "unknown"
+    model: str = "unknown"
+    tuner: str = "unknown"
+
+
+@dataclass(frozen=True)
+class SweepCoverage:
+    status: CoverageStatus
+    expected_bins: int
+    observed_bins: int
+    fraction: float
+
+
+@dataclass(frozen=True)
+class SweepQuality:
+    status: QualityStatus
+    flags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ErrorClassification:
+    """Stable error category for persistence; raw exception text is not canonical."""
+
+    category: str
+    code: str
+
+
 @dataclass(frozen=True)
 class SpectrumSweep:
     started_at: datetime
@@ -38,23 +86,69 @@ class SpectrumSweep:
     backend: str
     receiver: str = "невідомо"
     tuner: str = "невідомо"
-    status: str = "success"
+    status: SweepStatus = "success"
+    schema_version: str = "spectrum-sweep.v1"
+    sweep_id: str = field(default_factory=lambda: str(uuid4()))
+    sequence: int = 1
+    correlation_id: str | None = None
+    requested_profile: SweepProfileMetadata | None = None
+    actual_profile: SweepProfileMetadata | None = None
+    device: DeviceIdentity = field(default_factory=DeviceIdentity)
+    tool_version: str = "unknown"
+    coverage: SweepCoverage | None = None
+    quality: SweepQuality | None = None
+    error_classification: ErrorClassification | None = None
 
     def __post_init__(self):
+        if self.coverage is None:
+            observed = len(self.powers)
+            status: CoverageStatus = "complete" if self.status == "success" else (
+                "none" if self.status == "failed" else "partial")
+            expected = observed if status == "complete" else max(observed, 1)
+            object.__setattr__(self, "coverage", SweepCoverage(
+                status, expected, observed, observed / expected if expected else 0.0))
+        if self.quality is None:
+            quality: QualityStatus = ("valid" if self.status == "success" else
+                                      "unavailable" if self.status == "failed" else "degraded")
+            object.__setattr__(self, "quality", SweepQuality(quality))
+        if self.actual_profile is None and 0 < self.start_hz < self.stop_hz:
+            object.__setattr__(self, "actual_profile", SweepProfileMetadata(
+                self.start_hz, self.stop_hz, self.bin_width_hz,
+                self.duration_seconds, self.duration_seconds))
+        if self.requested_profile is None and self.actual_profile is not None:
+            object.__setattr__(self, "requested_profile", self.actual_profile)
         values = (self.duration_seconds, self.start_hz, self.stop_hz,
                   self.bin_width_hz, *self.frequencies_hz, *self.powers)
-        if (not all(math.isfinite(v) for v in values)
+        if (self.schema_version != "spectrum-sweep.v1" or not self.sweep_id
+                or type(self.sequence) is not int or self.sequence < 1
+                or not self.tool_version or not all(math.isfinite(v) for v in values)
                 or self.started_at.utcoffset() is None or self.finished_at.utcoffset() is None
                 or self.finished_at < self.started_at or self.duration_seconds < 0
-                or not 0 < self.start_hz < self.stop_hz or self.bin_width_hz <= 0
-                or not self.powers or len(self.powers) != len(self.frequencies_hz)
-                or self.status != "success" or not self.backend
-                or any(not self.start_hz < f < self.stop_hz for f in self.frequencies_hz)
-                or any(b <= a for a, b in zip(self.frequencies_hz, self.frequencies_hz[1:]))
-                or abs(self.stop_hz - self.start_hz - len(self.powers) * self.bin_width_hz) > 2
-                or any(abs(f - (self.start_hz + (i + 0.5) * self.bin_width_hz)) > 2
-                       for i, f in enumerate(self.frequencies_hz))):
+                or not self.backend or self.status not in ("success", "partial", "failed")
+                or (self.status == "success" and (
+                    not 0 < self.start_hz < self.stop_hz or self.bin_width_hz <= 0
+                    or not self.powers or len(self.powers) != len(self.frequencies_hz)
+                    or any(not self.start_hz < f < self.stop_hz for f in self.frequencies_hz)
+                    or any(b <= a for a, b in zip(self.frequencies_hz, self.frequencies_hz[1:]))
+                    or abs(self.stop_hz - self.start_hz - len(self.powers) * self.bin_width_hz) > 2
+                    or any(abs(f - (self.start_hz + (i + 0.5) * self.bin_width_hz)) > 2
+                           for i, f in enumerate(self.frequencies_hz))))
+                or self.status == "failed" and (self.powers or self.frequencies_hz)
+                or self.coverage is None or self.quality is None
+                or self.requested_profile is None
+                or self.coverage.expected_bins < 0 or self.coverage.observed_bins < 0
+                or not 0 <= self.coverage.fraction <= 1
+                or (self.status == "success" and self.coverage.status != "complete")
+                or (self.status == "failed" and self.coverage.status != "none")
+                or (self.status == "success" and self.quality.status != "valid")
+                or (self.status == "failed" and self.quality.status != "unavailable")
+                or (self.status == "failed" and self.error_classification is None)):
             raise ValueError("Некоректний завершений прохід спектра")
+
+    @property
+    def outcome(self) -> SweepStatus:
+        """Canonical name for the terminal status; ``status`` remains API-compatible."""
+        return self.status
 
 
 class MeasurementSink(Protocol):

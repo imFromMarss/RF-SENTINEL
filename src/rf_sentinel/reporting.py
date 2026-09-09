@@ -1,5 +1,6 @@
 """Українські звіти та інженерна карта спектра, незалежні від транспорту."""
 
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -66,7 +67,109 @@ class ReportData:
     gaps: tuple[ReportGap, ...]
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        """Return a JSON-compatible mapping with stable English keys."""
+        value = asdict(self)
+        value["window_start"] = self.window_start.isoformat()
+        value["window_end"] = self.window_end.isoformat()
+        for gap in value["gaps"]:
+            gap["start"] = gap["start"].isoformat()
+            gap["end"] = gap["end"].isoformat()
+        for sweep in value["sweeps"]:
+            sweep["started_at"] = sweep["started_at"].isoformat()
+            sweep["finished_at"] = sweep["finished_at"].isoformat()
+        return value
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "ReportData":
+        """Restore ReportData produced by :meth:`to_dict`."""
+        payload = dict(value)
+        payload["window_start"] = datetime.fromisoformat(payload["window_start"])
+        payload["window_end"] = datetime.fromisoformat(payload["window_end"])
+        payload["frequency_range_hz"] = (
+            tuple(payload["frequency_range_hz"])
+            if payload["frequency_range_hz"] is not None else None
+        )
+        payload["time_ordering"] = tuple(payload["time_ordering"])
+        payload["sweeps"] = tuple(
+            ReportSweep(
+                item["sweep_id"], datetime.fromisoformat(item["started_at"]),
+                datetime.fromisoformat(item["finished_at"]), item["outcome"],
+                item["coverage"], tuple(item.get("frequencies_hz", ())),
+                tuple(item.get("powers", ())), item.get("frequency_start_hz"),
+                item.get("frequency_stop_hz"), item.get("bin_width_hz"),
+            ) for item in payload["sweeps"]
+        )
+        payload["gaps"] = tuple(
+            ReportGap(
+                datetime.fromisoformat(item["start"]), datetime.fromisoformat(item["end"]),
+                item["kind"], item.get("previous_sweep_id"), item.get("next_sweep_id"),
+            ) for item in payload["gaps"]
+        )
+        return cls(**payload)
+
+    def to_text(self, timezone: str = "Europe/Kyiv") -> str:
+        """Render the report for a human; machine-readable names stay in JSON."""
+        zone = ZoneInfo(timezone)
+        start = self.window_start.astimezone(zone)
+        end = self.window_end.astimezone(zone)
+        frequency = "дані відсутні"
+        if self.frequency_range_hz is not None:
+            frequency = (f"{self.frequency_range_hz[0] / 1e6:.6f}–"
+                         f"{self.frequency_range_hz[1] / 1e6:.6f} МГц")
+        peak = "дані відсутні"
+        if self.peak_frequency_hz is not None:
+            peak = (f"{self.peak_frequency_hz / 1e6:.6f} МГц, "
+                    f"{self.peak_power_db:.2f} dB")
+        quality = []
+        if self.partial_count:
+            quality.append("є неповні проходи")
+        if self.failed_count:
+            quality.append("є невдалі проходи")
+        if self.gaps:
+            quality.append(f"виявлено прогалини: {len(self.gaps)}")
+        warning = "; ".join(quality) if quality else "критичних застережень не виявлено"
+        return (
+            "RF Sentinel — звіт часового вікна\n\n"
+            f"Початок вікна: {start:%d.%m.%Y %H:%M:%S} ({timezone})\n"
+            f"Завершення вікна: {end:%d.%m.%Y %H:%M:%S} ({timezone})\n"
+            f"Тривалість: {duration_text((self.window_end - self.window_start).total_seconds())}\n"
+            f"Проходи: {self.success_count} успішних, {self.partial_count} неповних, "
+            f"{self.failed_count} невдалих (усього {self.sweep_count})\n"
+            f"Покриття: {self.coverage * 100:.1f}%\n"
+            f"Діапазон частот: {frequency}\n"
+            f"Пікова частота/потужність: {peak}\n"
+            f"Прогалини: {len(self.gaps)}\n"
+            f"Попередження якості: {warning}\n\n"
+            "Примітка: рівні dB некалібровані та придатні лише для відносного порівняння."
+        )
+
+
+@dataclass(frozen=True)
+class ReportPackage:
+    """All derived artifacts and the window they describe."""
+
+    artifact_dir: Path
+    report_json: Path
+    report_txt: Path
+    waterfall: Path
+    heatmap: Path
+    window_start: datetime
+    window_end: datetime
+
+    @property
+    def paths(self) -> tuple[Path, Path, Path, Path]:
+        return self.report_json, self.report_txt, self.waterfall, self.heatmap
+
+    def to_dict(self) -> dict:
+        return {
+            "artifact_dir": str(self.artifact_dir),
+            "report_json": str(self.report_json),
+            "report_txt": str(self.report_txt),
+            "waterfall": str(self.waterfall),
+            "heatmap": str(self.heatmap),
+            "window_start": self.window_start.isoformat(),
+            "window_end": self.window_end.isoformat(),
+        }
 
 
 def last_hour_window(end: datetime) -> tuple[datetime, datetime]:
@@ -153,7 +256,8 @@ class SQLiteReportEngine:
 
 def _report_limits(report: ReportData) -> tuple[float, float]:
     if report.frequency_range_hz is None:
-        raise ValueError("PNG report needs at least one frequency range")
+        # Empty and failed windows still get a valid, clearly empty artifact.
+        return 0.0, 1.0
     low, high = report.frequency_range_hz
     if not high > low:
         raise ValueError("PNG report frequency range must be increasing")
@@ -166,7 +270,7 @@ def _report_color_limits(report: ReportData) -> tuple[float, float]:
     values = np.asarray(
         [power for sweep in report.sweeps for power in sweep.powers], dtype=float,
     )
-    return color_limits(values)
+    return color_limits(values) if values.size else (-1.0, 1.0)
 
 
 def _frequency_edges(frequencies: tuple[float, ...], low: float, high: float,
@@ -299,6 +403,23 @@ def render_report_images(report: ReportData, waterfall: str | Path,
     render_report_waterfall(report, waterfall_path, timezone)
     render_report_heatmap(report, heatmap_path, timezone)
     return waterfall_path, heatmap_path
+
+
+def generate_report_package(report: ReportData, destination: str | Path,
+                            timezone: str = "Europe/Kyiv") -> ReportPackage:
+    """Write the complete four-file package from ReportData only."""
+    directory = Path(destination)
+    directory.mkdir(parents=True, exist_ok=True)
+    report_json = directory / "report.json"
+    report_txt = directory / "report.txt"
+    waterfall = directory / "waterfall.png"
+    heatmap = directory / "heatmap.png"
+    report_json.write_text(json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    report_txt.write_text(report.to_text(timezone) + "\n", encoding="utf-8")
+    render_report_images(report, waterfall, heatmap, timezone)
+    return ReportPackage(directory, report_json, report_txt, waterfall, heatmap,
+                         report.window_start, report.window_end)
 
 
 def duration_text(seconds: float) -> str:

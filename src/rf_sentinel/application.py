@@ -6,7 +6,7 @@ from pathlib import Path
 import signal
 import socket
 import sys
-from threading import Event
+from threading import Event, Thread
 
 from rf_sentinel.config import Settings
 from rf_sentinel.errors import SentinelError
@@ -19,6 +19,29 @@ def configure_logging(data_dir: Path) -> None:
 
 def _shutdown_signal(signum, frame) -> None:
     raise KeyboardInterrupt
+
+
+def _start_telegram_polling(settings: Settings, stop: Event, notifier):
+    """Attach inbound Telegram to a long-running application mode."""
+    if not settings.telegram_enabled:
+        return None
+    from rf_sentinel.telegram import TelegramPollingRuntime, TelegramReportHandler
+
+    handler = TelegramReportHandler.from_settings(settings, notifier)
+    runtime = TelegramPollingRuntime(
+        settings.telegram_bot_token, handler, stop,
+        attempts=settings.telegram_attempts,
+        backoff_seconds=settings.telegram_backoff_seconds,
+    )
+    thread = Thread(target=runtime.run, name="telegram-inbound", daemon=True)
+    thread.start()
+    return thread
+
+
+def _stop_telegram_polling(thread, stop: Event) -> None:
+    stop.set()
+    if thread is not None:
+        thread.join(timeout=20)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -50,11 +73,13 @@ def main(argv: list[str] | None = None) -> int:
                 timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
             )
             stop = Event()
+            inbound_thread = _start_telegram_polling(settings, stop, notifier)
             previous = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, _shutdown_signal)
             try:
                 run_report_scheduler(runner, stop)
             finally:
+                _stop_telegram_polling(inbound_thread, stop)
                 signal.signal(signal.SIGTERM, previous)
             return 0
         from rf_sentinel.rtl_power import RTLPowerSurveyAdapter
@@ -86,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         logger = logging.getLogger("rf_sentinel.application")
         logger.info("RF Sentinel запущено; конфігурацію перевірено; monitoring активний")
         stop = Event()
+        inbound_thread = _start_telegram_polling(settings, stop, notifier)
         previous = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, _shutdown_signal)
         try:
@@ -95,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                 notify_status=workflow.notify_status,
             )
         finally:
+            _stop_telegram_polling(inbound_thread, stop)
             signal.signal(signal.SIGTERM, previous)
         return 0
     except KeyboardInterrupt:

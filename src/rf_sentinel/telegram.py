@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from threading import Event
+from typing import TYPE_CHECKING, Callable, Protocol
 from urllib.parse import urlencode
 
 from rf_sentinel.errors import NotificationError
@@ -21,6 +22,7 @@ LAST_HOUR_REPORT_BUTTON = "📊 Звіт за останню годину"
 
 MAX_PHOTO_BYTES = 9 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_UPDATE_BATCH = 100
 
 
 class Notifier(Protocol):
@@ -136,6 +138,112 @@ class TelegramReportHandler:
             return InboundReportResult("failed")
 
 
+class TelegramPollingRuntime:
+    """Run the inbound Telegram boundary without owning monitoring resources.
+
+    Telegram transport failures are isolated to this loop.  The update offset
+    is advanced after each syntactically accepted update, including an
+    unauthorized or unsupported update, so Telegram does not redeliver it.
+    """
+
+    def __init__(self, token: str, handler: TelegramReportHandler, stop: Event,
+                 *, connection_factory=None, http_timeout: float = 15,
+                 long_poll_timeout: int = 5, attempts: int = 3,
+                 backoff_seconds: float = 5,
+                 sleeper: Callable[[float], object] | None = None):
+        if not token:
+            raise NotificationError("Потрібні облікові дані Telegram")
+        if not 0 < http_timeout <= 60:
+            raise ValueError("http_timeout must be between 0 and 60 seconds")
+        if not 0 <= long_poll_timeout <= 50:
+            raise ValueError("long_poll_timeout must be between 0 and 50 seconds")
+        if not 1 <= attempts <= 5:
+            raise ValueError("attempts must be between 1 and 5")
+        if not 0 <= backoff_seconds <= 300:
+            raise ValueError("backoff_seconds must be between 0 and 300 seconds")
+        self._token = token
+        self.handler = handler
+        self.stop = stop
+        self._connection_factory = connection_factory or http.client.HTTPSConnection
+        self.http_timeout = http_timeout
+        self.long_poll_timeout = long_poll_timeout
+        self.attempts = attempts
+        self.backoff_seconds = backoff_seconds
+        self.sleeper = sleeper or self.stop.wait
+        self.offset: int | None = None
+        self._transport_get_updates = getattr(handler.notifier, "get_updates", None)
+
+    def _get_updates(self) -> list[dict]:
+        if self._transport_get_updates is not None:
+            return self._transport_get_updates(self.offset, self.long_poll_timeout, MAX_UPDATE_BATCH)
+        connection = None
+        try:
+            connection = self._connection_factory("api.telegram.org", timeout=self.http_timeout)
+            parameters = {"timeout": self.long_poll_timeout, "limit": MAX_UPDATE_BATCH}
+            if self.offset is not None:
+                parameters["offset"] = self.offset
+            connection.request(
+                "POST", f"/bot{self._token}/getUpdates",
+                body=urlencode(parameters).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                raise NotificationError("Помилка HTTP-запиту Telegram")
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(payload) > MAX_RESPONSE_BYTES:
+                raise NotificationError("Відповідь Telegram перевищила ліміт розміру")
+            value = json.loads(payload)
+            updates = value.get("result") if isinstance(value, dict) and value.get("ok") is True else None
+            if not isinstance(updates, list) or len(updates) > MAX_UPDATE_BATCH:
+                raise NotificationError("Некоректна відповідь Telegram")
+            return [update for update in updates if isinstance(update, dict)]
+        except (OSError, http.client.HTTPException, ValueError, TypeError) as error:
+            raise NotificationError("Помилка транспорту Telegram або некоректний JSON") from error
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except (OSError, http.client.HTTPException):
+                    pass
+
+    def poll_once(self) -> int:
+        """Fetch and dispatch one batch; return the number of accepted updates."""
+        updates = None
+        for attempt in range(1, self.attempts + 1):
+            if self.stop.is_set():
+                return 0
+            try:
+                updates = self._get_updates()
+                break
+            except NotificationError:
+                if attempt == self.attempts:
+                    logger.warning("Telegram inbound polling failed; monitoring continues")
+                    return 0
+                logger.warning("Telegram inbound polling failed; retry %d/%d",
+                               attempt + 1, self.attempts)
+                self.sleeper(self.backoff_seconds)
+        accepted = 0
+        for update in updates or ():
+            update_id = update.get("update_id")
+            if type(update_id) is not int or (self.offset is not None and update_id < self.offset):
+                continue
+            try:
+                self.handler.handle_update(update)
+            except Exception as error:
+                # A malformed handler dependency must not poison the polling loop.
+                logger.error("Telegram inbound update handling failed (%s)", type(error).__name__)
+            finally:
+                self.offset = update_id + 1
+                accepted += 1
+        return accepted
+
+    def run(self) -> None:
+        """Poll until stopped; failures never terminate the monitoring process."""
+        while not self.stop.is_set():
+            self.poll_once()
+
+
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str, *, connection_factory=None):
         # Перевірка діє і для викликів поза точкою складання application.
@@ -147,6 +255,39 @@ class TelegramNotifier:
         self._token = token
         self._chat_id = chat_id
         self._connection_factory = connection_factory or http.client.HTTPSConnection
+
+    def get_updates(self, offset: int | None, timeout: int, limit: int) -> list[dict]:
+        """Fetch inbound updates through the same Bot API transport boundary."""
+        connection = None
+        try:
+            connection = self._connection_factory("api.telegram.org", timeout=min(15, timeout + 10))
+            parameters = {"timeout": timeout, "limit": limit}
+            if offset is not None:
+                parameters["offset"] = offset
+            connection.request(
+                "POST", f"/bot{self._token}/getUpdates",
+                body=urlencode(parameters).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            if not 200 <= response.status < 300:
+                raise NotificationError("Помилка HTTP-запиту Telegram")
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(payload) > MAX_RESPONSE_BYTES:
+                raise NotificationError("Відповідь Telegram перевищила ліміт розміру")
+            value = json.loads(payload)
+            updates = value.get("result") if isinstance(value, dict) and value.get("ok") is True else None
+            if not isinstance(updates, list) or len(updates) > limit:
+                raise NotificationError("Некоректна відповідь Telegram")
+            return [update for update in updates if isinstance(update, dict)]
+        except (OSError, http.client.HTTPException, ValueError, TypeError) as error:
+            raise NotificationError("Помилка транспорту Telegram або некоректний JSON") from error
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except (OSError, http.client.HTTPException):
+                    pass
 
     def _post(self, method: str, body: bytes, content_type: str) -> int | None:
         connection = None

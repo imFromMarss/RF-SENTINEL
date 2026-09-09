@@ -72,14 +72,14 @@
 - **Consequences:** The normalized contract protects downstream components. A hybrid per-device adapter strategy remains valid.
 - **Evidence required:** Device discovery, supported profile settings, sample/stream stability, disconnect/reconnect, USB, CPU/RAM, and packaging tests on target CM4.
 
-## ADR-009: Do not select final persistence technology yet
+## ADR-009: Use SQLite for the local prototype persistence boundary
 
-- **Status:** DEFERRED
-- **Context:** Requirements distinguish structured records, high-volume measurements, binary captures, artifacts, and logs, but CM4 disk/load/query evidence is absent.
-- **Decision:** Define repository/artifact boundaries and authoritative data categories only. Defer database/file-format selection and retention values.
+- **Status:** ACCEPTED FOR LOCAL PROTOTYPE; production retention/deployment validation pending
+- **Context:** The continuous acquisition and report consumers need a durable local hand-off. The implementation persists canonical sweeps, measurement payloads, metadata, and bounded incidents in one SQLite database.
+- **Decision:** Use `runtime/sweeps.sqlite3` as the persistent local store for acquisition and report queries. Keep report artifacts as separate files and retain storage/production-capacity thresholds as deployment concerns.
 - **Alternatives:** Select one embedded database now; CSV-only; time-series database now.
-- **Consequences:** Architecture work remains technology-neutral. Storage interfaces must accommodate source-volume and artifact differences.
-- **Evidence required:** Disk, retention, historical query/report, and recovery experiments.
+- **Consequences:** Acquisition and reporting share a durable local source without coupling their lifecycles. SQLite does not become a claim that all future domain, IQ, or production-retention needs are solved.
+- **Evidence required:** Raspberry Pi endurance, capacity, retention, and recovery validation before production deployment.
 
 ## ADR-010: Keep IQ capture and classification optional
 
@@ -111,4 +111,4 @@
 - **Ризики та їх зменшення:** Interpreter і objects додають memory overhead; CPU-heavy pure-Python loops можуть стати bottleneck; dynamic typing потребує дисципліни на boundaries. У разі прийняття рішення Python runtime стане deployment dependency. Blocking work, cancellation, subprocess termination/reaping і clean shutdown потребують явного дизайну. Ризики зменшуються bounded queues/buffers, explicit contracts, validation, automated tests і profiling. Native implementations або додаткова process isolation розглядаються лише за підтвердженої потреби та відповідного architecture review.
 - **Архітектурні межі:** Пропозиція не приймає draft SDR Device Architecture APIs і не змінює ADR-003, ADR-006, ADR-008, ADR-009 або ADR-010. Зберігаються RX-only, цільова платформа CM4/Linux ARM64, підтримка RTL-SDR/HackRF, одна systemd-supervised station service із supervised acquisition child processes, Device Manager як єдиний reservation authority та контрольована Command/Query boundary для Telegram без прямого SDR/shell authority. Новий runtime process model або message broker не запроваджується; persistence, SoapySDR та optional IQ/classification не приймаються цим рішенням.
 - **Свідомо відкладено:** Точна Python version; package name; dependency/package manager; build backend; `pyproject.toml`; formatter; linter; type checker; test framework; CI; concurrency implementation; configuration format/library; persistence technology; native bindings mechanism; SoapySDR adoption; optional IQ/classification implementation. Конкретні libraries та runtime dependencies не обираються.
-- **Review та необхідні підтвердження:** Статус залишається PROPOSED до окремого human/Product Owner decision після review. CM4 workload, memory, storage/report processing, endurance і subprocess failure/recovery перевіряються за [EXPERIMENTS.md](research/EXPERIMENTS.md); вибір мови не замінює ці перевірки й не встановлює performance thresholds.
+- **Review та необхідні підтвердження:** Рішення ACCEPTED. CM4 workload, memory, storage/report processing, endurance і subprocess failure/recovery перевіряються за [EXPERIMENTS.md](research/EXPERIMENTS.md); вибір мови не замінює ці перевірки й не встановлює performance thresholds.

@@ -3,11 +3,14 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import math
+from queue import Empty, Full, Queue
+from threading import Condition, Thread
 import time
 from typing import Callable, Literal, Protocol, TypeVar
 from uuid import uuid4
 
-from rf_sentinel.errors import ConfigurationError, ScanError
+from rf_sentinel.errors import (ConfigurationError, MeasurementPersistenceError,
+                                MeasurementQueueFullError, MeasurementSinkError, ScanError)
 
 
 @dataclass(frozen=True)
@@ -151,10 +154,22 @@ class SpectrumSweep:
         return self.status
 
 
-class MeasurementSink(Protocol):
-    """Швидке приймання завершеного frame; rendering виконується окремим consumer."""
+MeasurementStatus = Literal["accepted", "persisted", "rejected", "failed"]
 
-    def store_sweep(self, sweep: SpectrumSweep) -> None: ...
+
+@dataclass
+class MeasurementReceipt:
+    """Outcome of one hand-off; ``accepted`` is not a durability claim."""
+
+    sweep_id: str
+    status: MeasurementStatus
+    error: BaseException | None = None
+
+
+class MeasurementSink(Protocol):
+    """Boundary for completed frames; a result makes hand-off explicit."""
+
+    def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt | None: ...
 
 
 class SweepSource(Protocol):
@@ -167,8 +182,158 @@ class LatestSweepSink:
     def __init__(self):
         self.latest: SpectrumSweep | None = None
 
-    def store_sweep(self, sweep: SpectrumSweep) -> None:
+    def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt:
         self.latest = sweep
+        return MeasurementReceipt(sweep.sweep_id, "persisted")
+
+
+class AsyncMeasurementSink:
+    """Bounded in-process hand-off to a serialized persistence consumer.
+
+    A successful ``store_sweep`` means only that this process owns the queued
+    item.  It becomes ``persisted`` in the receipt after the downstream sink
+    returns.  Queued items are deliberately non-durable and are rejected on
+    close after a writer failure or process restart.
+    """
+
+    def __init__(self, downstream: MeasurementSink, *, max_queue: int = 32,
+                 enqueue_timeout: float = 0.1, thread_name: str = "measurement-writer"):
+        if type(max_queue) is not int or max_queue < 1:
+            raise ConfigurationError("Розмір черги MeasurementSink має бути додатним")
+        if not math.isfinite(enqueue_timeout) or enqueue_timeout < 0:
+            raise ConfigurationError("Timeout черги MeasurementSink некоректний")
+        self._downstream = downstream
+        self._queue: Queue[tuple[SpectrumSweep, MeasurementReceipt]] = Queue(maxsize=max_queue)
+        self._enqueue_timeout = enqueue_timeout
+        self._condition = Condition()
+        self._pending = 0
+        self._closing = False
+        self._closed = False
+        self._failure: BaseException | None = None
+        self._writer = Thread(target=self._write_loop, name=thread_name, daemon=False)
+        self.accepted_count = self.persisted_count = 0
+        self.rejected_count = self.failed_count = 0
+        self._writer.start()
+
+    @property
+    def failure(self) -> BaseException | None:
+        return self._failure
+
+    @property
+    def pending_count(self) -> int:
+        with self._condition:
+            return self._pending
+
+    def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt:
+        receipt = MeasurementReceipt(sweep.sweep_id, "accepted")
+        with self._condition:
+            if self._closing or self._closed:
+                receipt.status = "rejected"
+                receipt.error = MeasurementSinkError("MeasurementSink is closed")
+                self.rejected_count += 1
+                return receipt
+            if self._failure is not None:
+                receipt.status = "failed"
+                receipt.error = self._failure
+                self.failed_count += 1
+                return receipt
+            self._pending += 1
+            self.accepted_count += 1
+        try:
+            self._queue.put((sweep, receipt), timeout=self._enqueue_timeout)
+        except Full:
+            with self._condition:
+                self._pending -= 1
+                self.rejected_count += 1
+                self._condition.notify_all()
+            receipt.status = "rejected"
+            receipt.error = MeasurementQueueFullError("MeasurementSink queue is full")
+        return receipt
+
+    def _write_loop(self) -> None:
+        while True:
+            try:
+                sweep, receipt = self._queue.get(timeout=0.05)
+            except Empty:
+                with self._condition:
+                    if self._closing and self._pending == 0:
+                        return
+                continue
+            try:
+                if self._failure is not None:
+                    receipt.status = "failed"
+                    receipt.error = self._failure
+                    self.failed_count += 1
+                else:
+                    persist = getattr(self._downstream, "store_sweep", self._downstream)
+                    persist(sweep)
+                    receipt.status = "persisted"
+                    self.persisted_count += 1
+            except BaseException as error:
+                with self._condition:
+                    if self._failure is None:
+                        self._failure = MeasurementPersistenceError(
+                            "MeasurementSink persistence failed")
+                receipt.status = "failed"
+                receipt.error = self._failure
+                self.failed_count += 1
+            finally:
+                with self._condition:
+                    self._pending -= 1
+                    should_exit = self._closing and self._pending == 0
+                    self._condition.notify_all()
+                self._queue.task_done()
+                if should_exit:
+                    return
+
+    def flush(self, timeout: float | None = None) -> None:
+        """Wait for all accepted items; raises if any item was not persisted."""
+        if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
+            raise ValueError("flush timeout must be finite and non-negative")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._pending:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("MeasurementSink flush timed out")
+                self._condition.wait(remaining)
+            if self._failure is not None:
+                raise self._failure
+
+    def close(self, timeout: float | None = None) -> None:
+        """Drain and stop the non-daemon writer; no orphan writer is allowed."""
+        with self._condition:
+            if self._closed:
+                return
+            self._closing = True
+        error = None
+        try:
+            self.flush(timeout)
+        except BaseException as exc:
+            error = exc
+        self._writer.join(timeout)
+        if self._writer.is_alive():
+            raise TimeoutError("MeasurementSink writer did not stop")
+        with self._condition:
+            while True:
+                try:
+                    _, receipt = self._queue.get_nowait()
+                except Empty:
+                    break
+                receipt.status = "rejected"
+                receipt.error = error or self._failure or MeasurementSinkError("Sink closed")
+                self.rejected_count += 1
+                self._queue.task_done()
+            self._closed = True
+        downstream_close = getattr(self._downstream, "close", None)
+        if downstream_close is not None:
+            try:
+                downstream_close()
+            except BaseException as exc:
+                if error is None:
+                    error = MeasurementPersistenceError("MeasurementSink close failed")
+        if error is not None:
+            raise error
 
 
 T = TypeVar("T")
@@ -231,7 +396,11 @@ class SpectrumAcquisitionWorker:
             return self.source.acquire(self.profile)
 
         def complete(sweep):
-            self.sink.store_sweep(sweep)
+            receipt = self.sink.store_sweep(sweep)
+            if receipt is not None and receipt.status in ("rejected", "failed"):
+                if isinstance(receipt.error, BaseException):
+                    raise receipt.error
+                raise MeasurementSinkError(f"MeasurementSink {receipt.status}")
             self.observer.completed(sweep)
             return True
 
@@ -249,6 +418,22 @@ class SpectrumAcquisitionWorker:
             self.observer.sweep_started(self.now(), cadence)
             return acquire()
 
+        def shutdown(failed):
+            lifecycle_error = None
+            try:
+                close = getattr(self.sink, "close", None)
+                if close is not None:
+                    close()
+                else:
+                    flush = getattr(self.sink, "flush", None)
+                    if flush is not None:
+                        flush()
+            except BaseException as error:
+                lifecycle_error = error
+            self.observer.shutdown(failed or lifecycle_error is not None)
+            if lifecycle_error is not None:
+                raise lifecycle_error
+
         run_continuous_loop(cycle, self.recovery_seconds, self.stop,
                             lambda: self.observer.start(self.now()),
-                            complete, failure, self.observer.shutdown, wait_after_success)
+                            complete, failure, shutdown, wait_after_success)

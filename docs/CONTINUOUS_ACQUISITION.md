@@ -39,12 +39,19 @@ Overlap та catch-up відсутні. `flock` на локальному lock-�
 Пристрій відкривається заново для кожного проходу; цей overhead входить у benchmark.
 Safety timeout одноразового subprocess — 90 секунд, CSV ≤64 MiB, stderr ≤1 MiB.
 
-Sink має швидко приймати frame без rendering/reporting. Поточний `LatestSweepSink`
-зберігає лише останній frame у RAM: споживання пам’яті обмежене, історія втрачається
-при перезапуску. Майбутні reports працюватимуть окремими downstream consumers.
-Port синхронний: повільна реалізація sink збільшить cadence; Stage 2 має визначити
-буферизацію та backpressure. Помилка sink завершує application зі станом `failed`,
-а не запускає повторний RF-прийом і не приховує втрату даних.
+Sink має швидко приймати frame без rendering/reporting. `AsyncMeasurementSink` має
+bounded in-process queue і один non-daemon writer: acquisition чекає лише bounded
+`enqueue_timeout`, а не latency storage. Результат hand-off має чотири стани:
+`accepted` означає ownership queue (не durability), `persisted` — downstream підтвердив
+запис, `rejected` — queue/стан sink не прийняв frame, `failed` — downstream не зміг
+записати frame. Queue-full збільшує explicit rejection counter; writer failure є
+sticky і піднімається через `flush`/`close`, тому не стає тихою втратою.
+
+`flush` чекає завершення всіх accepted frames і помиляється, якщо будь-який не став
+`persisted`. `close` спочатку drains queue, закриває downstream і зупиняє writer;
+після process crash queued-but-not-persisted frames не вважаються durable й можуть
+бути втрачені. `LatestSweepSink` залишається lightweight RAM implementation для
+hardware-free runtime; final persistent storage не обирається цим етапом.
 
 ## Відмови та завершення
 

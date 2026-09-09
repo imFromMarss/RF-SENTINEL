@@ -20,3 +20,15 @@ class ParseError(ScanError):
 
 class NotificationError(SentinelError):
     pass
+
+
+class MeasurementSinkError(SentinelError):
+    """The acquisition-to-persistence boundary could not accept a sweep."""
+
+
+class MeasurementQueueFullError(MeasurementSinkError):
+    pass
+
+
+class MeasurementPersistenceError(MeasurementSinkError):
+    pass

@@ -160,7 +160,7 @@ def test_atomic_snapshot(tmp_path, monkeypatch):
 
 
 def test_single_shot_command(monkeypatch):
-    from test_rtl_power import FakeProcess
+    from tests.test_rtl_power import FakeProcess
     processes = []
     def spawn(command, **kwargs):
         process = FakeProcess(command, **kwargs)
@@ -265,7 +265,7 @@ def test_preexisting_stop_does_not_acquire(tmp_path):
 
 def test_kill_fallback_reaps_child(monkeypatch):
     import subprocess
-    from test_rtl_power import FakeProcess
+    from tests.test_rtl_power import FakeProcess
     processes = []
     def spawn(command, **kwargs):
         process = FakeProcess(command, **kwargs)

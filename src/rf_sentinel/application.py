@@ -12,9 +12,9 @@ from rf_sentinel.config import Settings
 from rf_sentinel.errors import SentinelError
 
 
-def configure_logging(data_dir: Path) -> None:
+def configure_logging(data_dir: Path, max_bytes: int = 5_000_000, backups: int = 3) -> None:
     from rf_sentinel.observability import configure_operational_logging
-    configure_operational_logging(data_dir / "logs")
+    configure_operational_logging(data_dir / "logs", max_bytes, backups)
 
 
 def _shutdown_signal(signum, frame) -> None:
@@ -61,16 +61,20 @@ def main(argv: list[str] | None = None) -> int:
             from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler
             from rf_sentinel.telegram import TelegramNotifier
 
-            configure_logging(settings.data_dir)
+            configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
+            from rf_sentinel.storage import SQLiteMeasurementSink
             notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id) \
                 if settings.telegram_enabled else None
             if notifier is None:
                 logger = logging.getLogger("rf_sentinel.application")
                 logger.error("Report scheduler requires Telegram configuration")
                 return 1
+            storage = SQLiteMeasurementSink(settings.sweeps_path,
+                                            incident_retention=settings.incident_retention)
             runner = ScheduledReportRunner(
                 SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
                 timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
+                storage=storage,
             )
             stop = Event()
             inbound_thread = _start_telegram_polling(settings, stop, notifier)
@@ -81,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 _stop_telegram_polling(inbound_thread, stop)
                 signal.signal(signal.SIGTERM, previous)
+                storage.close()
             return 0
         from rf_sentinel.rtl_power import RTLPowerSurveyAdapter
         from rf_sentinel.scheduler import run_continuous

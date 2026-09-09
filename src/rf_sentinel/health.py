@@ -46,6 +46,12 @@ class AcquisitionHealth:
     failed_persists: int = 0
     sqlite_db_size_bytes: int | None = None
     storage_error: str | None = None
+    report_status: str = "unknown"
+    total_completed_reports: int = 0
+    total_failed_reports: int = 0
+    consecutive_report_failures: int = 0
+    last_successful_report_at: str | None = None
+    last_report_error_reason: str | None = None
 
     @classmethod
     def started(cls) -> "AcquisitionHealth":
@@ -98,3 +104,15 @@ def write_health_snapshot(path: Path, state: AcquisitionHealth) -> None:
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def load_health_snapshot(path: Path) -> AcquisitionHealth:
+    """Load the canonical health model, tolerating snapshots from older builds."""
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(values, dict):
+            raise ValueError
+        fields = set(AcquisitionHealth.__dataclass_fields__)
+        return AcquisitionHealth(**{key: value for key, value in values.items() if key in fields})
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return AcquisitionHealth.started()

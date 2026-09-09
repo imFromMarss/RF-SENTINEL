@@ -2,6 +2,7 @@
 
 import json
 import logging
+from uuid import uuid4
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -10,7 +11,9 @@ from zoneinfo import ZoneInfo
 
 from rf_sentinel.acquisition import run_continuous_loop
 from rf_sentinel.errors import SentinelError
-from rf_sentinel.health import AcquisitionHealth, write_health_snapshot
+from rf_sentinel.health import (AcquisitionHealth, load_health_snapshot,
+                                write_health_snapshot)
+from rf_sentinel.errors import MeasurementPersistenceError
 from rf_sentinel.reporting import (completed_calendar_day, completed_calendar_hour,
                                    generate_report_package)
 
@@ -107,7 +110,9 @@ class ScheduledReportRunner:
 
     def __init__(self, report_engine, notifier, data_dir: str | Path,
                  *, timezone: str = "Europe/Kyiv", clock: Callable[[], datetime] | None = None,
-                 delivery_attempts: int = 1, sleeper: Callable[[float], object] | None = None):
+                 delivery_attempts: int = 1, sleeper: Callable[[float], object] | None = None,
+                 storage=None, health_path: str | Path | None = None,
+                 state: AcquisitionHealth | None = None):
         if delivery_attempts < 1:
             raise ValueError("delivery_attempts must be positive")
         self.report_engine = report_engine
@@ -119,7 +124,54 @@ class ScheduledReportRunner:
         self.delivery_attempts = delivery_attempts
         self.sleeper = sleeper
         self.state_path = self.data_dir / "reports" / "scheduled" / "delivery-state.json"
+        self.health_path = Path(health_path or self.data_dir / "status" / "health.json")
+        self.state = state or load_health_snapshot(self.health_path)
+        if storage is None:
+            from rf_sentinel.storage import SQLiteMeasurementSink
+            storage = SQLiteMeasurementSink(self.data_dir / "sweeps.sqlite3")
+        self.storage = storage
+        self._report_failures = self.state.consecutive_report_failures
         self._delivered = self._load_delivered()
+
+    def _save_health(self) -> None:
+        try:
+            write_health_snapshot(self.health_path, self.state)
+        except (OSError, ValueError):
+            logger.error("Scheduled reports: health snapshot unavailable")
+
+    def _incident(self, classification: str, message: str, result: str) -> None:
+        try:
+            self.storage.record_incident(
+                component="report-scheduler", classification=classification,
+                safe_message=message, correlation_id=str(uuid4()), recovery_result=result,
+            )
+        except MeasurementPersistenceError:
+            logger.error("Scheduled reports: incident history unavailable")
+
+    def _failure(self, classification: str, message: str) -> None:
+        self._report_failures += 1
+        self.state.report_status = "failed"
+        self.state.total_failed_reports += 1
+        self.state.consecutive_report_failures = self._report_failures
+        self.state.last_report_error_reason = classification
+        if self.state.application_status not in ("recovering", "failed"):
+            self.state.application_status = "degraded"
+        self._incident(classification, message, "retry_scheduled")
+        self._save_health()
+
+    def _success(self) -> None:
+        recovered = self._report_failures > 0
+        self.state.report_status = "running"
+        self.state.total_completed_reports += 1
+        self.state.consecutive_report_failures = 0
+        self.state.last_successful_report_at = datetime.now(UTC).isoformat()
+        self.state.last_report_error_reason = None
+        if recovered:
+            self._incident("recovery", "Запланована доставка звітів відновлена", "recovered")
+            if self.state.application_status == "degraded":
+                self.state.application_status = "running"
+        self._report_failures = 0
+        self._save_health()
 
     @staticmethod
     def _key(kind: str, start: datetime, end: datetime) -> str:
@@ -164,15 +216,24 @@ class ScheduledReportRunner:
                     self.sleeper(0)
             if getattr(delivery, "status", None) != "sent":
                 logger.error("Scheduled %s report delivery failed", kind)
+                self._failure("telegram_delivery", "Не вдалося доставити запланований звіт")
                 return False
             self._delivered.add(key)
             self._persist_delivered()
+            self._success()
             logger.info("Scheduled %s report delivered: %s–%s", kind, start, end)
             return True
+        except MeasurementPersistenceError:
+            logger.error("Scheduled %s report persistence failed", kind)
+            self._failure("report_persistence", "Не вдалося зберегти стан запланованого звіту")
+            return False
         except Exception:
             # Derived report and transport failures must not affect acquisition
             # or prevent the next calendar boundary from being evaluated.
-            logger.exception("Scheduled %s report failed", kind)
+            # Do not serialize exception text: external transports may include
+            # URLs, identifiers, or response bodies in it.
+            logger.error("Scheduled %s report generation failed", kind)
+            self._failure("report_generation", "Не вдалося сформувати запланований звіт")
             return False
 
     def run_pending(self, now: datetime | None = None) -> tuple[str, ...]:

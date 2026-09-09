@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env(acquisition_only=True) if args.mode == "acquire" else Settings.from_env()
         if args.mode == "acquire":
             return run_acquisition(settings)
-        from rf_sentinel.rtl_power import RTLPowerScanner
+        from rf_sentinel.rtl_power import RTLPowerSurveyAdapter
         from rf_sentinel.scheduler import run_continuous
         from rf_sentinel.spectrum import ScanProfile
         from rf_sentinel.telegram import TelegramNotifier
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
             settings.survey_integration_seconds, settings.survey_duration_seconds,
         )
         workflow = SurveyWorkflow(
-            RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain),
+            RTLPowerSurveyAdapter(settings.rtl_device_index, settings.rtl_gain),
             profile, settings.data_dir, f"RF Sentinel / {socket.gethostname()}", notifier,
             timezone=settings.timezone, telegram_attempts=settings.telegram_attempts,
             telegram_backoff_seconds=settings.telegram_backoff_seconds,

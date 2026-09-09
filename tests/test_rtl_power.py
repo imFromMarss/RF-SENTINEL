@@ -4,7 +4,7 @@ import traceback
 import pytest
 
 from rf_sentinel.errors import ConfigurationError, ParseError, ScanError
-from rf_sentinel.rtl_power import RTLPowerScanner, parse_rtl_power
+from rf_sentinel.rtl_power import RTLPowerScanner, RTLPowerSurveyAdapter, parse_rtl_power
 from rf_sentinel.spectrum import ScanProfile
 
 
@@ -84,7 +84,7 @@ def test_subprocess_is_bounded_and_environment_isolated(monkeypatch):
         return process
     monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setenv("RF_SENTINEL_TELEGRAM_BOT_TOKEN", "synthetic-private")
-    result = RTLPowerScanner(1, 20.7).scan(ScanProfile())
+    result = RTLPowerSurveyAdapter(1, 20.7).scan(ScanProfile())
     process = processes[0]
     assert process.command == [
         "rtl_power", "-f", "88000000:108000000:125000", "-i", "10", "-e", "30",
@@ -125,7 +125,7 @@ def test_subprocess_failures_and_cleanup(monkeypatch, kind, tmp_path):
     if kind == "size":
         monkeypatch.setattr("rf_sentinel.rtl_power.MAX_CSV_BYTES", 10)
     with pytest.raises(KeyboardInterrupt if kind == "interrupt" else ScanError) as error:
-        RTLPowerScanner().scan(ScanProfile(), tmp_path / "spectrum.csv")
+        RTLPowerSurveyAdapter().scan(ScanProfile(), tmp_path / "spectrum.csv")
     assert "private" not in "".join(traceback.format_exception(error.value))
     if processes:
         assert processes[0].waited
@@ -157,7 +157,7 @@ def test_out_of_range_spectrum_rejected(monkeypatch):
         return process
     monkeypatch.setattr(subprocess, "Popen", spawn)
     with pytest.raises(ScanError, match="покривають"):
-        RTLPowerScanner().scan(ScanProfile())
+        RTLPowerSurveyAdapter().scan(ScanProfile())
 
 
 def test_full_range_profile_and_raw_file(monkeypatch, tmp_path):
@@ -170,7 +170,7 @@ def test_full_range_profile_and_raw_file(monkeypatch, tmp_path):
     raw = tmp_path / "spectrum.csv"
     profile = ScanProfile.full_range(24_000_000, 1_766_000_000)
     with pytest.raises(ScanError, match="покривають"):
-        RTLPowerScanner().scan(profile, raw)
+        RTLPowerSurveyAdapter().scan(profile, raw)
     assert raw.exists()
     assert raw.read_text() == CSV
     assert processes[0].command[2] == "24000000:1766000000:500000"

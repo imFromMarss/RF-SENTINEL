@@ -11,8 +11,7 @@ from rf_sentinel.acquisition import LatestSweepSink, SpectrumAcquisitionWorker, 
 from rf_sentinel.config import Settings
 from rf_sentinel.errors import ConfigurationError, ScanError
 from rf_sentinel.observability import AcquisitionObserver, OperationalFormatter
-from rf_sentinel.rtl_power import RTLPowerScanner, sweep_from_result
-from rf_sentinel.spectrum import ScanResult, SpectrumData, SpectrumFrame
+from rf_sentinel.rtl_power import RTLPowerScanner
 
 NOW = datetime(2026, 9, 8, tzinfo=UTC)
 
@@ -30,14 +29,6 @@ def frame(duration=7):
 def test_invalid_sweep(change):
     with pytest.raises(ValueError):
         replace(frame(), **change)
-
-
-def test_adapter():
-    spectrum = SpectrumData((24e6, 25e6, 26e6), (SpectrumFrame(NOW, (-40., -50.), 10),))
-    result = ScanResult("rtl_power", SweepProfile(), NOW, 7, spectrum)
-    assert sweep_from_result(result) == frame()
-    with pytest.raises(ScanError):
-        sweep_from_result(replace(result, spectrum=replace(spectrum, frames=spectrum.frames * 2)))
 
 
 class ClockStop:

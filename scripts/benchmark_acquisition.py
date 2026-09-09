@@ -8,7 +8,7 @@ import time
 
 from rf_sentinel.acquisition import SweepProfile
 from rf_sentinel.errors import ScanError
-from rf_sentinel.rtl_power import RTLPowerScanner, sweep_from_result
+from rf_sentinel.rtl_power import RTLPowerScanner
 
 
 def main():
@@ -23,8 +23,7 @@ def main():
         started = time.monotonic()
         row = {"profile": asdict(profile), "started_at": datetime.now(UTC).isoformat()}
         try:
-            result = RTLPowerScanner().scan(profile, raw)
-            sweep = sweep_from_result(result)
+            sweep = RTLPowerScanner().acquire(profile)
             row.update(status="success", returncode=0, bins=len(sweep.powers),
                        actual_bin_width_hz=sweep.bin_width_hz, actual_start_hz=sweep.start_hz,
                        actual_stop_hz=sweep.stop_hz, duration_seconds=sweep.duration_seconds,

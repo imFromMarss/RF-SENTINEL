@@ -93,9 +93,10 @@ class RTLPowerScanner:
         self._gain = gain
 
     def acquire(self, profile: SweepProfile) -> SpectrumSweep:
-        return sweep_from_result(self.scan(profile))
+        return _sweep_from_result(self._scan(profile))
 
-    def scan(self, profile: ScanProfile | SweepProfile, raw_path: Path | None = None) -> ScanResult:
+    def _scan(self, profile: ScanProfile | SweepProfile,
+              raw_path: Path | None = None) -> ScanResult:
         # flock захищає також від другого локального RF Sentinel process.
         import fcntl
         lock_path = Path(tempfile.gettempdir()) / f"rf-sentinel-rtl-{self._device_index}.lock"
@@ -104,9 +105,10 @@ class RTLPowerScanner:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ScanError("SDR вже використовується", reason="device_busy") from None
-            return self._scan(profile, raw_path)
+            return self._run(profile, raw_path)
 
-    def _scan(self, profile, raw_path=None) -> ScanResult:
+    def _run(self, profile: ScanProfile | SweepProfile,
+             raw_path: Path | None = None) -> ScanResult:
         profile.__post_init__()
         command = [
             "rtl_power", "-f", f"{profile.low_hz}:{profile.high_hz}:{profile.bin_hz}",
@@ -213,8 +215,18 @@ class RTLPowerScanner:
                           time.monotonic() - started, spectrum, "RTL-SDR", tuner, self._gain)
 
 
-def sweep_from_result(result: ScanResult) -> SpectrumSweep:
-    """Адаптує єдиний завершений frame без залежності domain від CSV."""
+class RTLPowerSurveyAdapter:
+    """Legacy multi-frame survey boundary for reporting and heatmap rendering."""
+
+    def __init__(self, device_index: int = 0, gain: float | None = None):
+        self._scanner = RTLPowerScanner(device_index, gain)
+
+    def scan(self, profile: ScanProfile, raw_path: Path | None = None) -> ScanResult:
+        return self._scanner._scan(profile, raw_path)
+
+
+def _sweep_from_result(result: ScanResult) -> SpectrumSweep:
+    """Normalize the adapter's internal single-frame result to the domain frame."""
     if len(result.spectrum.frames) != 1:
         raise ScanError("Очікувався один прохід спектра", reason="frame_count")
     edges = result.spectrum.edges_hz

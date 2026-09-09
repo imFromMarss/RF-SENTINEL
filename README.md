@@ -40,3 +40,11 @@ RF Sentinel — автономний сервер моніторингу RF-сп
 і `schedule` запускають одноразовий або continuous application workflow. Налаштування,
 історичні артефакти, logging, recovery, локальні команди та hardware-free tests описані
 в [LOCAL_SURVEY.md](docs/LOCAL_SURVEY.md).
+
+## Continuous acquisition
+
+`python -m rf_sentinel acquire` запускає незалежний RX producer без Telegram і reports.
+Hardware benchmark показав, що full-range cadence ≤10 с через `rtl_power` недосяжний:
+практичний budget становить близько 60 с, або потрібні менші frequency windows.
+Stage 1 зберігає останній frame у RAM, operational logs і atomic health snapshot.
+Конфігурація, діагностика та обмеження: [Continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).

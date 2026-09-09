@@ -36,9 +36,25 @@ class Settings:
     telegram_backoff_seconds: int = 5
     survey_recovery_seconds: int = 60
     timezone: str = "Europe/Kyiv"
+    acquisition_low_hz: int = 24_000_000
+    acquisition_high_hz: int = 1_766_000_000
+    acquisition_bin_hz: int = 500_000
+    acquisition_target_seconds: float = 10
+    acquisition_recovery_seconds: float = 60
+    log_max_bytes: int = 5_000_000
+    log_backups: int = 3
 
     def __post_init__(self) -> None:
         validate_device(self.rtl_device_index, self.rtl_gain)
+        from rf_sentinel.acquisition import SweepProfile
+        SweepProfile(self.acquisition_low_hz, self.acquisition_high_hz, self.acquisition_bin_hz)
+        for value, minimum in ((self.acquisition_target_seconds, 0.001),
+                               (self.acquisition_recovery_seconds, 1)):
+            if type(value) not in (int, float) or not math.isfinite(value) or not minimum <= value <= 3600:
+                raise ConfigurationError("Некоректний інтервал acquisition")
+        if (type(self.log_max_bytes) is not int or not 1024 <= self.log_max_bytes <= 100_000_000
+                or type(self.log_backups) is not int or not 1 <= self.log_backups <= 20):
+            raise ConfigurationError("Некоректні межі rotation журналу")
         if (
             type(self.report_interval_minutes) is not int
             or not 1 <= self.report_interval_minutes <= 1440
@@ -80,14 +96,27 @@ class Settings:
         return bool(self.telegram_bot_token)
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: Mapping[str, str] | None = None, *, acquisition_only: bool = False) -> "Settings":
         source = os.environ if env is None else env
 
         def read(name: str, default: str) -> str:
+            if acquisition_only and not (
+                name.startswith(("ACQUISITION_", "RTL_", "LOG_")) or name == "DATA_DIR"
+            ):
+                return default
             return source.get("RF_SENTINEL_" + name, default).strip()
 
         # Текст conversion exception може містити secret, помилково записаний у числове поле.
         try:
+            acquisition = dict(
+                acquisition_low_hz=int(read("ACQUISITION_START_HZ", "24000000")),
+                acquisition_high_hz=int(read("ACQUISITION_STOP_HZ", "1766000000")),
+                acquisition_bin_hz=int(read("ACQUISITION_BIN_HZ", "500000")),
+                acquisition_target_seconds=float(read("ACQUISITION_TARGET_SECONDS", "10")),
+                acquisition_recovery_seconds=float(read("ACQUISITION_RECOVERY_SECONDS", "60")),
+                log_max_bytes=int(read("LOG_MAX_BYTES", "5000000")),
+                log_backups=int(read("LOG_BACKUPS", "3")),
+            )
             interval = int(read("REPORT_INTERVAL_MINUTES", "30"))
             device = int(read("RTL_DEVICE_INDEX", "0"))
             gain_text = read("RTL_GAIN", "auto")
@@ -109,8 +138,8 @@ class Settings:
         if not directory or "\0" in directory:
             raise ConfigurationError("Некоректний каталог даних")
         return cls(
-            telegram_bot_token=read("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id=read("TELEGRAM_CHAT_ID", ""),
+            telegram_bot_token="" if acquisition_only else read("TELEGRAM_BOT_TOKEN", ""),
+            telegram_chat_id="" if acquisition_only else read("TELEGRAM_CHAT_ID", ""),
             report_interval_minutes=interval,
             rtl_device_index=device,
             rtl_gain=gain,
@@ -124,4 +153,5 @@ class Settings:
             telegram_backoff_seconds=telegram_backoff,
             survey_recovery_seconds=recovery,
             timezone=read("TIMEZONE", "Europe/Kyiv"),
+            **acquisition,
         )

@@ -13,16 +13,8 @@ from rf_sentinel.errors import SentinelError
 
 
 def configure_logging(data_dir: Path) -> None:
-    log_dir = data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-    handlers = [logging.StreamHandler(), logging.FileHandler(log_dir / "rf-sentinel.log")]
-    for handler in handlers:
-        handler.setFormatter(formatter)
-    logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
+    from rf_sentinel.observability import configure_operational_logging
+    configure_operational_logging(data_dir / "logs")
 
 
 def _shutdown_signal(signum, frame) -> None:
@@ -31,14 +23,16 @@ def _shutdown_signal(signum, frame) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rf_sentinel")
-    parser.add_argument("mode", nargs="?", choices=("survey", "schedule"))
+    parser.add_argument("mode", nargs="?", choices=("survey", "schedule", "acquire"))
     # main() без аргументів не читає аргументи pytest або host process.
     args = parser.parse_args([] if argv is None else argv)
     if args.mode is None:
         print("RF Sentinel")
         return 0
     try:
-        settings = Settings.from_env()
+        settings = Settings.from_env(acquisition_only=True) if args.mode == "acquire" else Settings.from_env()
+        if args.mode == "acquire":
+            return run_acquisition(settings)
         from rf_sentinel.rtl_power import RTLPowerScanner
         from rf_sentinel.scheduler import run_continuous
         from rf_sentinel.spectrum import ScanProfile
@@ -83,7 +77,41 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger("rf_sentinel.application").info("Отримано команду завершення")
         logging.shutdown()
         return 130
-    except SentinelError:
+    except (SentinelError, OSError):
         print("RF Sentinel: помилка конфігурації або огляду; перевірте локальне середовище",
               file=sys.stderr)
         return 1
+
+
+def run_acquisition(settings: Settings) -> int:
+    """Складає незалежний acquisition без імпорту reporting і Telegram."""
+    from rf_sentinel.acquisition import LatestSweepSink, SpectrumAcquisitionWorker, SweepProfile
+    from rf_sentinel.observability import AcquisitionObserver, configure_operational_logging
+    from rf_sentinel.rtl_power import RTLPowerScanner
+
+    configure_operational_logging(settings.data_dir / "logs", settings.log_max_bytes,
+                                  settings.log_backups)
+    profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,
+                           settings.acquisition_bin_hz)
+    stop = Event()
+    observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
+                                   settings.acquisition_target_seconds,
+                                   settings.acquisition_recovery_seconds)
+    previous = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, _shutdown_signal)
+        SpectrumAcquisitionWorker(
+            RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), LatestSweepSink(),
+            profile, observer, stop, settings.acquisition_target_seconds,
+            settings.acquisition_recovery_seconds,
+        ).run()
+        return 0
+    except OSError:
+        logging.getLogger(__name__).error("Помилка запису operational artifacts")
+        return 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        logging.shutdown()

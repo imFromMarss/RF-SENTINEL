@@ -7,10 +7,11 @@ import os
 import subprocess
 import tempfile
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
+from rf_sentinel.acquisition import SpectrumSweep, SweepProfile
 from rf_sentinel.config import validate_device
 from rf_sentinel.errors import ParseError, ScanError
 from rf_sentinel.spectrum import ScanProfile, ScanResult, SpectrumData, SpectrumFrame
@@ -91,13 +92,29 @@ class RTLPowerScanner:
         self._device_index = device_index
         self._gain = gain
 
-    def scan(self, profile: ScanProfile, raw_path: Path | None = None) -> ScanResult:
+    def acquire(self, profile: SweepProfile) -> SpectrumSweep:
+        return sweep_from_result(self.scan(profile))
+
+    def scan(self, profile: ScanProfile | SweepProfile, raw_path: Path | None = None) -> ScanResult:
+        # flock захищає також від другого локального RF Sentinel process.
+        import fcntl
+        lock_path = Path(tempfile.gettempdir()) / f"rf-sentinel-rtl-{self._device_index}.lock"
+        with lock_path.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ScanError("SDR вже використовується", reason="device_busy") from None
+            return self._scan(profile, raw_path)
+
+    def _scan(self, profile, raw_path=None) -> ScanResult:
         profile.__post_init__()
         command = [
             "rtl_power", "-f", f"{profile.low_hz}:{profile.high_hz}:{profile.bin_hz}",
             "-i", str(profile.integration_seconds), "-e", str(profile.duration_seconds),
             "-d", str(self._device_index),
         ]
+        if isinstance(profile, SweepProfile):
+            command[5:7] = ["-1"]
         if self._gain is not None:
             command += ["-g", str(self._gain)]
         command.append("-")
@@ -105,6 +122,8 @@ class RTLPowerScanner:
         child_env = {"PATH": os.defpath, "TZ": "UTC", "LC_ALL": "C"}
         if "PATH" in os.environ:
             child_env["PATH"] = os.environ["PATH"]
+        timeout_seconds = (90 if isinstance(profile, SweepProfile) else
+                           profile.duration_seconds + max(15, profile.integration_seconds + 30))
         started_at = datetime.now(UTC)
         started = time.monotonic()
         try:
@@ -122,7 +141,7 @@ class RTLPowerScanner:
                 ) as process:
                     try:
                         while process.poll() is None:
-                            if time.monotonic() - started > profile.duration_seconds + max(15, profile.integration_seconds + 30):
+                            if time.monotonic() - started > timeout_seconds:
                                 raise ScanError(
                                     "Перевищено час очікування сканування rtl_power",
                                     reason="timeout",
@@ -192,3 +211,20 @@ class RTLPowerScanner:
             )
         return ScanResult("rtl_power", profile, started_at,
                           time.monotonic() - started, spectrum, "RTL-SDR", tuner, self._gain)
+
+
+def sweep_from_result(result: ScanResult) -> SpectrumSweep:
+    """Адаптує єдиний завершений frame без залежності domain від CSV."""
+    if len(result.spectrum.frames) != 1:
+        raise ScanError("Очікувався один прохід спектра", reason="frame_count")
+    edges = result.spectrum.edges_hz
+    widths = [b - a for a, b in zip(edges, edges[1:])]
+    if not widths or max(widths) - min(widths) > 2:
+        raise ScanError("Неузгоджена ширина комірок", reason="bin_width")
+    return SpectrumSweep(
+        result.started_at, result.started_at + timedelta(seconds=result.duration_seconds),
+        result.duration_seconds, edges[0], edges[-1],
+        tuple((a + b) / 2 for a, b in zip(edges, edges[1:])),
+        sum(widths) / len(widths), result.spectrum.frames[0].powers,
+        result.backend, result.receiver, result.tuner,
+    )

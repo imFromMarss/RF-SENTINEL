@@ -512,3 +512,11 @@ The architecture intentionally does not settle adapter/tool adequacy, SoapySDR m
 | Subprocess failure | Adapter supervision, strict normalization, process reaping, bounded retry, coverage outcomes, and health escalation are defined. |
 | Provenance/configuration version | Immutable references are required in Observation, Sweep, SpectrumMeasurement, RFEvent, Capture, Classification, and artifacts. |
 | No observation versus no RF activity | Observation/Sweep coverage states and measurement quality flags are persisted and carried into analytics/reports. |
+
+## Continuous acquisition
+
+Цільова модель — незалежний producer спектра та downstream consumers.
+Режим `acquire` додає sweep domain model, MeasurementSink і operational health/logging.
+Один sweep — один timestamped spectrum frame; reporting не затримує наступний прийом.
+Hardware benchmark спростував target ~10 с для повного 24–1766 МГц range через
+сотні послідовних tuner hops. Деталі та компроміси: [Continuous acquisition](CONTINUOUS_ACQUISITION.md).

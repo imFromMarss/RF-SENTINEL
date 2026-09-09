@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
 from rf_sentinel.errors import MeasurementSinkError
-from rf_sentinel.health import AcquisitionHealth, write_health_snapshot
+from rf_sentinel.health import AcquisitionHealth, HealthOwner, write_health_snapshot
 
 
 class OperationalFormatter(logging.Formatter):
@@ -27,10 +27,13 @@ def configure_operational_logging(directory, max_bytes=5_000_000, backups=3):
 
 
 class AcquisitionObserver:
-    def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds, storage=None):
+    def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds, storage=None,
+                 health_owner: HealthOwner | None = None):
         self.path = path
-        self.state = AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz,
-                                       profile.bin_hz, cadence_budget_seconds, recovery_seconds)
+        self.health_owner = health_owner
+        self.state = (health_owner.state if health_owner is not None else
+                      AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz,
+                                        profile.bin_hz, cadence_budget_seconds, recovery_seconds))
         self.logger = logging.getLogger("rf_sentinel.acquisition")
         self.storage = storage
         self._correlation_id = None
@@ -58,12 +61,19 @@ class AcquisitionObserver:
         self.logger.log(level, message, extra={"context": {"event": event, **context}})
 
     def save(self):
-        self._sync_storage()
-        write_health_snapshot(self.path, self.state)
+        if self.health_owner is not None:
+            with self.health_owner.lock:
+                self._sync_storage()
+                self.health_owner.save()
+        else:
+            self._sync_storage()
+            write_health_snapshot(self.path, self.state)
 
     def start(self, now):
-        self.state.started_at = now.isoformat()
-        self.save()
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self.state.started_at = now.isoformat()
+            self.save()
         self.event("startup", "RF Sentinel запущено")
         self.event("configuration", "Конфігурацію перевірено",
                    start_hz=self.state.configured_start_hz,
@@ -75,14 +85,21 @@ class AcquisitionObserver:
                    backend=self.state.backend)
 
     def sweep_started(self, now, cadence_seconds=None):
-        self._correlation_id = str(uuid4())
-        self.state.application_status = "acquiring"
-        self.state.last_sweep_started_at = now.isoformat()
-        self.state.last_sweep_cadence_seconds = cadence_seconds
-        self.save()
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self._correlation_id = str(uuid4())
+            self.state.application_status = "acquiring"
+            self.state.last_sweep_started_at = now.isoformat()
+            self.state.last_sweep_cadence_seconds = cadence_seconds
+            self.save()
         self.event("sweep_started", "Розпочато прохід спектра")
 
     def failure(self, duration, recovery, error):
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self._failure_locked(duration, recovery, error)
+
+    def _failure_locked(self, duration, recovery, error):
         safe_reasons = {"timeout", "output_too_large", "stderr_too_large", "subprocess_exit",
                         "tuner_pll", "executable_missing", "io_error", "incomplete_coverage",
                         "parser_malformed", "frame_count", "bin_width", "device_busy"}
@@ -106,6 +123,11 @@ class AcquisitionObserver:
         self.event("recovery_scheduled", "Заплановано відновлення прийому", delay_s=recovery)
 
     def completed(self, sweep):
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self._completed_locked(sweep)
+
+    def _completed_locked(self, sweep):
         recovered = self.state.consecutive_sweep_failures > 0
         self.state.application_status = "running"
         self.state.total_sweeps += 1
@@ -133,8 +155,18 @@ class AcquisitionObserver:
             self.event("recovery_success", "Прийом спектра відновлено")
 
     def shutdown(self, failed=False):
-        self.state.application_status = "failed" if failed else "stopped"
-        if failed:
-            self.state.last_error_summary = "Помилка application або приймання даних sink"
-        self.save()
+        lock = self.health_owner.lock if self.health_owner is not None else _NullLock()
+        with lock:
+            self.state.application_status = "failed" if failed else "stopped"
+            if failed:
+                self.state.last_error_summary = "Помилка application або приймання даних sink"
+            self.save()
         self.event("shutdown", "Моніторинг спектра завершено", status=self.state.application_status)
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False

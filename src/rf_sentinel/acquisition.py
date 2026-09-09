@@ -197,12 +197,14 @@ class AsyncMeasurementSink:
     """
 
     def __init__(self, downstream: MeasurementSink, *, max_queue: int = 32,
-                 enqueue_timeout: float = 0.1, thread_name: str = "measurement-writer"):
+                 enqueue_timeout: float = 0.1, thread_name: str = "measurement-writer",
+                 close_downstream: bool = True):
         if type(max_queue) is not int or max_queue < 1:
             raise ConfigurationError("Розмір черги MeasurementSink має бути додатним")
         if not math.isfinite(enqueue_timeout) or enqueue_timeout < 0:
             raise ConfigurationError("Timeout черги MeasurementSink некоректний")
         self._downstream = downstream
+        self._close_downstream = close_downstream
         self._queue: Queue[tuple[SpectrumSweep, MeasurementReceipt]] = Queue(maxsize=max_queue)
         self._enqueue_timeout = enqueue_timeout
         self._condition = Condition()
@@ -325,7 +327,8 @@ class AsyncMeasurementSink:
                 self.rejected_count += 1
                 self._queue.task_done()
             self._closed = True
-        downstream_close = getattr(self._downstream, "close", None)
+        downstream_close = (getattr(self._downstream, "close", None)
+                            if self._close_downstream else None)
         if downstream_close is not None:
             try:
                 downstream_close()
@@ -413,6 +416,8 @@ class SpectrumAcquisitionWorker:
         def cycle():
             nonlocal started, previous_started
             started = self.monotonic()
+            if self.stop.is_set():
+                raise ScanError("Завершення прийому", reason="stopped")
             cadence = None if previous_started is None else started - previous_started
             previous_started = started
             self.observer.sweep_started(self.now(), cadence)

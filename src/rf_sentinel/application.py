@@ -44,9 +44,115 @@ def _stop_telegram_polling(thread, stop: Event) -> None:
         thread.join(timeout=20)
 
 
+class _DisabledNotifier:
+    def send_package(self, package):
+        from rf_sentinel.telegram import DeliveryResult
+        return DeliveryResult("failed", {}, "telegram_disabled")
+
+    def send_message(self, text):
+        return None
+
+    def send_photo(self, path, caption=""):
+        return None
+
+
+def run_station(settings: Settings) -> int:
+    """Run acquisition, scheduled reports, and inbound Telegram in one process."""
+    from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumAcquisitionWorker, SweepProfile
+    from rf_sentinel.health import AcquisitionHealth, HealthOwner
+    from rf_sentinel.observability import AcquisitionObserver
+    from rf_sentinel.reporting import SQLiteReportEngine
+    from rf_sentinel.rtl_power import RTLPowerScanner
+    from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler
+    from rf_sentinel.storage import SQLiteMeasurementSink
+    from rf_sentinel.telegram import TelegramNotifier
+
+    configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
+    stop = Event()
+    health_path = settings.data_dir / "status" / "health.json"
+    profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,
+                           settings.acquisition_bin_hz)
+    state = AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz, profile.bin_hz,
+                              settings.acquisition_cadence_budget_seconds,
+                              settings.acquisition_recovery_seconds)
+    health = HealthOwner(health_path, state)
+    storage = SQLiteMeasurementSink(settings.sweeps_path,
+                                    incident_retention=settings.incident_retention)
+    sink = AsyncMeasurementSink(storage, close_downstream=False,
+                                thread_name="station-measurement-writer")
+    observer = AcquisitionObserver(health_path, profile,
+                                   settings.acquisition_cadence_budget_seconds,
+                                   settings.acquisition_recovery_seconds, storage=storage,
+                                   health_owner=health)
+    worker = SpectrumAcquisitionWorker(
+        RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain, stop=stop), sink,
+        profile, observer, stop, settings.acquisition_cadence_budget_seconds,
+        settings.acquisition_recovery_seconds,
+    )
+    notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+                if settings.telegram_enabled else _DisabledNotifier())
+    runner = ScheduledReportRunner(
+        SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
+        timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
+        storage=storage, health_path=health_path, state=state, health_owner=health,
+    )
+
+    def run_component(label, operation):
+        try:
+            operation()
+        except BaseException:
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station component stopped unexpectedly: %s", label)
+
+    acquisition_thread = Thread(target=run_component, args=("acquisition", worker.run),
+                                 name="station-acquisition")
+    report_thread = Thread(
+        target=run_component,
+        args=("report-scheduler", lambda: run_report_scheduler(runner, stop)),
+        name="station-reports",
+    )
+    inbound_thread = None
+    previous = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda *_args: stop.set())
+        health.save()
+        logging.getLogger("rf_sentinel.application").info(
+            "RF Sentinel station started: acquisition, reports, and Telegram lifecycle shared")
+        acquisition_thread.start()
+        report_thread.start()
+        if settings.telegram_enabled:
+            inbound_thread = _start_telegram_polling(settings, stop, notifier)
+        while not stop.wait(0.2):
+            if not acquisition_thread.is_alive() and not report_thread.is_alive():
+                stop.set()
+    finally:
+        stop.set()
+        acquisition_thread.join(timeout=30)
+        report_thread.join(timeout=10)
+        _stop_telegram_polling(inbound_thread, stop)
+        if acquisition_thread.is_alive() or report_thread.is_alive():
+            logging.getLogger("rf_sentinel.application").error(
+                "Station shutdown exceeded component deadline")
+        try:
+            sink.close(timeout=10)
+        except BaseException:
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station measurement sink close failed")
+        try:
+            storage.close()
+        except BaseException:
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station SQLite close failed")
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rf_sentinel")
-    parser.add_argument("mode", nargs="?", choices=("survey", "schedule", "report-schedule", "acquire"))
+    parser.add_argument("mode", nargs="?", choices=("survey", "schedule", "report-schedule", "acquire", "station"))
     # main() без аргументів не читає аргументи pytest або host process.
     args = parser.parse_args([] if argv is None else argv)
     if args.mode is None:
@@ -56,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env(acquisition_only=True) if args.mode == "acquire" else Settings.from_env()
         if args.mode == "acquire":
             return run_acquisition(settings)
+        if args.mode == "station":
+            return run_station(settings)
         if args.mode == "report-schedule":
             from rf_sentinel.reporting import SQLiteReportEngine
             from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler

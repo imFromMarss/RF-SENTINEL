@@ -88,10 +88,11 @@ def parse_rtl_power(lines: Iterable[str]) -> SpectrumData:
 
 
 class RTLPowerScanner:
-    def __init__(self, device_index: int = 0, gain: float | None = None):
+    def __init__(self, device_index: int = 0, gain: float | None = None, stop=None):
         validate_device(device_index, gain)
         self._device_index = device_index
         self._gain = gain
+        self._stop = stop
 
     def acquire(self, profile: SweepProfile) -> SpectrumSweep:
         return _sweep_from_result(self._scan(profile))
@@ -144,6 +145,8 @@ class RTLPowerScanner:
                 ) as process:
                     try:
                         while process.poll() is None:
+                            if self._stop is not None and self._stop.is_set():
+                                raise ScanError("Завершення прийому", reason="stopped")
                             if time.monotonic() - started > timeout_seconds:
                                 raise ScanError(
                                     "Перевищено час очікування сканування rtl_power",

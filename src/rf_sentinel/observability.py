@@ -1,11 +1,10 @@
 """Обмежений operational log і атомарний snapshot для подальшої діагностики."""
 
-from dataclasses import dataclass
 import json
 import logging
 from logging.handlers import RotatingFileHandler
 
-from rf_sentinel.scheduler import write_status
+from rf_sentinel.health import AcquisitionHealth, write_health_snapshot
 
 
 class OperationalFormatter(logging.Formatter):
@@ -25,33 +24,6 @@ def configure_operational_logging(directory, max_bytes=5_000_000, backups=3):
     logging.basicConfig(level=logging.INFO, handlers=[handler, console], force=True)
 
 
-@dataclass
-class AcquisitionHealth:
-    backend: str
-    configured_start_hz: int
-    configured_stop_hz: int
-    configured_bin_width_hz: int
-    cadence_budget_seconds: float
-    recovery_delay_seconds: float
-    application_status: str = "starting"
-    started_at: str | None = None
-    last_sweep_started_at: str | None = None
-    last_sweep_completed_at: str | None = None
-    last_successful_sweep_at: str | None = None
-    last_sweep_duration_seconds: float | None = None
-    last_sweep_cadence_seconds: float | None = None
-    actual_bin_width_hz: float | None = None
-    actual_start_hz: float | None = None
-    actual_stop_hz: float | None = None
-    bin_count: int = 0
-    total_sweeps: int = 0
-    failed_sweeps: int = 0
-    consecutive_sweep_failures: int = 0
-    last_error_summary: str | None = None
-    last_error_reason: str | None = None
-    last_subprocess_returncode: int | None = None
-
-
 class AcquisitionObserver:
     def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds):
         self.path = path
@@ -64,7 +36,7 @@ class AcquisitionObserver:
         self.logger.log(level, message, extra={"context": {"event": event, **context}})
 
     def save(self):
-        write_status(self.path, self.state)
+        write_health_snapshot(self.path, self.state)
 
     def start(self, now):
         self.state.started_at = now.isoformat()

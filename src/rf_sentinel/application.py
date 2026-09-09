@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             run_continuous(
                 workflow.run, settings.survey_recovery_seconds, stop,
-                settings.data_dir / "status.json",
+                settings.data_dir / "status" / "health.json",
                 notify_status=workflow.notify_status,
             )
         finally:

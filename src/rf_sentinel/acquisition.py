@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import math
 import time
-from typing import Protocol
+from typing import Callable, Protocol, TypeVar
 
 from rf_sentinel.errors import ConfigurationError, ScanError
 
@@ -77,6 +77,46 @@ class LatestSweepSink:
         self.latest = sweep
 
 
+T = TypeVar("T")
+
+
+def run_continuous_loop(run_cycle: Callable[[], T], recovery_seconds: float, stop,
+                        on_start: Callable[[], None], on_result: Callable[[T], bool],
+                        on_failure: Callable[[BaseException], None],
+                        on_shutdown: Callable[[bool], None],
+                        success_wait: Callable[[T], float] | None = None,
+                        retry_exceptions: tuple[type[BaseException], ...] = (ScanError,)) -> None:
+    """The one serialized loop used by acquisition and application workflows."""
+    if not math.isfinite(recovery_seconds) or not 1 <= recovery_seconds <= 3600:
+        raise ConfigurationError("Некоректна затримка відновлення")
+    failed = False
+    try:
+        on_start()
+        while not stop.is_set():
+            try:
+                result = run_cycle()
+            except retry_exceptions as error:
+                on_failure(error)
+                if stop.wait(recovery_seconds):
+                    break
+                continue
+            successful = on_result(result)
+            delay = success_wait(result) if successful and success_wait is not None else (
+                0 if successful else recovery_seconds
+            )
+            if delay and stop.wait(delay):
+                break
+    except KeyboardInterrupt:
+        if hasattr(stop, "set"):
+            stop.set()
+        raise
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        on_shutdown(failed)
+
+
 class SpectrumAcquisitionWorker:
     def __init__(self, source: SweepSource, sink: MeasurementSink, profile: SweepProfile,
                  observer, stop, cadence_budget_seconds=60.0, recovery_seconds=60.0,
@@ -90,32 +130,31 @@ class SpectrumAcquisitionWorker:
         self.monotonic, self.now = monotonic, now
 
     def run(self):
-        failed = False
         previous_started = None
-        try:
-            self.observer.start(self.now())
-            while not self.stop.is_set():
-                started = self.monotonic()
-                cadence = None if previous_started is None else started - previous_started
-                previous_started = started
-                self.observer.sweep_started(self.now(), cadence)
-                try:
-                    sweep = self.source.acquire(self.profile)
-                except ScanError as error:
-                    self.observer.failure(self.monotonic() - started, self.recovery_seconds, error)
-                    if self.stop.wait(self.recovery_seconds):
-                        break
-                    continue
-                self.sink.store_sweep(sweep)
-                self.observer.completed(sweep)
-                remaining = max(0, self.cadence_budget_seconds - (self.monotonic() - started))
-                if remaining and self.stop.wait(remaining):
-                    break
-        except KeyboardInterrupt:
-            self.stop.set()
-            raise
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            self.observer.shutdown(failed)
+        started = None
+
+        def acquire():
+            return self.source.acquire(self.profile)
+
+        def complete(sweep):
+            self.sink.store_sweep(sweep)
+            self.observer.completed(sweep)
+            return True
+
+        def failure(error):
+            self.observer.failure(self.monotonic() - started, self.recovery_seconds, error)
+
+        def wait_after_success(_sweep):
+            return max(0, self.cadence_budget_seconds - (self.monotonic() - started))
+
+        def cycle():
+            nonlocal started, previous_started
+            started = self.monotonic()
+            cadence = None if previous_started is None else started - previous_started
+            previous_started = started
+            self.observer.sweep_started(self.now(), cadence)
+            return acquire()
+
+        run_continuous_loop(cycle, self.recovery_seconds, self.stop,
+                            lambda: self.observer.start(self.now()),
+                            complete, failure, self.observer.shutdown, wait_after_success)

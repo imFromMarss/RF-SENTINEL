@@ -114,4 +114,4 @@ def test_shutdown_interrupts_recovery_wait_and_persists_stopped(tmp_path):
         )
 
     assert stop.delays == [60]
-    assert json.loads((tmp_path / "status.json").read_text())["current_state"] == "stopped"
+    assert json.loads((tmp_path / "status.json").read_text())["application_status"] == "stopped"

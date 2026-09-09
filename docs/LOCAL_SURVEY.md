@@ -74,7 +74,7 @@ runtime/surveys/YYYYMMDDTHHMMSS.ffffffZ-xxxxxxxx/
 failed report. `scan-diagnostics.json` фіксує reason і subprocess return code. При
 помилці Telegram локальні дані й heatmap зберігаються.
 
-`runtime/status.json` містить поточний process state та лічильники. Operational log:
+`runtime/status/health.json` містить canonical health snapshot і лічильники. Operational log:
 `runtime/logs/rf-sentinel.log`. Увесь `runtime/` і `.env` ігноруються Git.
 
 ## Continuous operation і відмови
@@ -93,7 +93,7 @@ tight retry loop. Один failed cycle не завершує process.
 залишаються лише в локальному log. Перший успішний survey після failure state надсилає
 окреме повідомлення про відновлення, після чого normal report delivery продовжується.
 
-`status.json` показує application start, останній start survey, останній успішний survey,
+`status/health.json` показує application start, останній start survey, останній успішний survey,
 останню успішну Telegram delivery, послідовні помилки та загальні лічильники.
 Логи мають timestamp, severity і component name; credentials, Telegram URL та response
 body не логуються.

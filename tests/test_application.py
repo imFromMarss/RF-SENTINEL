@@ -55,7 +55,7 @@ def test_schedule_mode_uses_recovery_delay_and_status_path(monkeypatch, tmp_path
     )
     assert main(["schedule"]) == 0
     assert calls[0][1] == 7
-    assert calls[0][3] == tmp_path / "status.json"
+    assert calls[0][3] == tmp_path / "status" / "health.json"
     assert callable(calls[0][4])
     assert calls[0][0].__self__.send_failure_reports is False
 

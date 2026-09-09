@@ -23,6 +23,8 @@ def validate_device(index: int, gain: float | None) -> None:
 class Settings:
     telegram_bot_token: str = field(default="", repr=False)
     telegram_chat_id: str = field(default="", repr=False)
+    telegram_allowed_chat_ids: tuple[str, ...] = ()
+    telegram_allowed_user_ids: tuple[str, ...] = ()
     report_interval_minutes: int = 30
     rtl_device_index: int = 0
     rtl_gain: float | None = None
@@ -70,6 +72,9 @@ class Settings:
             raise ConfigurationError("Некоректний формат Telegram bot token")
         if chat and not re.fullmatch(r"-?[0-9]+|@[A-Za-z][A-Za-z0-9_]{4,31}", chat):
             raise ConfigurationError("Некоректний формат Telegram chat ID")
+        for value in (*self.telegram_allowed_chat_ids, *self.telegram_allowed_user_ids):
+            if not isinstance(value, str) or not re.fullmatch(r"-?[0-9]+", value):
+                raise ConfigurationError("Некоректний Telegram authorization ID")
         if not isinstance(self.data_dir, Path) or "\0" in str(self.data_dir):
             raise ConfigurationError("Некоректний каталог даних")
         if not 1 <= self.telegram_attempts <= 5:
@@ -148,9 +153,20 @@ class Settings:
         directory = read("DATA_DIR", "runtime")
         if not directory or "\0" in directory:
             raise ConfigurationError("Некоректний каталог даних")
+        configured_chat = "" if acquisition_only else read("TELEGRAM_CHAT_ID", "")
+
+        def parse_ids(name: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+            value = read(name, "")
+            if not value:
+                return default
+            return tuple(item for item in (part.strip() for part in value.split(",")) if item)
+
         return cls(
             telegram_bot_token="" if acquisition_only else read("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id="" if acquisition_only else read("TELEGRAM_CHAT_ID", ""),
+            telegram_chat_id=configured_chat,
+            telegram_allowed_chat_ids=parse_ids("TELEGRAM_ALLOWED_CHAT_IDS",
+                                                (configured_chat,) if configured_chat else ()),
+            telegram_allowed_user_ids=parse_ids("TELEGRAM_ALLOWED_USER_IDS"),
             report_interval_minutes=interval,
             rtl_device_index=device,
             rtl_gain=gain,

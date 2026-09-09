@@ -4,6 +4,8 @@ import http.client
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlencode
@@ -12,6 +14,10 @@ from rf_sentinel.errors import NotificationError
 
 if TYPE_CHECKING:
     from rf_sentinel.reporting import ReportPackage
+
+logger = logging.getLogger(__name__)
+
+LAST_HOUR_REPORT_BUTTON = "📊 Звіт за останню годину"
 
 MAX_PHOTO_BYTES = 9 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -37,6 +43,97 @@ class DeliveryResult:
             "message_ids": dict(self.message_ids),
             "error_classification": self.error_classification,
         }
+
+
+@dataclass(frozen=True)
+class InboundReportResult:
+    """Safe outcome of handling one inbound Telegram update."""
+
+    status: str
+    delivery: DeliveryResult | None = None
+
+
+def report_reply_keyboard() -> dict:
+    """Return the single supported report action for a Telegram reply keyboard."""
+    return {"keyboard": [[{"text": LAST_HOUR_REPORT_BUTTON}]], "resize_keyboard": True}
+
+
+class TelegramReportHandler:
+    """Handle the one authorized, read-only report action.
+
+    This boundary consumes already-received Telegram updates. It does not poll,
+    schedule, scan, or otherwise call an acquisition component.
+    """
+
+    def __init__(self, report_engine, notifier, data_dir: str | Path,
+                 *, allowed_chat_ids: tuple[str, ...] = (),
+                 allowed_user_ids: tuple[str, ...] = (),
+                 timezone: str = "Europe/Kyiv", clock=None):
+        self.report_engine = report_engine
+        self.notifier = notifier
+        self.data_dir = Path(data_dir)
+        self.allowed_chat_ids = frozenset(str(value) for value in allowed_chat_ids)
+        self.allowed_user_ids = frozenset(str(value) for value in allowed_user_ids)
+        self.timezone = timezone
+        self.clock = clock or (lambda: datetime.now(UTC))
+
+    @classmethod
+    def from_settings(cls, settings, notifier, *, clock=None):
+        from rf_sentinel.reporting import SQLiteReportEngine
+
+        allowed_chats = settings.telegram_allowed_chat_ids or (
+            (settings.telegram_chat_id,) if settings.telegram_chat_id else ()
+        )
+        return cls(
+            SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
+            allowed_chat_ids=allowed_chats,
+            allowed_user_ids=settings.telegram_allowed_user_ids,
+            timezone=settings.timezone, clock=clock,
+        )
+
+    @staticmethod
+    def _sender(update: dict) -> tuple[str | None, str | None, str | None]:
+        message = update.get("message") if isinstance(update, dict) else None
+        if not isinstance(message, dict):
+            return None, None, None
+        chat = message.get("chat")
+        sender = message.get("from")
+        chat_id = chat.get("id") if isinstance(chat, dict) else None
+        user_id = sender.get("id") if isinstance(sender, dict) else None
+        return message.get("text"), None if chat_id is None else str(chat_id), \
+            None if user_id is None else str(user_id)
+
+    def _authorized(self, chat_id: str | None, user_id: str | None) -> bool:
+        return (
+            chat_id is not None and chat_id in self.allowed_chat_ids
+            and (not self.allowed_user_ids or user_id in self.allowed_user_ids)
+        )
+
+    def handle_update(self, update: dict) -> InboundReportResult:
+        text, chat_id, user_id = self._sender(update)
+        if text != LAST_HOUR_REPORT_BUTTON:
+            return InboundReportResult("ignored")
+        if not self._authorized(chat_id, user_id):
+            # Deliberately omit IDs, update content, and exception details.
+            logger.warning("Telegram: unauthorized report request rejected")
+            return InboundReportResult("unauthorized")
+
+        from rf_sentinel.reporting import generate_report_package, last_hour_window
+
+        end = self.clock()
+        start, end = last_hour_window(end)
+        try:
+            report = self.report_engine.build(start, end)
+            destination = self.data_dir / "reports" / "last-hour" / end.strftime(
+                "%Y%m%dT%H%M%S.%fZ")
+            package = generate_report_package(report, destination, self.timezone)
+            delivery = self.notifier.send_package(package)
+            return InboundReportResult("delivered", delivery)
+        except Exception as error:
+            # The boundary exposes no paths, credentials, IDs, or raw exceptions.
+            logger.error("Telegram: last-hour report request failed (%s)",
+                         type(error).__name__)
+            return InboundReportResult("failed")
 
 
 class TelegramNotifier:

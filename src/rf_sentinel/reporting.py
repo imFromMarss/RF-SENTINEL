@@ -35,6 +35,9 @@ class ReportSweep:
     coverage: float
     frequencies_hz: tuple[float, ...] = ()
     powers: tuple[float, ...] = ()
+    frequency_start_hz: float | None = None
+    frequency_stop_hz: float | None = None
+    bin_width_hz: float | None = None
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,10 @@ class SQLiteReportEngine:
             ReportSweep(item.sweep_id, item.started_at, item.finished_at, item.outcome,
                         item.coverage.fraction,
                         item.frequencies_hz if item.outcome != "failed" else (),
-                        item.powers if item.outcome != "failed" else ())
+                        item.powers if item.outcome != "failed" else (),
+                        item.start_hz if item.outcome != "failed" else None,
+                        item.stop_hz if item.outcome != "failed" else None,
+                        item.bin_width_hz if item.outcome != "failed" else None)
             for item in ordered
         )
         measurements = [
@@ -143,6 +149,156 @@ class SQLiteReportEngine:
             coverage, frequency_range, tuple(item.sweep_id for item in ordered),
             peak_frequency, peak_power, payloads, tuple(gaps),
         )
+
+
+def _report_limits(report: ReportData) -> tuple[float, float]:
+    if report.frequency_range_hz is None:
+        raise ValueError("PNG report needs at least one frequency range")
+    low, high = report.frequency_range_hz
+    if not high > low:
+        raise ValueError("PNG report frequency range must be increasing")
+    return low, high
+
+
+def _report_color_limits(report: ReportData) -> tuple[float, float]:
+    import numpy as np
+
+    values = np.asarray(
+        [power for sweep in report.sweeps for power in sweep.powers], dtype=float,
+    )
+    return color_limits(values)
+
+
+def _frequency_edges(frequencies: tuple[float, ...], low: float, high: float,
+                     bin_width_hz: float | None):
+    import numpy as np
+
+    centers = np.asarray(frequencies, dtype=float)
+    if centers.size == 0 or not np.isfinite(centers).all() or not (np.diff(centers) > 0).all():
+        raise ValueError("ReportData has invalid frequency bins")
+    if centers.size == 1:
+        width = bin_width_hz if bin_width_hz and bin_width_hz > 0 else high - low
+        edges = np.asarray([centers[0] - width / 2, centers[0] + width / 2], dtype=float)
+    else:
+        edges = np.empty(centers.size + 1, dtype=float)
+        edges[1:-1] = (centers[:-1] + centers[1:]) / 2
+        edges[0] = centers[0] - (edges[1] - centers[0])
+        edges[-1] = centers[-1] + (centers[-1] - edges[-2])
+    return np.clip(edges, low, high)
+
+
+def _report_meshes(axes, report: ReportData, *, cmap, norm, failed_color: str):
+    """Draw only persisted bins; absent rows remain the axes background."""
+    import numpy as np
+    from matplotlib.patches import Rectangle
+
+    low, high = _report_limits(report)
+    for sweep in report.sweeps:
+        y_start = sweep.started_at.timestamp() / 86400
+        y_end = sweep.finished_at.timestamp() / 86400
+        if sweep.powers:
+            if len(sweep.frequencies_hz) != len(sweep.powers):
+                raise ValueError("ReportData frequency/power payload lengths differ")
+            edges = _frequency_edges(sweep.frequencies_hz, low, high,
+                                     sweep.bin_width_hz) / 1e6
+            axes.pcolormesh(
+                edges, [y_start, y_end], np.asarray([sweep.powers], dtype=float),
+                shading="flat", antialiased=False, rasterized=True, cmap=cmap, norm=norm,
+            )
+        elif sweep.outcome == "failed":
+            axes.add_patch(Rectangle(
+                (low / 1e6, y_start), (high - low) / 1e6, y_end - y_start,
+                facecolor=failed_color, edgecolor=failed_color, hatch="///", linewidth=0,
+                alpha=0.38, zorder=3,
+            ))
+
+
+def _format_report_axes(figure, axes, report: ReportData, timezone: str, title: str,
+                        color_mesh, *, top_x: bool = False):
+    from matplotlib.dates import AutoDateLocator, DateFormatter
+    from matplotlib.ticker import MaxNLocator
+
+    zone = ZoneInfo(timezone)
+    low, high = _report_limits(report)
+    axes.set_xlim(low / 1e6, high / 1e6)
+    axes.set_ylim(report.window_start.timestamp() / 86400,
+                  report.window_end.timestamp() / 86400)
+    if top_x:
+        axes.xaxis.tick_top()
+        axes.xaxis.set_label_position("top")
+    axes.set_xlabel("Частота, МГц", labelpad=10)
+    axes.set_ylabel(f"Час · {timezone}")
+    axes.xaxis.set_major_locator(MaxNLocator(nbins=10))
+    axes.yaxis.set_major_locator(AutoDateLocator(tz=zone, minticks=4, maxticks=8))
+    axes.yaxis.set_major_formatter(DateFormatter("%H:%M:%S", tz=zone))
+    axes.set_title(title, loc="left", pad=14)
+    colorbar = figure.colorbar(color_mesh, ax=axes, pad=0.02)
+    colorbar.set_label("Рівень, dB")
+
+
+def _render_report_png(report: ReportData, destination: Path, timezone: str, *,
+                       palette, title: str, axes_facecolor: str, figure_facecolor: str,
+                       failed_color: str, top_x: bool) -> None:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.colors import Normalize
+    from matplotlib.figure import Figure
+
+    low, high = _report_color_limits(report)
+    figure = Figure(figsize=(13, 7), dpi=150, facecolor=figure_facecolor)
+    FigureCanvasAgg(figure)
+    axes = figure.add_axes((0.09, 0.12, 0.78, 0.78), facecolor=axes_facecolor)
+    mesh = axes.imshow([[low, high]], cmap=palette, norm=Normalize(low, high),
+                       visible=False, aspect="auto")
+    _report_meshes(axes, report, cmap=palette, norm=Normalize(low, high),
+                   failed_color=failed_color)
+    _format_report_axes(figure, axes, report, timezone, title, mesh, top_x=top_x)
+    figure.savefig(destination, format="png", dpi=150, facecolor=figure_facecolor)
+    figure.clear()
+
+
+def render_report_heatmap(report: ReportData, destination: str | Path,
+                          timezone: str = "Europe/Kyiv") -> None:
+    """Render a classic rtl_power-style heatmap from ReportData only."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    palette = LinearSegmentedColormap.from_list(
+        "rf_sentinel_rtl_heatmap",
+        ["#05050e", "#101b58", "#40236b", "#852d63", "#c43b46",
+         "#ed6b32", "#f6b743", "#fff3a6", "#fffdeb"], N=256,
+    )
+    _render_report_png(
+        report, Path(destination), timezone, palette=palette,
+        title="RF Sentinel — heatmap спектра", axes_facecolor="#05050e",
+        figure_facecolor="#0b101b", failed_color="#9aa4b2", top_x=True,
+    )
+
+
+def render_report_waterfall(report: ReportData, destination: str | Path,
+                            timezone: str = "Europe/Kyiv") -> None:
+    """Render RF Sentinel's banded waterfall from ReportData only."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    palette = LinearSegmentedColormap.from_list(
+        "rf_sentinel_waterfall",
+        ["#02040b", "#09203d", "#075985", "#00a6a6", "#72d572",
+         "#f3dc5b", "#ff8c42", "#fff2b2"], N=256,
+    )
+    _render_report_png(
+        report, Path(destination), timezone, palette=palette,
+        title="RF Sentinel — waterfall спектра", axes_facecolor="#02040b",
+        figure_facecolor="#070b13", failed_color="#556274", top_x=False,
+    )
+
+
+def render_report_images(report: ReportData, waterfall: str | Path,
+                         heatmap: str | Path, timezone: str = "Europe/Kyiv") -> tuple[Path, Path]:
+    """Create both PNG views from one already-built ReportData value."""
+    waterfall_path, heatmap_path = Path(waterfall), Path(heatmap)
+    waterfall_path.parent.mkdir(parents=True, exist_ok=True)
+    heatmap_path.parent.mkdir(parents=True, exist_ok=True)
+    render_report_waterfall(report, waterfall_path, timezone)
+    render_report_heatmap(report, heatmap_path, timezone)
+    return waterfall_path, heatmap_path
 
 
 def duration_text(seconds: float) -> str:

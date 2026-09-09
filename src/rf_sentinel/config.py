@@ -43,6 +43,7 @@ class Settings:
     acquisition_recovery_seconds: float = 60
     log_max_bytes: int = 5_000_000
     log_backups: int = 3
+    incident_retention: int = 1000
 
     def __post_init__(self) -> None:
         validate_device(self.rtl_device_index, self.rtl_gain)
@@ -55,6 +56,8 @@ class Settings:
         if (type(self.log_max_bytes) is not int or not 1024 <= self.log_max_bytes <= 100_000_000
                 or type(self.log_backups) is not int or not 1 <= self.log_backups <= 20):
             raise ConfigurationError("Некоректні межі rotation журналу")
+        if type(self.incident_retention) is not int or not 1 <= self.incident_retention <= 100_000:
+            raise ConfigurationError("Некоректна межа incident history")
         if (
             type(self.report_interval_minutes) is not int
             or not 1 <= self.report_interval_minutes <= 1440
@@ -101,7 +104,7 @@ class Settings:
 
         def read(name: str, default: str) -> str:
             if acquisition_only and not (
-                name.startswith(("ACQUISITION_", "RTL_", "LOG_")) or name == "DATA_DIR"
+                name.startswith(("ACQUISITION_", "RTL_", "LOG_", "INCIDENT_")) or name == "DATA_DIR"
             ):
                 return default
             return source.get("RF_SENTINEL_" + name, default).strip()
@@ -118,6 +121,7 @@ class Settings:
                 acquisition_recovery_seconds=float(read("ACQUISITION_RECOVERY_SECONDS", "60")),
                 log_max_bytes=int(read("LOG_MAX_BYTES", "5000000")),
                 log_backups=int(read("LOG_BACKUPS", "3")),
+                incident_retention=int(read("INCIDENT_RETENTION", "1000")),
             )
             interval = int(read("REPORT_INTERVAL_MINUTES", "30"))
             device = int(read("RTL_DEVICE_INDEX", "0"))

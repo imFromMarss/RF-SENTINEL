@@ -21,6 +21,7 @@ def test_defaults():
     assert settings.acquisition_cadence_budget_seconds == 60
     assert settings.telegram_attempts == 3
     assert settings.survey_recovery_seconds == 60
+    assert settings.incident_retention == 1000
     assert not settings.telegram_enabled
 
 
@@ -66,6 +67,12 @@ def test_environment_parsing():
 def test_invalid_configuration(name, value):
     with pytest.raises(ConfigurationError):
         Settings.from_env({"RF_SENTINEL_" + name: value})
+
+
+def test_incident_retention_boundary_is_configurable():
+    assert Settings.from_env({"RF_SENTINEL_INCIDENT_RETENTION": "25"}).incident_retention == 25
+    with pytest.raises(ConfigurationError):
+        Settings.from_env({"RF_SENTINEL_INCIDENT_RETENTION": "0"})
 
 
 def test_legacy_recovery_setting_remains_supported():

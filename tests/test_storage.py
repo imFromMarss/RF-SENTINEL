@@ -83,3 +83,21 @@ def test_persistence_error_propagates(tmp_path):
     store.close()
     with pytest.raises(MeasurementPersistenceError):
         store.store_sweep(sweep())
+
+
+def test_incidents_are_durable_and_bounded(tmp_path):
+    path = tmp_path / "sweeps.sqlite3"
+    store = SQLiteMeasurementSink(path, incident_retention=2)
+    for number in range(3):
+        store.record_incident(
+            component="acquisition", classification="timeout", safe_message="safe failure",
+            correlation_id=f"corr-{number}", recovery_result="recovery_scheduled",
+            timestamp=NOW + timedelta(seconds=number),
+        )
+    store.close()
+
+    reopened = SQLiteMeasurementSink(path, incident_retention=2)
+    incidents = reopened.query_incidents()
+    assert len(incidents) == 2
+    assert [item.correlation_id for item in incidents] == ["corr-1", "corr-2"]
+    assert incidents[0].safe_message == "safe failure"

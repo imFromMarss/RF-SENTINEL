@@ -3,7 +3,9 @@
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+from uuid import uuid4
 
+from rf_sentinel.errors import MeasurementSinkError
 from rf_sentinel.health import AcquisitionHealth, write_health_snapshot
 
 
@@ -25,17 +27,38 @@ def configure_operational_logging(directory, max_bytes=5_000_000, backups=3):
 
 
 class AcquisitionObserver:
-    def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds):
+    def __init__(self, path, profile, cadence_budget_seconds, recovery_seconds, storage=None):
         self.path = path
         self.state = AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz,
                                        profile.bin_hz, cadence_budget_seconds, recovery_seconds)
         self.logger = logging.getLogger("rf_sentinel.acquisition")
+        self.storage = storage
+        self._correlation_id = None
+
+    def _sync_storage(self):
+        if self.storage is None:
+            return
+        status = self.storage.storage_status()
+        for name, value in status.items():
+            setattr(self.state, name, value)
+
+    def _incident(self, *, component, classification, message, result):
+        if self.storage is None:
+            return
+        try:
+            self.storage.record_incident(
+                component=component, classification=classification, safe_message=message,
+                correlation_id=self._correlation_id, recovery_result=result,
+            )
+        except MeasurementSinkError:
+            pass
 
     def event(self, event, message, **context):
         level = logging.ERROR if event == "sweep_failed" else logging.INFO
         self.logger.log(level, message, extra={"context": {"event": event, **context}})
 
     def save(self):
+        self._sync_storage()
         write_health_snapshot(self.path, self.state)
 
     def start(self, now):
@@ -52,6 +75,7 @@ class AcquisitionObserver:
                    backend=self.state.backend)
 
     def sweep_started(self, now, cadence_seconds=None):
+        self._correlation_id = str(uuid4())
         self.state.application_status = "acquiring"
         self.state.last_sweep_started_at = now.isoformat()
         self.state.last_sweep_cadence_seconds = cadence_seconds
@@ -62,7 +86,7 @@ class AcquisitionObserver:
         safe_reasons = {"timeout", "output_too_large", "stderr_too_large", "subprocess_exit",
                         "tuner_pll", "executable_missing", "io_error", "incomplete_coverage",
                         "parser_malformed", "frame_count", "bin_width", "device_busy"}
-        self.state.last_error_reason = error.reason if error.reason in safe_reasons else "unknown"
+        self.state.last_error_reason = error.reason if getattr(error, "reason", None) in safe_reasons else "unknown"
         self.state.last_subprocess_returncode = error.returncode if type(error.returncode) is int else None
         self.state.application_status = "recovering"
         self.state.total_sweeps += 1
@@ -70,6 +94,11 @@ class AcquisitionObserver:
         self.state.consecutive_sweep_failures += 1
         self.state.last_sweep_duration_seconds = duration
         self.state.last_error_summary = "Помилка прийому SDR"
+        component = "persistence" if isinstance(error, MeasurementSinkError) else "acquisition"
+        classification = "persistence_error" if component == "persistence" else self.state.last_error_reason
+        message = "Не вдалося зберегти sweep" if component == "persistence" else "Помилка прийому SDR"
+        self._incident(component=component, classification=classification,
+                       message=message, result="recovery_scheduled")
         self.save()
         self.event("sweep_failed", "Помилка прийому SDR", duration_s=duration,
                    consecutive_failures=self.state.consecutive_sweep_failures,
@@ -91,6 +120,9 @@ class AcquisitionObserver:
         self.state.last_error_summary = None
         self.state.last_error_reason = None
         self.state.last_subprocess_returncode = None
+        if recovered:
+            self._incident(component="acquisition", classification="recovery",
+                           message="Прийом спектра відновлено", result="recovered")
         self.save()
         self.event("sweep_completed", "Прохід спектра завершено",
                    duration_s=sweep.duration_seconds, bins=len(sweep.powers),

@@ -213,6 +213,27 @@ def test_sink_failure_stops_without_retry(tmp_path):
     assert "synthetic-secret" not in (tmp_path / "health.json").read_text()
 
 
+def test_storage_metrics_are_observable(tmp_path):
+    from rf_sentinel.storage import SQLiteMeasurementSink
+
+    storage = SQLiteMeasurementSink(tmp_path / "sweeps.sqlite3")
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60, storage)
+    clock = ClockStop()
+    observer.start(NOW)
+    observer.sweep_started(NOW)
+    observer.failure(1, 60, ScanError("synthetic-secret", reason="timeout"))
+    health = json.loads((tmp_path / "health.json").read_text())
+    assert health["persisted_sweeps"] == 0
+    assert health["failed_persists"] == 0
+    assert health["sqlite_db_size_bytes"] > 0
+    assert health["storage_error"] is None
+    incidents = storage.query_incidents()
+    assert incidents[0].classification == "timeout"
+    assert incidents[0].safe_message == "Помилка прийому SDR"
+    assert "synthetic-secret" not in (tmp_path / "health.json").read_text()
+    storage.close()
+
+
 def test_preexisting_stop_does_not_acquire(tmp_path):
     clock = ClockStop()
     clock.set()

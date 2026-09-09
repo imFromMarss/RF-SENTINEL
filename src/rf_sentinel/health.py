@@ -41,6 +41,11 @@ class AcquisitionHealth:
     total_completed_surveys: int = 0
     total_failed_surveys: int = 0
     current_artifact_dir: str | None = None
+    last_persisted_sweep_at: str | None = None
+    persisted_sweeps: int = 0
+    failed_persists: int = 0
+    sqlite_db_size_bytes: int | None = None
+    storage_error: str | None = None
 
     @classmethod
     def started(cls) -> "AcquisitionHealth":

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import sqlite3
 import struct
 from typing import Iterable
+from uuid import uuid4
 
 from rf_sentinel.acquisition import (DeviceIdentity, ErrorClassification,
                                      MeasurementReceipt, MeasurementSink,
@@ -16,9 +18,20 @@ from rf_sentinel.acquisition import (DeviceIdentity, ErrorClassification,
 from rf_sentinel.errors import MeasurementPersistenceError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_NAME = "spectrum-sweeps.v1"
 _FLOAT64 = struct.Struct("<d")
+
+
+@dataclass(frozen=True)
+class IncidentRecord:
+    incident_id: str
+    timestamp: str
+    component: str
+    classification: str
+    safe_message: str
+    correlation_id: str | None
+    recovery_result: str
 
 
 def _pack(values: Iterable[float]) -> bytes:
@@ -87,8 +100,15 @@ def _metadata(sweep: SpectrumSweep) -> str:
 class SQLiteMeasurementSink(MeasurementSink):
     """One SQLite row per sweep, with atomic insert and durable reopen support."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, incident_retention: int = 1000):
+        if type(incident_retention) is not int or not 1 <= incident_retention <= 100_000:
+            raise ValueError("incident_retention must be between 1 and 100000")
         self.path = Path(path)
+        self.incident_retention = incident_retention
+        self.persisted_count = 0
+        self.failed_count = 0
+        self.last_persisted_sweep_at: str | None = None
+        self.storage_error: str | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._db = sqlite3.connect(self.path)
@@ -102,7 +122,7 @@ class SQLiteMeasurementSink(MeasurementSink):
 
     def _initialize(self) -> None:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             raise MeasurementPersistenceError(f"Unsupported SQLite schema version: {version}")
         if version == 0:
             with self._db:
@@ -124,8 +144,29 @@ class SQLiteMeasurementSink(MeasurementSink):
                         ON sweeps(sweep_id);
                     CREATE INDEX IF NOT EXISTS idx_sweeps_outcome
                         ON sweeps(outcome);
-                    PRAGMA user_version = 1;
+                    PRAGMA user_version = 2;
                 """)
+            with self._db:
+                self._create_incidents_table()
+        elif version == 1:
+            with self._db:
+                self._create_incidents_table()
+                self._db.execute("PRAGMA user_version = 2")
+
+    def _create_incidents_table(self) -> None:
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS incidents (
+                incident_id TEXT PRIMARY KEY,
+                timestamp_us INTEGER NOT NULL,
+                component TEXT NOT NULL,
+                classification TEXT NOT NULL,
+                safe_message TEXT NOT NULL,
+                correlation_id TEXT,
+                recovery_result TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_incidents_timestamp ON incidents(timestamp_us);
+            CREATE INDEX IF NOT EXISTS idx_incidents_correlation ON incidents(correlation_id);
+        """)
 
     def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt:
         if not isinstance(sweep, SpectrumSweep):
@@ -146,9 +187,66 @@ class SQLiteMeasurementSink(MeasurementSink):
                      len(sweep.frequencies_hz), frequencies if sweep.frequencies_hz else None,
                      len(sweep.powers), powers if sweep.powers else None),
                 )
+            self.persisted_count += 1
+            self.last_persisted_sweep_at = sweep.finished_at.isoformat()
+            self.storage_error = None
         except (OSError, sqlite3.Error, TypeError, ValueError, struct.error) as error:
+            self.failed_count += 1
+            self.storage_error = "SQLite persistence failed"
             raise MeasurementPersistenceError("Could not persist spectrum sweep") from error
         return MeasurementReceipt(sweep.sweep_id, "persisted")
+
+    def record_incident(self, *, component: str, classification: str,
+                        safe_message: str, correlation_id: str | None,
+                        recovery_result: str, timestamp: datetime | None = None) -> IncidentRecord:
+        timestamp = timestamp or datetime.now().astimezone()
+        record = IncidentRecord(str(uuid4()), timestamp.isoformat(), component, classification,
+                                safe_message, correlation_id, recovery_result)
+        try:
+            with self._db:
+                self._db.execute(
+                    """INSERT INTO incidents
+                    (incident_id, timestamp_us, component, classification, safe_message,
+                     correlation_id, recovery_result) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (record.incident_id, _timestamp(timestamp), record.component,
+                     record.classification, record.safe_message, record.correlation_id,
+                     record.recovery_result),
+                )
+                self._db.execute(
+                    """DELETE FROM incidents WHERE incident_id IN (
+                    SELECT incident_id FROM incidents ORDER BY timestamp_us DESC, incident_id DESC
+                    LIMIT -1 OFFSET ?)""", (self.incident_retention,))
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            self.storage_error = "SQLite incident history unavailable"
+            raise MeasurementPersistenceError("Could not persist incident record") from error
+        return record
+
+    def query_incidents(self, limit: int | None = None) -> list[IncidentRecord]:
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 100_000):
+            raise ValueError("incident limit must be between 1 and 100000")
+        sql = ("SELECT incident_id, timestamp_us, component, classification, safe_message, "
+               "correlation_id, recovery_result FROM incidents ORDER BY timestamp_us, incident_id")
+        params = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        try:
+            rows = self._db.execute(sql, params).fetchall()
+        except sqlite3.Error as error:
+            raise MeasurementPersistenceError("Could not read incident history") from error
+        return [IncidentRecord(row[0], datetime.fromtimestamp(row[1] / 1_000_000, UTC).isoformat(),
+                               row[2], row[3], row[4], row[5], row[6]) for row in rows]
+
+    def storage_status(self) -> dict:
+        try:
+            db_size = self.path.stat().st_size
+        except OSError:
+            db_size = None
+        return {"last_persisted_sweep_at": self.last_persisted_sweep_at,
+                "persisted_sweeps": self.persisted_count,
+                "failed_persists": self.failed_count,
+                "sqlite_db_size_bytes": db_size,
+                "storage_error": self.storage_error}
 
     def fetch_sweep(self, sweep_id: str) -> SpectrumSweep | None:
         try:

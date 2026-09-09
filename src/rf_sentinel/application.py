@@ -95,15 +95,17 @@ def run_acquisition(settings: Settings) -> int:
     profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,
                            settings.acquisition_bin_hz)
     stop = Event()
-    observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
-                                   settings.acquisition_cadence_budget_seconds,
-                                   settings.acquisition_recovery_seconds)
     previous = {}
+    sink = None
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.getsignal(sig)
             signal.signal(sig, _shutdown_signal)
-        sink = SQLiteMeasurementSink(settings.data_dir / "sweeps.sqlite3")
+        sink = SQLiteMeasurementSink(settings.data_dir / "sweeps.sqlite3",
+                                     incident_retention=settings.incident_retention)
+        observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
+                                       settings.acquisition_cadence_budget_seconds,
+                                       settings.acquisition_recovery_seconds, storage=sink)
         SpectrumAcquisitionWorker(
             RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), sink,
             profile, observer, stop, settings.acquisition_cadence_budget_seconds,

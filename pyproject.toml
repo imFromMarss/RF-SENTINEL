@@ -8,6 +8,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = ["matplotlib>=3.8,<4"]
 
+[project.scripts]
+rf-characterize = "rf_sentinel.characterization:main"
+rf-cw-characterize = "rf_sentinel.cw_characterization:main"
+rf-cw-matrix = "rf_sentinel.cw_matrix:main"
+rf-cw-frequency-accuracy = "rf_sentinel.cw_frequency_accuracy:main"
+
 [project.optional-dependencies]
 dev = ["pytest"]
 

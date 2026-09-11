@@ -3,14 +3,53 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import re
 import subprocess
+from dataclasses import dataclass
 from typing import Callable, Sequence
 
 
 _GAIN_RE = re.compile(r"Tuner gain set to\s+([-+0-9.]+)\s+dB", re.IGNORECASE)
 _FFT_BIN_RE = re.compile(r"FFT bin size:\s*([-+0-9.]+)\s*Hz", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class RTLPowerRow:
+    low: float
+    high: float
+    step: float
+    power_bins: tuple[float, ...]
+
+
+def decode_rtl_power_row(
+        columns: Sequence[str], *, require_positive_low: bool) -> RTLPowerRow | None:
+    """Decode one rtl_power CSV row, or return None for an invalid row."""
+    if len(columns) < 7:
+        return None
+    try:
+        low, high, step = map(float, columns[2:5])
+        values = tuple(float(value) for value in columns[6:])
+    except (ValueError, TypeError):
+        return None
+    if (not all(math.isfinite(value) for value in (low, high, step, *values))
+            or not values):
+        return None
+    invalid_range = (not 0 < low < high) if require_positive_low else low >= high
+    if invalid_range or step <= 0:
+        return None
+    expected_bins = round((high - low) / step)
+    if (expected_bins <= 0
+            or abs(expected_bins * step - (high - low))
+            > 2 + expected_bins * 0.0051):
+        return None
+    if (len(values) == expected_bins + 1
+            and values[-1] == values[-2]):
+        values = values[:-1]
+    if len(values) != expected_bins:
+        return None
+    return RTLPowerRow(low, high, step, values)
 
 
 def invoke_rtl_power(command: Sequence[str], *, stderr_path: Path,

@@ -7,7 +7,6 @@ import csv
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import json
-import math
 from pathlib import Path
 import shlex
 import socket
@@ -15,7 +14,9 @@ import subprocess
 import time
 from typing import Callable, Iterable, Sequence
 
-from rf_sentinel.capture import invoke_rtl_power, raw_csv_within_limit
+from rf_sentinel.capture import (
+    decode_rtl_power_row, invoke_rtl_power, raw_csv_within_limit,
+)
 
 
 DEFAULT_FREQUENCIES_HZ = (
@@ -118,28 +119,13 @@ def _rtl_power_points(path: Path) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     with path.open("r", encoding="ascii", errors="strict", newline="") as stream:
         for columns in csv.reader(stream, skipinitialspace=True):
-            if not columns or len(columns) < 7:
+            if not columns:
                 continue
-            try:
-                low, high, step = map(float, columns[2:5])
-                values = [float(value) for value in columns[6:]]
-            except (ValueError, TypeError):
+            decoded = decode_rtl_power_row(columns, require_positive_low=True)
+            if decoded is None:
                 continue
-            if (not all(math.isfinite(value) for value in (low, high, step, *values))
-                    or not values or not 0 < low < high or step <= 0):
-                continue
-            expected_bins = round((high - low) / step)
-            if (expected_bins <= 0
-                    or abs(expected_bins * step - (high - low))
-                    > 2 + expected_bins * 0.0051):
-                continue
-            if (len(values) == expected_bins + 1
-                    and values[-1] == values[-2]):
-                values = values[:-1]
-            if len(values) != expected_bins:
-                continue
-            points.extend((low + (index + 0.5) * step, value)
-                          for index, value in enumerate(values))
+            points.extend((decoded.low + (index + 0.5) * decoded.step, value)
+                          for index, value in enumerate(decoded.power_bins))
     return points
 
 

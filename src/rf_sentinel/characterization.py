@@ -6,7 +6,6 @@ import argparse
 import csv
 from datetime import UTC, datetime
 import json
-import math
 from pathlib import Path
 import shlex
 import subprocess
@@ -14,7 +13,9 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Sequence
 
-from rf_sentinel.capture import invoke_rtl_power, raw_csv_within_limit
+from rf_sentinel.capture import (
+    decode_rtl_power_row, invoke_rtl_power, raw_csv_within_limit,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path(".local/characterization")
@@ -54,34 +55,13 @@ def _inspect_csv(path: Path) -> tuple[int, int, float | None, float | None]:
         for columns in csv.reader(stream, skipinitialspace=True):
             if not columns:
                 continue
-            if len(columns) < 7:
-                continue
-            try:
-                low, high, step = map(float, columns[2:5])
-                values = [float(value) for value in columns[6:]]
-                if not (math.isfinite(low) and math.isfinite(high) and math.isfinite(step)):
-                    continue
-                if not values or not all(math.isfinite(value) for value in values):
-                    continue
-                if low >= high or step <= 0:
-                    continue
-                expected_bins = round((high - low) / step)
-                if (expected_bins <= 0
-                        or abs(expected_bins * step - (high - low))
-                        > 2 + expected_bins * 0.0051):
-                    continue
-                # rtl_power повторює останній FFT value у кожному CSV row.
-                if (len(values) == expected_bins + 1
-                        and values[-1] == values[-2]):
-                    values = values[:-1]
-                if len(values) != expected_bins:
-                    continue
-            except (ValueError, TypeError):
+            decoded = decode_rtl_power_row(columns, require_positive_low=False)
+            if decoded is None:
                 continue
             rows += 1
-            bins += len(values)
-            starts.append(low)
-            stops.append(high)
+            bins += len(decoded.power_bins)
+            starts.append(decoded.low)
+            stops.append(decoded.high)
     return rows, bins, (min(starts) if starts else None), (max(stops) if stops else None)
 
 

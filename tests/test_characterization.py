@@ -10,6 +10,8 @@ from rf_sentinel.characterization import (
     build_command,
     run_characterization,
 )
+from rf_sentinel.capture import decode_rtl_power_row
+from rf_sentinel.cw_characterization import _rtl_power_points
 
 
 CSV = "2026-09-11, 10:00:00, 24000000, 26000000, 1000000.00, 1, -50, -49\n"
@@ -52,6 +54,56 @@ def test_csv_inspection_excludes_rtl_power_duplicate_terminal_bin(tmp_path):
     path = tmp_path / "raw.csv"
     path.write_text(CSV.replace("-50, -49", "-50, -49, -49"), encoding="ascii")
     assert _inspect_csv(path) == (1, 2, 24_000_000.0, 26_000_000.0)
+
+
+def _row_columns(low="0", high="4", step="2", values=("-30", "-20", "-20")):
+    return ["2026-09-11", "10:00:00", low, high, step, "1", *values]
+
+
+def test_shared_decoder_removes_only_terminal_duplicate_and_preserves_order():
+    decoded = decode_rtl_power_row(_row_columns(values=("-30", "-10", "-10")),
+                                   require_positive_low=False)
+    assert decoded is not None
+    assert decoded.power_bins == (-30.0, -10.0)
+
+
+def test_shared_decoder_preserves_characterization_and_cw_low_policies():
+    row = _row_columns(low="0")
+    assert decode_rtl_power_row(row, require_positive_low=False) is not None
+    assert decode_rtl_power_row(row, require_positive_low=True) is None
+    negative = _row_columns(low="-2", high="2")
+    assert decode_rtl_power_row(negative, require_positive_low=False) is not None
+    assert decode_rtl_power_row(negative, require_positive_low=True) is None
+
+
+@pytest.mark.parametrize("columns", [
+    ["too", "short"],
+    _row_columns(low="not-a-number"),
+    _row_columns(values=("nan", "-20")),
+    _row_columns(values=("inf", "-20")),
+    _row_columns(step="0", values=("-30", "-20")),
+    _row_columns(values=("-30",)),
+])
+def test_shared_decoder_rejects_invalid_structural_rows(columns):
+    assert decode_rtl_power_row(columns, require_positive_low=False) is None
+
+
+def test_shared_decoder_keeps_bin_tolerance_and_power_ordering():
+    assert decode_rtl_power_row(
+        _row_columns(high="10", step="4", values=("-3", "-2")),
+        require_positive_low=False).power_bins == (-3.0, -2.0)
+    assert decode_rtl_power_row(
+        _row_columns(high="10.1", step="4", values=("-3", "-2")),
+        require_positive_low=False) is None
+
+
+def test_csv_wrappers_keep_strict_ascii_decoding(tmp_path):
+    path = tmp_path / "non-ascii.csv"
+    path.write_bytes(b"\xff")
+    with pytest.raises(UnicodeDecodeError):
+        _inspect_csv(path)
+    with pytest.raises(UnicodeDecodeError):
+        _rtl_power_points(path)
 
 
 def test_run_writes_json_csv_summary_and_monotonic_duration(tmp_path):

@@ -2,11 +2,16 @@ import argparse
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from rf_sentinel.cw_characterization import build_point_command
 from rf_sentinel.cw_frequency_accuracy import (
+    RTL_POWER_FFT_WINDOWS,
+    _frequency_accuracy_succeeded,
+    build_parser,
     expand_frequency_accuracy_matrix,
     offset_tuning_active,
     run_frequency_accuracy,
@@ -68,6 +73,26 @@ def test_matrix_expansion_covers_offsets_repeats_and_tuning_modes():
     assert plan[0].key == "f230000000-c-500000-r1-normal"
     assert plan[1].key == "f230000000-c-500000-r1-offset"
     assert plan[-1].key == "f500000000-c+0-r3-offset"
+    assert len({point.checkpoint_identity for point in plan}) == len(plan)
+
+
+def test_duplicate_frequency_accuracy_axes_are_rejected_before_execution(tmp_path):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--libre-vna-port", "1", "--generator-level-dbm", "-40",
+            "--frequencies-hz", "500000000", "--center-offsets-hz", "0,0",
+            "--repeats", "1", "--tuning-modes", "normal",
+            "--output-dir", str(tmp_path),
+        ])
+
+
+def test_fft_window_accepts_supported_names_and_rejects_invalid(tmp_path):
+    required = ["--libre-vna-port", "1", "--generator-level-dbm", "-40",
+                "--output-dir", str(tmp_path)]
+    for window in RTL_POWER_FFT_WINDOWS:
+        assert build_parser().parse_args(required + ["--fft-window", window]).fft_window == window
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(required + ["--fft-window", "not-a-window"])
 
 
 def test_point_command_separates_capture_center_and_enables_offset_tuning(tmp_path):
@@ -95,12 +120,13 @@ def test_non_cw_peaks_exclude_carrier_and_use_tuner_center_offsets(tmp_path):
     path = tmp_path / "raw.csv"
     path.write_text(_raw_csv(), encoding="ascii")
     peaks = strongest_non_cw_peaks(
-        path, cw_frequency_hz=500_000_000, tuner_center_hz=500_000_000,
+        path, cw_frequency_hz=500_000_000,
+        requested_tuner_center_hz=500_000_000,
         exclusion_hz=20_000, minimum_separation_hz=20_000, limit=1)
     assert peaks == [{
         "frequency_hz": 500_600_250.0,
         "level_db": -25.0,
-        "offset_from_tuner_center_hz": 600_250.0,
+        "offset_from_requested_tuner_center_hz": 600_250.0,
         "offset_from_cw_hz": 600_250.0,
     }]
 
@@ -118,7 +144,9 @@ def test_run_serializes_frequency_metrics_and_cleans_up_generator(tmp_path):
     assert record.cw_offset_fft_bins == 0.5
     assert record.requested_generator_level_dbm == -42.0
     assert record.offset_tuning_active is False
-    assert record.strongest_non_cw_peaks[0]["offset_from_tuner_center_hz"] == 600_250.0
+    assert record.requested_tuner_center_hz == 500_000_000
+    assert record.strongest_non_cw_peaks[0][
+        "offset_from_requested_tuner_center_hz"] == 600_250.0
     assert record.warnings == ["[R82XX] PLL not locked!"]
     assert scpi.commands[-1] == ":GEN:PORT 0"
     payload = json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))
@@ -126,6 +154,12 @@ def test_run_serializes_frequency_metrics_and_cleans_up_generator(tmp_path):
         "planned": 1, "completed": 1, "valid": 1, "invalid": 0, "failed": 0,
         "unsupported": 0, "unverified": 0}
     assert payload["frequency_correction_applied"] is False
+    assert payload["points"][0]["requested_tuner_center_hz"] == 500_000_000
+    assert "tuner_center_hz" not in payload["points"][0]
+    csv_header = (tmp_path / "results.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "requested_tuner_center_hz" in csv_header
+    assert "requested_tuner_center_hz" in (tmp_path / "summary.md").read_text(
+        encoding="utf-8")
     assert (tmp_path / "results.csv").exists()
 
 
@@ -155,14 +189,106 @@ def test_resume_replaces_orphan_artifacts_for_pending_point(tmp_path):
     assert sentinel.read_text(encoding="ascii") == "keep"
 
 
+def test_resume_skips_completed_frequency_accuracy_point(tmp_path):
+    args = _args(tmp_path)
+    run_frequency_accuracy(
+        args, scpi=FakeScpi(), runner=_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    args.resume = True
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("completed frequency-accuracy point was repeated")
+
+    records = run_frequency_accuracy(
+        args, scpi=FakeScpi(), runner=unexpected,
+        preflight_runner=unexpected, sleeper=lambda _: None)
+    assert len(records) == 1
+
+
 def test_frequency_accuracy_exit_is_nonzero_for_unverified(monkeypatch, tmp_path):
-    monkeypatch.setattr("rf_sentinel.cw_frequency_accuracy.run_frequency_accuracy",
-                        lambda args: [type("Record", (), {"status": "unverified"})()])
+    point = expand_frequency_accuracy_matrix((500_000_000,), (0,), 1, ("normal",))[0]
+    monkeypatch.setattr(
+        "rf_sentinel.cw_frequency_accuracy.run_frequency_accuracy",
+        lambda args: [SimpleNamespace(
+            status="unverified", tuning_mode="normal",
+            checkpoint_identity=point.checkpoint_identity)],
+    )
     from rf_sentinel.cw_frequency_accuracy import main
     assert main(["--libre-vna-port", "1", "--generator-level-dbm", "-40",
                  "--frequencies-hz", "500000000", "--center-offsets-hz", "0",
                  "--repeats", "1", "--tuning-modes", "normal", "--output-dir",
                  str(tmp_path)]) == 1
+
+
+def test_timeout_with_offset_failure_diagnostic_is_failed(tmp_path):
+    def timeout_runner(command, **kwargs):
+        kwargs["stderr"].write(b"WARNING: Failed to set offset tuning.\n")
+        raise subprocess.TimeoutExpired(command, 30)
+
+    records = run_frequency_accuracy(
+        _args(tmp_path, modes=("offset",)), scpi=FakeScpi(),
+        runner=timeout_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    assert records[0].return_code == 124
+    assert records[0].status == "failed"
+
+
+def test_nonzero_return_code_with_offset_failure_diagnostic_is_failed(tmp_path):
+    def failed_runner(command, **kwargs):
+        kwargs["stderr"].write(b"WARNING: Failed to set offset tuning.\n")
+        return type("Completed", (), {"returncode": 2})()
+
+    records = run_frequency_accuracy(
+        _args(tmp_path, modes=("offset",)), scpi=FakeScpi(),
+        runner=failed_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    assert records[0].return_code == 2
+    assert records[0].status == "failed"
+
+
+def test_valid_required_plus_optional_unsupported_is_success(tmp_path):
+    args = _args(tmp_path, modes=("normal", "offset"))
+    plan = expand_frequency_accuracy_matrix(
+        args.frequencies_hz, args.center_offsets_hz, args.repeats, args.tuning_modes)
+    records = [
+        SimpleNamespace(checkpoint_identity=plan[0].checkpoint_identity,
+                        tuning_mode="normal", status="valid", return_code=0),
+        SimpleNamespace(checkpoint_identity=plan[1].checkpoint_identity,
+                        tuning_mode="offset", status="unsupported", return_code=0),
+    ]
+    assert _frequency_accuracy_succeeded(args, records) is True
+
+
+def test_unsupported_with_execution_failure_is_not_success(tmp_path):
+    args = _args(tmp_path, modes=("normal", "offset"))
+    plan = expand_frequency_accuracy_matrix(
+        args.frequencies_hz, args.center_offsets_hz, args.repeats, args.tuning_modes)
+    records = [
+        SimpleNamespace(checkpoint_identity=plan[0].checkpoint_identity,
+                        tuning_mode="normal", status="valid", return_code=0),
+        SimpleNamespace(checkpoint_identity=plan[1].checkpoint_identity,
+                        tuning_mode="offset", status="unsupported", return_code=124),
+    ]
+    assert _frequency_accuracy_succeeded(args, records) is False
+
+
+def test_all_unsupported_or_incomplete_dataset_is_not_success(tmp_path):
+    args = _args(tmp_path, modes=("offset",))
+    plan = expand_frequency_accuracy_matrix(
+        args.frequencies_hz, args.center_offsets_hz, args.repeats, args.tuning_modes)
+    unsupported = [SimpleNamespace(
+        checkpoint_identity=plan[0].checkpoint_identity,
+        tuning_mode="offset", status="unsupported", return_code=0)]
+    assert _frequency_accuracy_succeeded(args, unsupported) is False
+
+    args = _args(tmp_path / "incomplete", modes=("normal",))
+    args.center_offsets_hz = (0, 250_000)
+    plan = expand_frequency_accuracy_matrix(
+        args.frequencies_hz, args.center_offsets_hz, args.repeats, args.tuning_modes)
+    incomplete = [SimpleNamespace(
+        checkpoint_identity=plan[0].checkpoint_identity,
+        tuning_mode="normal", status="valid")]
+    assert _frequency_accuracy_succeeded(args, incomplete) is False
 
 
 def test_failed_offset_capability_skips_later_offset_points(tmp_path):
@@ -183,5 +309,5 @@ def test_failed_offset_capability_skips_later_offset_points(tmp_path):
     assert len(calls) == 1
     assert [record.status for record in records] == ["unsupported", "unsupported"]
     assert records[0].offset_tuning_active is False
-    assert records[1].return_code is None
+    assert records[1].return_code == 0
     assert records[1].scpi_commands == []

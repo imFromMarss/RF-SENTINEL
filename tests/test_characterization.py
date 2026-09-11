@@ -2,7 +2,14 @@ import argparse
 from datetime import UTC, datetime
 import json
 
-from rf_sentinel.characterization import (_inspect_csv, build_command, run_characterization)
+import pytest
+
+from rf_sentinel.characterization import (
+    _characterization_succeeded,
+    _inspect_csv,
+    build_command,
+    run_characterization,
+)
 
 
 CSV = "2026-09-11, 10:00:00, 24000000, 26000000, 1000000.00, 1, -50, -49\n"
@@ -66,3 +73,48 @@ def test_run_writes_json_csv_summary_and_monotonic_duration(tmp_path):
     assert payload["sweeps"][0]["single_sweep"] is False
     assert (tmp_path / "results.csv").exists()
     assert (tmp_path / "summary.md").exists()
+
+
+@pytest.mark.parametrize("capture", [None, "", "truncated output\n"])
+def test_rc0_without_usable_csv_is_not_success(tmp_path, capture):
+    def fake_runner(command, **kwargs):
+        if capture is not None:
+            __import__("pathlib").Path(command[-1]).write_text(capture, encoding="ascii")
+        return type("Completed", (), {"returncode": 0})()
+
+    args = _args(tmp_path)
+    records = run_characterization(args, runner=fake_runner)
+    assert records[0].return_code == 0
+    assert records[0].rows == 0
+    assert records[0].bins == 0
+    assert _characterization_succeeded(args, records) is False
+
+
+def test_rc0_valid_nonempty_full_coverage_sweep_is_success(tmp_path):
+    def fake_runner(command, **kwargs):
+        __import__("pathlib").Path(command[-1]).write_text(CSV, encoding="ascii")
+        return type("Completed", (), {"returncode": 0})()
+
+    args = _args(tmp_path)
+    records = run_characterization(args, runner=fake_runner)
+    assert _characterization_succeeded(args, records) is True
+
+
+def test_partial_coverage_and_nonzero_subprocess_are_not_success(tmp_path):
+    partial = "2026-09-11, 10:00:00, 24000000, 25000000, 1000000.00, 1, -50\n"
+
+    def partial_runner(command, **kwargs):
+        __import__("pathlib").Path(command[-1]).write_text(partial, encoding="ascii")
+        return type("Completed", (), {"returncode": 0})()
+
+    args = _args(tmp_path / "partial")
+    assert _characterization_succeeded(
+        args, run_characterization(args, runner=partial_runner)) is False
+
+    def failed_runner(command, **kwargs):
+        __import__("pathlib").Path(command[-1]).write_text(CSV, encoding="ascii")
+        return type("Completed", (), {"returncode": 1})()
+
+    args = _args(tmp_path / "failed")
+    assert _characterization_succeeded(
+        args, run_characterization(args, runner=failed_runner)) is False

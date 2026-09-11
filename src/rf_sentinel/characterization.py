@@ -64,9 +64,17 @@ def _inspect_csv(path: Path) -> tuple[int, int, float | None, float | None]:
                     continue
                 if low >= high or step <= 0:
                     continue
+                expected_bins = round((high - low) / step)
+                if (expected_bins <= 0
+                        or abs(expected_bins * step - (high - low))
+                        > 2 + expected_bins * 0.0051):
+                    continue
                 # rtl_power повторює останній FFT value у кожному CSV row.
-                if len(values) >= 2 and values[-1] == values[-2]:
+                if (len(values) == expected_bins + 1
+                        and values[-1] == values[-2]):
                     values = values[:-1]
+                if len(values) != expected_bins:
+                    continue
             except (ValueError, TypeError):
                 continue
             rows += 1
@@ -204,6 +212,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _characterization_succeeded(args: argparse.Namespace,
+                                records: Sequence[SweepRecord]) -> bool:
+    usable = all(
+        record.return_code == 0
+        and record.rows > 0
+        and record.bins > 0
+        and record.coverage_start_hz is not None
+        and record.coverage_stop_hz is not None
+        and record.coverage_start_hz <= record.requested_start_hz
+        and record.coverage_stop_hz >= record.requested_stop_hz
+        for record in records
+    )
+    return bool(records) and len(records) == args.repeat and usable
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not (24_000_000 <= args.start_hz < args.stop_hz <= 1_766_000_000):
@@ -225,7 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for record in records:
         print(f"sweep {record.sequence}: rc={record.return_code}, {record.duration_seconds:.3f}s, "
               f"CSV={record.csv_path}")
-    return 0 if all(record.return_code == 0 for record in records) else 1
+    return 0 if _characterization_succeeded(args, records) else 1
 
 
 if __name__ == "__main__":

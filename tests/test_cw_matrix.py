@@ -2,11 +2,12 @@ import argparse
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tomllib
 
 import pytest
 
-from rf_sentinel.cw_matrix import expand_matrix, run_matrix
+from rf_sentinel.cw_matrix import _matrix_succeeded, build_parser, expand_matrix, run_matrix
 
 
 RAW_CSV = ("2026-09-11, 10:00:00, 49000000, 51000000, 62500.00, 1, "
@@ -64,6 +65,23 @@ def test_matrix_expansion_is_deterministic():
     ]
 
 
+def test_close_float_gains_have_distinct_lossless_checkpoint_identities():
+    plan = expand_matrix((50_000_000,), (10.0000001, 10.0000002), (100_000,))
+    assert plan[0].key == plan[1].key
+    assert plan[0].checkpoint_identity != plan[1].checkpoint_identity
+    assert "0x" in plan[0].checkpoint_identity
+
+
+def test_duplicate_matrix_axis_values_are_rejected_before_execution(tmp_path):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "--physical-configuration", "x", "--cable", "A",
+            "--libre-vna-port", "1", "--generator-level-dbm", "-40",
+            "--frequencies-hz", "50000000", "--gains-db", "10,10",
+            "--bins-hz", "100000", "--output-dir", str(tmp_path),
+        ])
+
+
 def test_serialization_includes_matrix_and_diagnostics(tmp_path):
     scpi = FakeScpi()
     records = run_matrix(
@@ -85,6 +103,35 @@ def test_serialization_includes_matrix_and_diagnostics(tmp_path):
     assert payload["normalization_applied"] is False
     assert (tmp_path / "results.csv").exists()
     assert (tmp_path / "summary.md").exists()
+
+
+@pytest.mark.parametrize("capture", [b"", b"not a rtl_power row\n"])
+def test_empty_or_structurally_broken_capture_is_failed(tmp_path, capture):
+    args = _args(tmp_path)
+
+    def broken_runner(command, **kwargs):
+        Path(command[-1]).write_bytes(capture)
+        return type("Completed", (), {"returncode": 0})()
+
+    records = run_matrix(
+        args, scpi=FakeScpi(), runner=broken_runner,
+        preflight_runner=_preflight, sleeper=lambda _: None)
+    assert records[0].status == "failed"
+
+
+def test_parsed_capture_without_usable_carrier_is_invalid(tmp_path):
+    args = _args(tmp_path)
+    no_carrier = ("2026-09-11, 10:00:00, 49000000, 51000000, 62500.00, 1, "
+                  + ", ".join(["-50"] * 31 + ["-50", "-50"]) + "\n")
+
+    def no_carrier_runner(command, **kwargs):
+        Path(command[-1]).write_text(no_carrier, encoding="ascii")
+        return type("Completed", (), {"returncode": 0})()
+
+    records = run_matrix(
+        args, scpi=FakeScpi(), runner=no_carrier_runner,
+        preflight_runner=_preflight, sleeper=lambda _: None)
+    assert records[0].status == "invalid"
 
 
 def test_project_declares_all_characterization_entry_points():
@@ -112,6 +159,47 @@ def test_resume_skips_completed_points(tmp_path):
     assert len(records) == 1
 
 
+def test_interrupted_resume_does_not_skip_close_distinct_gain(tmp_path):
+    args = _args(tmp_path, gains=(10.0000001, 10.0000002))
+    calls = 0
+
+    def interrupt_second(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _runner(command, **kwargs)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(
+            args, scpi=FakeScpi(), runner=interrupt_second,
+            preflight_runner=_preflight, sleeper=lambda _: None,
+            clock=iter((1.0, 2.0, 3.0)).__next__,
+        )
+    payload = json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))
+    assert len(payload["points"]) == 1
+    completed_raw = Path(payload["points"][0]["raw_csv_path"])
+    completed_contents = completed_raw.read_text(encoding="ascii")
+
+    args.resume = True
+    resumed_calls = 0
+
+    def resume_runner(command, **kwargs):
+        nonlocal resumed_calls
+        resumed_calls += 1
+        return _runner(command, **kwargs)
+
+    records = run_matrix(
+        args, scpi=FakeScpi(), runner=resume_runner,
+        preflight_runner=_preflight, sleeper=lambda _: None,
+        clock=iter((4.0, 5.0)).__next__,
+    )
+    assert resumed_calls == 1
+    assert len(records) == 2
+    assert len({record.checkpoint_identity for record in records}) == 2
+    assert completed_raw.read_text(encoding="ascii") == completed_contents
+
+
 def test_resume_replaces_orphan_artifacts_for_pending_point(tmp_path):
     args = _args(tmp_path)
     raw = tmp_path / "point-001-50MHz-g10-b100000.csv"
@@ -129,12 +217,24 @@ def test_resume_replaces_orphan_artifacts_for_pending_point(tmp_path):
 
 
 def test_matrix_exit_is_nonzero_for_invalid(monkeypatch, tmp_path):
-    monkeypatch.setattr("rf_sentinel.cw_matrix.run_matrix",
-                        lambda args: [type("Record", (), {"status": "invalid"})()])
+    point = expand_matrix((50_000_000,), (10.0,), (100_000,))[0]
+    monkeypatch.setattr(
+        "rf_sentinel.cw_matrix.run_matrix",
+        lambda args: [SimpleNamespace(
+            checkpoint_identity=point.checkpoint_identity, status="invalid")],
+    )
     from rf_sentinel.cw_matrix import main
     assert main(["--physical-configuration", "x", "--cable", "A", "--libre-vna-port", "1",
                  "--generator-level-dbm", "-40", "--frequencies-hz", "50000000",
                  "--gains-db", "10", "--bins-hz", "100000", "--output-dir", str(tmp_path)]) == 1
+
+
+def test_incomplete_planned_identity_set_is_not_success(tmp_path):
+    args = _args(tmp_path, frequencies=(50_000_000, 100_000_000))
+    plan = expand_matrix(args.frequencies_hz, args.gains_db, args.bins_hz)
+    records = [SimpleNamespace(
+        checkpoint_identity=plan[0].checkpoint_identity, status="valid")]
+    assert _matrix_succeeded(args, records) is False
 
 
 def test_generator_cleanup_on_keyboard_interrupt(tmp_path):

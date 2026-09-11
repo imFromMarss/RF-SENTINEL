@@ -17,7 +17,17 @@ import time
 from typing import Callable, Iterable, Sequence
 
 
-DEFAULT_FREQUENCIES_HZ = (50, 100, 230, 500, 800, 1000, 1200, 1500, 1700)
+DEFAULT_FREQUENCIES_HZ = (
+    50_000_000,
+    100_000_000,
+    230_000_000,
+    500_000_000,
+    800_000_000,
+    1_000_000_000,
+    1_200_000_000,
+    1_500_000_000,
+    1_700_000_000,
+)
 DEFAULT_SCPI_PORT = 19542
 DEFAULT_EXPECTED_FREQUENCY_TOLERANCE_HZ = 250_000
 DEFAULT_MIN_CARRIER_DELTA_DB = 1.0
@@ -117,8 +127,16 @@ def _rtl_power_points(path: Path) -> list[tuple[float, float]]:
             if (not all(math.isfinite(value) for value in (low, high, step, *values))
                     or not values or not 0 < low < high or step <= 0):
                 continue
-            if len(values) >= 2 and values[-1] == values[-2]:
+            expected_bins = round((high - low) / step)
+            if (expected_bins <= 0
+                    or abs(expected_bins * step - (high - low))
+                    > 2 + expected_bins * 0.0051):
+                continue
+            if (len(values) == expected_bins + 1
+                    and values[-1] == values[-2]):
                 values = values[:-1]
+            if len(values) != expected_bins:
+                continue
             points.extend((low + (index + 0.5) * step, value)
                           for index, value in enumerate(values))
     return points
@@ -226,7 +244,13 @@ def run_cw_characterization(args: argparse.Namespace, *, scpi=None,
             except (OSError, subprocess.TimeoutExpired):
                 return_code = 124
             analysis = CWSpectrumAnalysis(None, None, None, None, None, False)
-            if return_code == 0 and csv_path.exists() and csv_path.stat().st_size <= MAX_CSV_BYTES:
+            capture_failed = return_code != 0
+            try:
+                capture_usable = (csv_path.exists()
+                                  and csv_path.stat().st_size <= MAX_CSV_BYTES)
+            except OSError:
+                capture_usable = False
+            if return_code == 0 and capture_usable:
                 try:
                     analysis = analyze_spectrum(
                         csv_path,
@@ -234,8 +258,12 @@ def run_cw_characterization(args: argparse.Namespace, *, scpi=None,
                         expected_frequency_tolerance_hz=args.expected_frequency_tolerance_hz,
                         min_carrier_delta_db=args.min_carrier_delta_db,
                     )
-                except (OSError, UnicodeError):
-                    return_code = 125
+                    if analysis.nearest_bin is None:
+                        capture_failed = True
+                except (OSError, UnicodeError, ValueError):
+                    capture_failed = True
+            elif return_code == 0:
+                capture_failed = True
             carrier = analysis.local_peak if analysis.carrier_valid else None
             records.append(CWPointRecord(
                 sequence, frequency_hz, None if carrier is None else carrier[0],
@@ -244,7 +272,7 @@ def run_cw_characterization(args: argparse.Namespace, *, scpi=None,
                 scpi_commands, args.settle_seconds, args.window_hz,
                 "auto" if args.gain is None else args.gain, args.generator_level_dbm,
                 args.libre_vna_port,
-                ("failed" if return_code != 0 else
+                ("failed" if capture_failed else
                  "valid" if analysis.carrier_valid else "invalid"),
                 None if analysis.nearest_bin is None else analysis.nearest_bin[0],
                 None if analysis.nearest_bin is None else analysis.nearest_bin[1],

@@ -37,6 +37,10 @@ DEFAULT_CENTER_OFFSETS_HZ = (-500_000, -250_000, 0, 250_000, 500_000)
 DEFAULT_TUNING_MODES = ("normal", "offset")
 MAX_POINTS = 500
 NON_CW_PEAK_COUNT = 5
+RTL_POWER_FFT_WINDOWS = (
+    "rectangle", "hamming", "blackman", "blackman-harris",
+    "hann-poisson", "bartlett", "youssef",
+)
 
 
 @dataclass(frozen=True)
@@ -48,7 +52,7 @@ class FrequencyAccuracyPoint:
     tuning_mode: str
 
     @property
-    def tuner_center_hz(self) -> int:
+    def requested_tuner_center_hz(self) -> int:
         return self.requested_cw_frequency_hz + self.center_offset_hz
 
     @property
@@ -56,13 +60,24 @@ class FrequencyAccuracyPoint:
         return (f"f{self.requested_cw_frequency_hz}-c{self.center_offset_hz:+d}"
                 f"-r{self.repeat}-{self.tuning_mode}")
 
+    @property
+    def checkpoint_identity(self) -> str:
+        return json.dumps({
+            "center_offset_hz": self.center_offset_hz,
+            "repeat": self.repeat,
+            "requested_cw_frequency_hz": self.requested_cw_frequency_hz,
+            "requested_tuner_center_hz": self.requested_tuner_center_hz,
+            "tuning_mode": self.tuning_mode,
+        }, sort_keys=True, separators=(",", ":"))
+
 
 @dataclass(frozen=True)
 class FrequencyAccuracyRecord:
     point_key: str
+    checkpoint_identity: str
     sequence: int
     requested_cw_frequency_hz: int
-    tuner_center_hz: int
+    requested_tuner_center_hz: int
     center_offset_hz: int
     repeat: int
     tuning_mode: str
@@ -105,7 +120,7 @@ def expand_frequency_accuracy_matrix(
 
 
 def strongest_non_cw_peaks(
-        path: Path, *, cw_frequency_hz: int, tuner_center_hz: int,
+        path: Path, *, cw_frequency_hz: int, requested_tuner_center_hz: int,
         exclusion_hz: int, minimum_separation_hz: int,
         limit: int = NON_CW_PEAK_COUNT) -> list[dict[str, float]]:
     """Return separated local maxima outside the CW exclusion band."""
@@ -130,7 +145,8 @@ def strongest_non_cw_peaks(
         {
             "frequency_hz": frequency_hz,
             "level_db": level_db,
-            "offset_from_tuner_center_hz": frequency_hz - tuner_center_hz,
+            "offset_from_requested_tuner_center_hz": (
+                frequency_hz - requested_tuner_center_hz),
             "offset_from_cw_hz": frequency_hz - cw_frequency_hz,
         }
         for frequency_hz, level_db in selected
@@ -156,6 +172,8 @@ def _number_list(value: str, *, parser, label: str):
         raise argparse.ArgumentTypeError(f"{label} мають бути числами через кому") from None
     if not result:
         raise argparse.ArgumentTypeError(f"потрібен непорожній список {label}")
+    if len(result) != len(set(result)):
+        raise argparse.ArgumentTypeError(f"{label} не можуть містити duplicate values")
     return result
 
 
@@ -174,6 +192,8 @@ def _tuning_modes(value: str) -> tuple[str, ...]:
     result = tuple(part.strip().lower() for part in value.split(",") if part.strip())
     if not result or any(mode not in DEFAULT_TUNING_MODES for mode in result):
         raise argparse.ArgumentTypeError("tuning modes: normal,offset")
+    if len(result) != len(set(result)):
+        raise argparse.ArgumentTypeError("tuning modes не можуть містити duplicate values")
     return result
 
 
@@ -259,7 +279,15 @@ def _persist(output_dir: Path, configuration: dict,
         f"Unsupported: {counts['unsupported']}",
         f"Unverified: {counts['unverified']}",
         "",
+        "## Points",
+        "",
     ]
+    for record in records:
+        lines.append(
+            f"- {record.point_key}: requested_tuner_center_hz="
+            f"{record.requested_tuner_center_hz}; status={record.status}; "
+            f"rc={record.return_code}"
+        )
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines))
 
 
@@ -281,6 +309,10 @@ def run_frequency_accuracy(
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     configuration = _configuration(args)
+    if (len(args.frequencies_hz) != len(set(args.frequencies_hz))
+            or len(args.center_offsets_hz) != len(set(args.center_offsets_hz))
+            or len(args.tuning_modes) != len(set(args.tuning_modes))):
+        raise ValueError("Frequency-accuracy axes не можуть містити duplicate values")
     plan = expand_frequency_accuracy_matrix(
         args.frequencies_hz, args.center_offsets_hz, args.repeats, args.tuning_modes)
     if not plan or len(plan) > MAX_POINTS:
@@ -288,8 +320,9 @@ def run_frequency_accuracy(
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
     created_at, preflight, records = _load_resume(output_dir, configuration)
-    completed_keys = {record.point_key for record in records}
-    pending = [point for point in plan if point.key not in completed_keys]
+    completed_identities = {record.checkpoint_identity for record in records}
+    pending = [point for point in plan
+               if point.checkpoint_identity not in completed_identities]
     if not pending:
         return records
 
@@ -301,7 +334,9 @@ def run_frequency_accuracy(
         scpi = LibreVNAScpi(args.vna_host, args.vna_port, args.scpi_timeout)
     offset_supported: bool | None = next(
         (record.offset_tuning_active for record in records
-         if record.tuning_mode == "offset" and record.offset_tuning_active is not None),
+         if record.tuning_mode == "offset"
+         and record.status in {"valid", "invalid", "unsupported"}
+         and record.offset_tuning_active is not None),
         None,
     )
     try:
@@ -318,7 +353,7 @@ def run_frequency_accuracy(
                     artifact.unlink()
             command = build_point_command(
                 frequency_hz=point.requested_cw_frequency_hz,
-                capture_center_hz=point.tuner_center_hz,
+                capture_center_hz=point.requested_tuner_center_hz,
                 window_hz=args.window_hz,
                 bin_hz=args.bin_hz,
                 integration_seconds=args.integration_seconds,
@@ -336,9 +371,10 @@ def run_frequency_accuracy(
             if point.tuning_mode == "offset" and offset_supported is False:
                 record = FrequencyAccuracyRecord(
                     point_key=point.key,
+                    checkpoint_identity=point.checkpoint_identity,
                     sequence=point.sequence,
                     requested_cw_frequency_hz=point.requested_cw_frequency_hz,
-                    tuner_center_hz=point.tuner_center_hz,
+                    requested_tuner_center_hz=point.requested_tuner_center_hz,
                     center_offset_hz=point.center_offset_hz,
                     repeat=point.repeat,
                     tuning_mode=point.tuning_mode,
@@ -359,7 +395,7 @@ def run_frequency_accuracy(
                     strongest_non_cw_peaks=[],
                     status="unsupported",
                     duration_seconds=0.0,
-                    return_code=None,
+                    return_code=0,
                     warnings=["offset tuning unsupported; skipped after capability failure"],
                     timestamp=now().isoformat(),
                     raw_csv_path=str(raw_csv_path),
@@ -397,19 +433,34 @@ def run_frequency_accuracy(
             except (OSError, subprocess.TimeoutExpired) as error:
                 return_code = 124
                 failure_warning = f"{type(error).__name__}: {error}"
+            except Exception as error:
+                return_code = 125
+                failure_warning = f"{type(error).__name__}: {error}"
 
-            stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
-                           if stderr_path.exists() else "")
+            try:
+                stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
+                               if stderr_path.exists() else "")
+            except OSError as error:
+                stderr_text = ""
+                return_code = 125
+                failure_warning = f"{type(error).__name__}: {error}"
             actual_gain, effective_bin, warnings = _diagnostics(stderr_text)
             active = offset_tuning_active(point.tuning_mode, stderr_text)
-            if point.tuning_mode == "offset" and active is not None:
+            if (return_code == 0 and point.tuning_mode == "offset"
+                    and active is not None):
                 offset_supported = active
             if failure_warning:
                 warnings.append(failure_warning)
             analysis = None
             non_cw_peaks: list[dict[str, float]] = []
-            if (return_code == 0 and raw_csv_path.exists()
-                    and raw_csv_path.stat().st_size <= MAX_CSV_BYTES):
+            try:
+                capture_usable = (return_code == 0 and raw_csv_path.exists()
+                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+            except OSError as error:
+                capture_usable = False
+                return_code = 125
+                warnings.append(f"capture: {type(error).__name__}: {error}")
+            if capture_usable:
                 try:
                     analysis = analyze_spectrum(
                         raw_csv_path,
@@ -420,15 +471,17 @@ def run_frequency_accuracy(
                     non_cw_peaks = strongest_non_cw_peaks(
                         raw_csv_path,
                         cw_frequency_hz=point.requested_cw_frequency_hz,
-                        tuner_center_hz=point.tuner_center_hz,
+                        requested_tuner_center_hz=point.requested_tuner_center_hz,
                         exclusion_hz=args.non_cw_exclusion_hz,
                         minimum_separation_hz=args.non_cw_peak_separation_hz,
                     )
                 except (OSError, UnicodeError, ValueError) as error:
                     warnings.append(f"analysis: {type(error).__name__}: {error}")
-            if point.tuning_mode == "offset" and active is False:
+            if return_code != 0:
+                status = "failed"
+            elif point.tuning_mode == "offset" and active is False:
                 status = "unsupported"
-            elif return_code != 0 or analysis is None:
+            elif analysis is None:
                 status = "failed"
             elif point.tuning_mode == "offset" and active is None:
                 status = "unverified"
@@ -438,9 +491,10 @@ def run_frequency_accuracy(
             carrier_offset_hz = None if carrier is None else carrier[0] - point.requested_cw_frequency_hz
             record = FrequencyAccuracyRecord(
                 point_key=point.key,
+                checkpoint_identity=point.checkpoint_identity,
                 sequence=point.sequence,
                 requested_cw_frequency_hz=point.requested_cw_frequency_hz,
-                tuner_center_hz=point.tuner_center_hz,
+                requested_tuner_center_hz=point.requested_tuner_center_hz,
                 center_offset_hz=point.center_offset_hz,
                 repeat=point.repeat,
                 tuning_mode=point.tuning_mode,
@@ -515,11 +569,36 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_MIN_CARRIER_DELTA_DB)
     parser.add_argument("--non-cw-exclusion-hz", type=int, default=20_000)
     parser.add_argument("--non-cw-peak-separation-hz", type=int, default=20_000)
-    parser.add_argument("--fft-window", default="blackman-harris")
+    parser.add_argument("--fft-window", choices=RTL_POWER_FFT_WINDOWS,
+                        default="blackman-harris")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser
+
+
+def _frequency_accuracy_succeeded(
+        args: argparse.Namespace,
+        records: Sequence[FrequencyAccuracyRecord]) -> bool:
+    planned_identities = {
+        point.checkpoint_identity
+        for point in expand_frequency_accuracy_matrix(
+            args.frequencies_hz, args.center_offsets_hz, args.repeats,
+            args.tuning_modes)
+    }
+    completed_identities = [getattr(record, "checkpoint_identity", None)
+                            for record in records]
+    complete = (len(completed_identities) == len(set(completed_identities))
+                and set(completed_identities) == planned_identities)
+    acceptable = all(
+        record.status == "valid"
+        or (record.status == "unsupported"
+            and record.tuning_mode == "offset"
+            and record.return_code == 0)
+        for record in records
+    )
+    has_usable_measurement = any(record.status == "valid" for record in records)
+    return complete and acceptable and has_usable_measurement
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -551,7 +630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 24_000_000 <= center_hz - half_window < center_hz + half_window <= 1_766_000_000:
                 raise SystemExit("Capture window виходить за межі RTL-SDR tuning range")
     records = run_frequency_accuracy(args)
-    return 0 if all(record.status in {"valid", "unsupported"} for record in records) else 1
+    return 0 if _frequency_accuracy_succeeded(args, records) else 1
 
 
 if __name__ == "__main__":

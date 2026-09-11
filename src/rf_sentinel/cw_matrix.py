@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import itertools
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -46,10 +47,19 @@ class MatrixPoint:
         return (f"f{self.requested_frequency_hz}-g{self.requested_gain_db:g}"
                 f"-b{self.requested_bin_hz}")
 
+    @property
+    def checkpoint_identity(self) -> str:
+        return json.dumps({
+            "requested_bin_hz": self.requested_bin_hz,
+            "requested_frequency_hz": self.requested_frequency_hz,
+            "requested_gain_db_hex": self.requested_gain_db.hex(),
+        }, sort_keys=True, separators=(",", ":"))
+
 
 @dataclass(frozen=True)
 class MatrixRecord:
     point_key: str
+    checkpoint_identity: str
     sequence: int
     physical_configuration: str
     cable: str
@@ -93,6 +103,8 @@ def _number_list(value: str, *, parser, label: str):
         raise argparse.ArgumentTypeError(f"{label} мають бути числами через кому") from None
     if not result:
         raise argparse.ArgumentTypeError(f"потрібен непорожній список {label}")
+    if len(result) != len(set(result)):
+        raise argparse.ArgumentTypeError(f"{label} не можуть містити duplicate values")
     return result
 
 
@@ -105,7 +117,7 @@ def _frequencies(value: str) -> tuple[int, ...]:
 
 def _gains(value: str) -> tuple[float, ...]:
     result = _number_list(value, parser=float, label="gain")
-    if any(not 0 <= item <= 50 for item in result):
+    if any(not math.isfinite(item) or not 0 <= item <= 50 for item in result):
         raise argparse.ArgumentTypeError("gain має бути в межах 0–50 dB")
     return result
 
@@ -258,14 +270,18 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     configuration = _configuration(args)
+    if any(len(values) != len(set(values))
+           for values in (args.frequencies_hz, args.gains_db, args.bins_hz)):
+        raise ValueError("Matrix axes не можуть містити duplicate values")
     plan = expand_matrix(args.frequencies_hz, args.gains_db, args.bins_hz)
     if len(plan) > 10_000:
         raise ValueError("Matrix обмежена 10000 points")
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
     created_at, preflight, records = _load_resume(output_dir, configuration)
-    completed_keys = {record.point_key for record in records}
-    pending = [point for point in plan if point.key not in completed_keys]
+    completed_identities = {record.checkpoint_identity for record in records}
+    pending = [point for point in plan
+               if point.checkpoint_identity not in completed_identities]
     if not pending:
         return records
 
@@ -327,8 +343,14 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
             if failure_warning:
                 warnings.append(failure_warning)
             analysis = None
-            if (return_code == 0 and raw_csv_path.exists()
-                    and raw_csv_path.stat().st_size <= MAX_CSV_BYTES):
+            capture_failed = return_code != 0
+            try:
+                capture_usable = (return_code == 0 and raw_csv_path.exists()
+                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+            except OSError as error:
+                capture_usable = False
+                warnings.append(f"capture: {type(error).__name__}: {error}")
+            if capture_usable:
                 try:
                     analysis = analyze_spectrum(
                         raw_csv_path,
@@ -336,15 +358,21 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
                         expected_frequency_tolerance_hz=args.expected_frequency_tolerance_hz,
                         min_carrier_delta_db=args.min_carrier_delta_db,
                     )
+                    if analysis.nearest_bin is None:
+                        capture_failed = True
                 except (OSError, UnicodeError, ValueError) as error:
                     warnings.append(f"analysis: {type(error).__name__}: {error}")
-            if return_code != 0 or analysis is None:
+                    capture_failed = True
+            elif return_code == 0:
+                capture_failed = True
+            if capture_failed or analysis is None:
                 status = "failed"
             else:
                 status = "valid" if analysis.carrier_valid else "invalid"
             carrier = analysis.local_peak if analysis is not None and analysis.carrier_valid else None
             record = MatrixRecord(
                 point_key=point.key,
+                checkpoint_identity=point.checkpoint_identity,
                 sequence=point.sequence,
                 physical_configuration=args.physical_configuration,
                 cable=args.cable,
@@ -414,6 +442,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _matrix_succeeded(args: argparse.Namespace,
+                      records: Sequence[MatrixRecord]) -> bool:
+    planned_identities = {
+        point.checkpoint_identity
+        for point in expand_matrix(args.frequencies_hz, args.gains_db, args.bins_hz)
+    }
+    completed_identities = [getattr(record, "checkpoint_identity", None)
+                            for record in records]
+    complete = (len(completed_identities) == len(set(completed_identities))
+                and set(completed_identities) == planned_identities)
+    return complete and all(record.status == "valid" for record in records)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not 1 <= args.libre_vna_port <= 2:
@@ -429,7 +470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.min_carrier_delta_db < 0:
         raise SystemExit("Minimum carrier delta не може бути від'ємним")
     records = run_matrix(args)
-    return 0 if all(record.status == "valid" for record in records) else 1
+    return 0 if _matrix_succeeded(args, records) else 1
 
 
 if __name__ == "__main__":

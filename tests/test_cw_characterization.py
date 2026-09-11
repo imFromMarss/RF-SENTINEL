@@ -3,8 +3,17 @@ from datetime import UTC, datetime
 import json
 from pathlib import Path
 
+import pytest
+
 from rf_sentinel.cw_characterization import (
-    _rtl_power_points, analyze_spectrum, build_point_command, extract_peak, generator_commands,
+    DEFAULT_FREQUENCIES_HZ,
+    _rtl_power_points,
+    analyze_spectrum,
+    build_parser,
+    build_point_command,
+    extract_peak,
+    generator_commands,
+    main,
     run_cw_characterization,
 )
 
@@ -13,7 +22,7 @@ CSV = "2026-09-11, 10:00:00, 49000000, 51000000, 1000000.00, 1, -50, -20, -20\n"
 VALID_CSV = ("2026-09-11, 10:00:00, 49000000, 51000000, 62500.00, 1, "
              "-50, -50, -50, -50, -50, -50, -50, -50, -50, -50, -50, -50, "
              "-50, -50, -40, -20, -20, -40, -50, -50, -50, -50, -50, -50, "
-             "-50, -50, -50, -50, -50, -50, -50, -50, -50, -50\n")
+             "-50, -50, -50, -50, -50, -50, -50, -50, -50\n")
 
 
 def _args(tmp_path):
@@ -29,6 +38,25 @@ def _args(tmp_path):
 def test_scpi_generator_command_generation():
     assert generator_commands(50_000_000, -40.0) == (
         ":DEV:MODE GEN", ":GEN:LVL -40", ":GEN:FREQ 50000000", ":GEN:PORT 1")
+
+
+def test_default_frequencies_are_hz_in_valid_rtl_sdr_range(monkeypatch, tmp_path):
+    assert DEFAULT_FREQUENCIES_HZ == (
+        50_000_000, 100_000_000, 230_000_000, 500_000_000, 800_000_000,
+        1_000_000_000, 1_200_000_000, 1_500_000_000, 1_700_000_000,
+    )
+    assert all(24_000_000 <= value <= 1_766_000_000
+               for value in DEFAULT_FREQUENCIES_HZ)
+    assert build_parser().parse_args(["--output-dir", str(tmp_path)]).frequencies_hz \
+        == DEFAULT_FREQUENCIES_HZ
+    monkeypatch.setattr(
+        "rf_sentinel.cw_characterization.run_cw_characterization",
+        lambda args: [type("Record", (), {
+            "sequence": 1, "requested_frequency_hz": args.frequencies_hz[0],
+            "raw_peak_level_db": -20.0, "status": "valid", "return_code": 0,
+        })()],
+    )
+    assert main(["--output-dir", str(tmp_path)]) == 0
 
 
 def test_run_uses_requested_libre_vna_port(tmp_path):
@@ -64,7 +92,7 @@ def test_peak_extraction_uses_raw_values_and_duplicate_is_removed(tmp_path):
 def test_analysis_prefers_carrier_near_expected_over_stronger_unrelated_peak(tmp_path):
     path = tmp_path / "raw.csv"
     path.write_text(
-        "2026-09-11, 10:00:00, 99000000, 101000000, 100000.00, 1, "
+        "2026-09-11, 10:00:00, 99000000, 101200000, 100000.00, 1, "
         + ", ".join(["-50"] * 8 + ["-30", "-10", "-30"] + ["-50"] * 8 + ["-5"] * 3)
         + "\n", encoding="ascii")
     analysis = analyze_spectrum(path, expected_frequency_hz=100_000_000,
@@ -78,7 +106,7 @@ def test_analysis_prefers_carrier_near_expected_over_stronger_unrelated_peak(tmp
 def test_analysis_marks_missing_local_carrier_invalid(tmp_path):
     path = tmp_path / "raw.csv"
     path.write_text(
-        "2026-09-11, 10:00:00, 99000000, 101000000, 100000.00, 1, "
+        "2026-09-11, 10:00:00, 99000000, 101300000, 100000.00, 1, "
         + ", ".join(["-30"] * 20 + ["-5"] * 3)
         + "\n", encoding="ascii")
     analysis = analyze_spectrum(path, expected_frequency_hz=100_000_000,
@@ -93,7 +121,7 @@ def test_analysis_marks_missing_local_carrier_invalid(tmp_path):
 def test_analysis_calculates_local_median_and_delta(tmp_path):
     path = tmp_path / "raw.csv"
     path.write_text(
-        "2026-09-11, 10:00:00, 99000000, 101000000, 100000.00, 1, "
+        "2026-09-11, 10:00:00, 99000000, 99900000, 100000.00, 1, "
         + ", ".join(["-40", "-39", "-38", "-37", "-36", "-20", "-35", "-34", "-33"])
         + "\n", encoding="ascii")
     analysis = analyze_spectrum(path, expected_frequency_hz=99_550_000,
@@ -146,4 +174,43 @@ def test_capture_failure_is_failed_not_invalid(tmp_path):
     records = run_cw_characterization(
         args, scpi=scpi, runner=failed_runner, sleeper=lambda _: None)
     assert records[0].return_code == 1
+    assert records[0].status == "failed"
+
+
+@pytest.mark.parametrize("capture", [
+    None,
+    b"",
+    b"broken\n",
+    b"\xff",
+    b"2026-09-11, 10:00:00, 49000000, 51000000, 1000000.00, 1, -20\n",
+])
+def test_missing_empty_structurally_broken_or_unreadable_capture_is_failed(
+        tmp_path, capture):
+    args = _args(tmp_path)
+    args.frequencies_hz = (50_000_000,)
+    scpi = type("FakeScpi", (), {"send": lambda self, command: None})()
+
+    def fake_runner(command, **kwargs):
+        if capture is not None:
+            Path(command[-1]).write_bytes(capture)
+        return type("Completed", (), {"returncode": 0})()
+
+    records = run_cw_characterization(
+        args, scpi=scpi, runner=fake_runner, sleeper=lambda _: None)
+    assert records[0].return_code == 0
+    assert records[0].status == "failed"
+
+
+def test_oversized_capture_is_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr("rf_sentinel.cw_characterization.MAX_CSV_BYTES", 1)
+    args = _args(tmp_path)
+    args.frequencies_hz = (50_000_000,)
+    scpi = type("FakeScpi", (), {"send": lambda self, command: None})()
+
+    def fake_runner(command, **kwargs):
+        Path(command[-1]).write_text(VALID_CSV, encoding="ascii")
+        return type("Completed", (), {"returncode": 0})()
+
+    records = run_cw_characterization(
+        args, scpi=scpi, runner=fake_runner, sleeper=lambda _: None)
     assert records[0].status == "failed"

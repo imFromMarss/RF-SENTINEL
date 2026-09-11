@@ -100,12 +100,14 @@ def run_schedule(run_survey: Callable, interval_seconds: float, stop: Event) -> 
 
 
 class ScheduledReportRunner:
-    """Deliver completed calendar reports without owning acquisition.
+    """Generate and optionally deliver completed calendar reports.
 
-    The delivery ledger is deliberately separate from the sweep database: the
-    report scheduler only reads SQLite through ``report_engine`` and owns no
-    acquisition or storage lifecycle.  A window is recorded after a complete
-    delivery, which makes normal polling and clean restarts idempotent.
+    The report scheduler reads SQLite through ``report_engine`` and records
+    incidents through its own writable storage connection. A window is
+    recorded after package generation when delivery is disabled, or after
+    complete delivery when a notifier is configured. This makes normal
+    polling and clean restarts idempotent without coupling artifact
+    generation to Telegram or acquisition's writable connection.
     """
 
     def __init__(self, report_engine, notifier, data_dir: str | Path,
@@ -217,6 +219,29 @@ class ScheduledReportRunner:
                            f"{start.astimezone(self.zone):%Y%m%dT%H%M%S}-"
                            f"{end.astimezone(self.zone):%Y%m%dT%H%M%S}")
             package = generate_report_package(report, destination, self.timezone)
+        except MeasurementPersistenceError:
+            logger.error("Scheduled %s report persistence failed", kind)
+            self._failure("report_persistence", "Не вдалося зберегти стан запланованого звіту")
+            return False
+        except Exception:
+            logger.error("Scheduled %s report generation failed", kind)
+            self._failure("report_generation", "Не вдалося сформувати запланований звіт")
+            return False
+
+        if self.notifier is None:
+            try:
+                self._delivered.add(key)
+                self._persist_delivered()
+                self._success()
+            except (MeasurementPersistenceError, OSError):
+                logger.error("Scheduled %s report persistence failed", kind)
+                self._failure("report_persistence", "Не вдалося зберегти стан запланованого звіту")
+                return False
+            logger.info("Scheduled %s report generated; Telegram delivery disabled: %s–%s",
+                        kind, start, end)
+            return True
+
+        try:
             delivery = None
             for attempt in range(self.delivery_attempts):
                 delivery = self.notifier.send_package(package)
@@ -238,12 +263,11 @@ class ScheduledReportRunner:
             self._failure("report_persistence", "Не вдалося зберегти стан запланованого звіту")
             return False
         except Exception:
-            # Derived report and transport failures must not affect acquisition
-            # or prevent the next calendar boundary from being evaluated.
+            # Transport failures do not invalidate the already-generated package.
             # Do not serialize exception text: external transports may include
             # URLs, identifiers, or response bodies in it.
-            logger.error("Scheduled %s report generation failed", kind)
-            self._failure("report_generation", "Не вдалося сформувати запланований звіт")
+            logger.error("Scheduled %s report delivery failed", kind)
+            self._failure("telegram_delivery", "Не вдалося доставити запланований звіт")
             return False
 
     def run_pending(self, now: datetime | None = None) -> tuple[str, ...]:

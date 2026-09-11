@@ -8,13 +8,14 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import json
 import math
-import os
 from pathlib import Path
 import shlex
 import socket
 import subprocess
 import time
 from typing import Callable, Iterable, Sequence
+
+from rf_sentinel.capture import invoke_rtl_power, raw_csv_within_limit
 
 
 DEFAULT_FREQUENCIES_HZ = (
@@ -233,21 +234,15 @@ def run_cw_characterization(args: argparse.Namespace, *, scpi=None,
                 for command_text in scpi_commands:
                     scpi.send(command_text)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False)
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired):
                 return_code = 124
             analysis = CWSpectrumAnalysis(None, None, None, None, None, False)
             capture_failed = return_code != 0
             try:
-                capture_usable = (csv_path.exists()
-                                  and csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = raw_csv_within_limit(csv_path, MAX_CSV_BYTES)
             except OSError:
                 capture_usable = False
             if return_code == 0 and capture_usable:

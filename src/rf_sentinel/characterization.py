@@ -7,13 +7,14 @@ import csv
 from datetime import UTC, datetime
 import json
 import math
-import os
 from pathlib import Path
 import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass
 from typing import Sequence
+
+from rf_sentinel.capture import invoke_rtl_power, raw_csv_within_limit
 
 
 DEFAULT_OUTPUT_DIR = Path(".local/characterization")
@@ -121,17 +122,12 @@ def run_characterization(args: argparse.Namespace, *, runner=subprocess.run,
         started = clock()
         timestamp = now().isoformat()
         try:
-            with stderr_path.open("wb") as diagnostics:
-                completed = runner(
-                    command, shell=False, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL, stderr=diagnostics,
-                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                         "TZ": "UTC", "LC_ALL": "C"},
-                    timeout=(SINGLE_SWEEP_TIMEOUT_SECONDS if getattr(args, "single_sweep", False) else
-                             args.duration_seconds + max(15, args.integration_seconds + 30)),
-                    check=False,
-                )
-            return_code = completed.returncode
+            return_code = invoke_rtl_power(
+                command, stderr_path=stderr_path,
+                timeout=(SINGLE_SWEEP_TIMEOUT_SECONDS if getattr(args, "single_sweep", False) else
+                         args.duration_seconds + max(15, args.integration_seconds + 30)),
+                runner=runner,
+            )
         except FileNotFoundError:
             return_code = 127
         except (subprocess.TimeoutExpired, OSError):
@@ -139,7 +135,7 @@ def run_characterization(args: argparse.Namespace, *, runner=subprocess.run,
         duration = clock() - started
         rows = bins = 0
         coverage_start = coverage_stop = None
-        if csv_path.exists() and csv_path.stat().st_size <= MAX_CSV_BYTES:
+        if raw_csv_within_limit(csv_path, MAX_CSV_BYTES):
             try:
                 rows, bins, coverage_start, coverage_stop = _inspect_csv(csv_path)
             except (OSError, UnicodeError):

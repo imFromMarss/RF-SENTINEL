@@ -11,7 +11,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 import subprocess
 import time
@@ -29,10 +28,7 @@ from rf_sentinel.cw_characterization import (
     generator_commands,
     generator_shutdown_command,
 )
-
-
-_GAIN_RE = re.compile(r"Tuner gain set to\s+([-+0-9.]+)\s+dB", re.IGNORECASE)
-_FFT_BIN_RE = re.compile(r"FFT bin size:\s*([-+0-9.]+)\s*Hz", re.IGNORECASE)
+from rf_sentinel.capture import _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text
 
 
 @dataclass(frozen=True)
@@ -127,21 +123,6 @@ def _bins(value: str) -> tuple[int, ...]:
     if any(not 10_000 <= item <= 2_800_000 for item in result):
         raise argparse.ArgumentTypeError("bin size має бути в межах 10000–2800000 Hz")
     return result
-
-
-def _diagnostics(stderr_text: str) -> tuple[float | None, float | None, list[str]]:
-    gain_match = _GAIN_RE.search(stderr_text)
-    bin_match = _FFT_BIN_RE.search(stderr_text)
-    warnings = [
-        line.strip() for line in stderr_text.splitlines()
-        if ("pll not locked" in line.lower() or "warning" in line.lower()
-            or "error" in line.lower() or "no e4000" in line.lower())
-    ]
-    return (
-        float(gain_match.group(1)) if gain_match else None,
-        float(bin_match.group(1)) if bin_match else None,
-        warnings,
-    )
 
 
 def _configuration(args: argparse.Namespace) -> dict:
@@ -324,29 +305,22 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
                 for scpi_command in scpi_commands:
                     scpi.send(scpi_command)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False,
-                    )
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired) as error:
                 return_code = 124
                 failure_warning = f"{type(error).__name__}: {error}"
 
-            stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
-                           if stderr_path.exists() else "")
+            stderr_text = (read_stderr_text(stderr_path) if stderr_path.exists() else "")
             actual_gain, effective_bin, warnings = _diagnostics(stderr_text)
             if failure_warning:
                 warnings.append(failure_warning)
             analysis = None
             capture_failed = return_code != 0
             try:
-                capture_usable = (return_code == 0 and raw_csv_path.exists()
-                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = (return_code == 0
+                                  and raw_csv_within_limit(raw_csv_path, MAX_CSV_BYTES))
             except OSError as error:
                 capture_usable = False
                 warnings.append(f"capture: {type(error).__name__}: {error}")

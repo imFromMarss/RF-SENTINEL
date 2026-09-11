@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 import itertools
 import json
 import math
-import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -29,7 +28,10 @@ from rf_sentinel.cw_characterization import (
     generator_commands,
     generator_shutdown_command,
 )
-from rf_sentinel.cw_matrix import _diagnostics, _run_preflight
+from rf_sentinel.cw_matrix import _run_preflight
+from rf_sentinel.capture import (
+    _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text,
+)
 
 
 DEFAULT_FREQUENCIES_HZ = (230_000_000, 500_000_000, 1_000_000_000, 1_500_000_000)
@@ -421,15 +423,9 @@ def run_frequency_accuracy(
                 for scpi_command in scpi_commands:
                     scpi.send(scpi_command)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False,
-                    )
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired) as error:
                 return_code = 124
                 failure_warning = f"{type(error).__name__}: {error}"
@@ -438,8 +434,7 @@ def run_frequency_accuracy(
                 failure_warning = f"{type(error).__name__}: {error}"
 
             try:
-                stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
-                               if stderr_path.exists() else "")
+                stderr_text = (read_stderr_text(stderr_path) if stderr_path.exists() else "")
             except OSError as error:
                 stderr_text = ""
                 return_code = 125
@@ -454,8 +449,8 @@ def run_frequency_accuracy(
             analysis = None
             non_cw_peaks: list[dict[str, float]] = []
             try:
-                capture_usable = (return_code == 0 and raw_csv_path.exists()
-                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = (return_code == 0
+                                  and raw_csv_within_limit(raw_csv_path, MAX_CSV_BYTES))
             except OSError as error:
                 capture_usable = False
                 return_code = 125

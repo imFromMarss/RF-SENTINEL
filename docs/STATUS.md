@@ -1,6 +1,6 @@
 # RF Sentinel — Стан проєкту
 
-**Поточний етап:** LOCAL SURVEY PROTOTYPE / architecture review
+**Поточний етап:** PRODUCTION-LIKE OPERATIONAL BASELINE / release checkpoint
 
 ## Завершено
 
@@ -24,11 +24,33 @@
 - Звичайні tests hardware-free; реальні SDR/Telegram та Linux ARM64 verification
   залишаються окремими integration/host перевірками.
 
+## Production-like operational baseline (2026-09-11)
+
+Canonical runtime — `python -m rf_sentinel station`. CM4/systemd deployment,
+boot lifecycle, unattended acquisition понад 24 години, стабільність SQLite
+persistence/geometry, reporting і Telegram delivery validated. Acquisition
+продовжує 60-секундний cadence незалежно від report generation.
+
+Початковий baseline: **PASS**.
+
+Під час 24h report validation старий reporting path мав GB-scale memory
+amplification і спричиняв OOM на CM4: великі datasets materialize-ились у SQLite,
+Python, JSON та Matplotlib одночасно. Reporting path переведено на streaming
+SQLite reads, compact payloads, temporary snapshots, streaming JSON і bounded
+percentile/render processing. На CM4 після fix report успішно обробив 1392 sweeps
+із піковим RSS приблизно 90 MiB, без OOM; concurrent smoke test підтвердив, що
+acquisition продовжується під час report generation.
+
+Operational trade-off: 24h report на CM4 може формуватися приблизно 12–13 хвилин
+і використовувати близько 714 MiB temporary disk space. Це прийнятно, оскільки
+acquisition не блокується; deployment потребує достатнього disk headroom.
+
 - Review архітектури SDR-пристроїв (SDR Device Architecture). Проєкт документа підготовлено й розміщено в `docs/design/SDR_DEVICE_ARCHITECTURE.md`; його наявність не означає формального прийняття.
 
 ## Наступний крок
 
-- Final verification → PR → Raspberry Pi/systemd deployment → soak test.
+- Окремо: PR/review та подальші deployment milestones. Цей release checkpoint
+  не створює PR і не виконує deployment.
 
 ## Stage 1: незалежний acquisition (2026-09-09)
 
@@ -43,5 +65,6 @@ budget встановлено 60 с. Виміряні нижні межі:
 початку кожної години, daily report — о 00:00; default timezone — `Europe/Kyiv`.
 Telegram доставляє автоматичні reports і дві PNG (`waterfall.png`, `heatmap.png`),
 а authorized users можуть запросити `📊 Звіт за останню годину`. Acquisition не
-зупиняється під час report generation. Raspberry Pi/systemd deployment ще не завершений.
+зупиняється під час report generation. Raspberry Pi/systemd operational validation
+пройдено для цього baseline.
 Деталі: [Continuous acquisition](CONTINUOUS_ACQUISITION.md).

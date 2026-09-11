@@ -8,6 +8,7 @@ from rf_sentinel.acquisition import (ErrorClassification, SpectrumSweep, SweepCo
 from rf_sentinel.reporting import (SQLiteReportEngine, completed_calendar_day,
                                    completed_calendar_hour, last_hour_window)
 from rf_sentinel.storage import SQLiteMeasurementSink
+from rf_sentinel.storage import SQLiteSweepReader
 
 
 START = datetime(2026, 9, 8, 12, tzinfo=UTC)
@@ -94,3 +95,41 @@ def test_invalid_window_is_rejected(tmp_path):
     store(path)
     with pytest.raises(ValueError):
         SQLiteReportEngine(path).build(START, START)
+
+
+def test_report_build_uses_streaming_reader_and_compact_payloads(tmp_path, monkeypatch):
+    path = tmp_path / "sweeps.sqlite3"
+    store(path, make_sweep(1, 10))
+
+    def legacy_query_must_not_run(self, start, end):
+        raise AssertionError("report build must not materialize query_sweeps()")
+
+    monkeypatch.setattr(SQLiteSweepReader, "query_sweeps", legacy_query_must_not_run)
+    report = SQLiteReportEngine(path).build(START, START + timedelta(minutes=1))
+
+    from rf_sentinel.reporting import _DiskValues
+    assert isinstance(report.sweeps[0].powers, _DiskValues)
+    assert report.to_dict()["sweeps"][0]["powers"] == [-40.0, -30.0]
+
+
+def test_report_snapshot_survives_source_changes_and_releases_file(tmp_path):
+    import gc
+    import sqlite3
+    import weakref
+
+    path = tmp_path / "sweeps.sqlite3"
+    store(path, make_sweep(1, 10), make_sweep(2, 20))
+    report = SQLiteReportEngine(path).build(START, START + timedelta(minutes=1))
+    values = report.sweeps[0].powers
+    owner = weakref.ref(values.owner)
+    file = weakref.ref(values.owner.file)
+    with sqlite3.connect(path) as db:
+        db.execute("DELETE FROM sweeps")
+    assert tuple(values) == (-40.0, -30.0)
+    assert values[-1] == -30.0
+    assert values[:] == (-40.0, -30.0)
+    assert tuple(report.sweeps[1].powers) == tuple(values)
+    del values, report
+    gc.collect()
+    assert owner() is None
+    assert file() is None

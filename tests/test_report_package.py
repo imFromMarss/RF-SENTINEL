@@ -61,3 +61,22 @@ def test_report_json_round_trip_and_package_metadata(tmp_path):
     assert set(json.loads(package.report_json.read_text())) >= {
         "window_start", "window_end", "success_count", "gaps", "sweeps",
     }
+
+
+def test_package_streams_json_without_full_tree_or_string(tmp_path, monkeypatch):
+    from rf_sentinel import reporting
+    data = ReportData.from_dict(report().to_dict())
+    expected = data.to_dict()
+    dumps = json.dumps
+
+    def scalar_only(value, *args, **kwargs):
+        assert not isinstance(value, (dict, list, tuple, ReportData))
+        return dumps(value, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("package must not materialize ReportData.to_dict")
+
+    monkeypatch.setattr(ReportData, "to_dict", forbidden)
+    monkeypatch.setattr(reporting.json, "dumps", scalar_only)
+    package = generate_report_package(data, tmp_path / "streamed", "UTC")
+    assert json.loads(package.report_json.read_text()) == expected

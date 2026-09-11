@@ -69,6 +69,20 @@ sticky і піднімається через `flush`/`close`, тому не с�
 `LatestSweepSink` залишається lightweight RAM implementation для
 hardware-free tests, але не production storage.
 
+## Великий report і bounded memory
+
+24h reporting не повинен використовувати legacy materializing path для великих
+вікон. `SQLiteReportEngine` читає sweeps потоково, payload зберігає в тимчасовому
+snapshot, JSON записує потоково, а percentile та rendering обробляють дані
+bounded-способом. `ReportData.to_dict()` збережено як compatibility API, але він
+матеріалізує payload і не є preferred path для production report generation.
+
+Під час CM4 validation report успішно обробив 1392 sweeps із peak RSS близько
+90 MiB без OOM. Тривалість 24h report становила приблизно 12–13 хвилин, а peak
+temporary disk space — близько 714 MiB. Це прийнятний trade-off: acquisition
+продовжує власний 60-секундний cadence незалежно від report generation. Host
+повинен мати достатній disk headroom.
+
 ## Відмови та завершення
 
 SDR/parse failure збільшує counters, записує безпечний reason/exit code та переводить
@@ -166,7 +180,8 @@ overhead sink/health і записується окремо від configured bu
 instantaneous-bandwidth limit. Фундаментально менше hops потребує кількох RTL-SDR
 або ширшосмугового hardware backend, наприклад майбутнього HackRF.
 
-SSH використовувався лише для benchmark; deployment та systemd не змінювалися.
+SSH використовувався лише для benchmark та validation; CM4/systemd boot lifecycle
+і unattended operation validated, без зміни runtime topology.
 У canonical `station` report scheduler і report handler працюють як internal downstream
 components: hourly report доставляється на початку кожної години, daily report — о 00:00
 у configured timezone (default `Europe/Kyiv`). Acquisition під час report generation не

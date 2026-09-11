@@ -8,6 +8,7 @@ from rf_sentinel.acquisition import (ErrorClassification, SpectrumSweep, SweepCo
                                      SweepProfileMetadata, SweepQuality)
 from rf_sentinel.errors import MeasurementPersistenceError
 from rf_sentinel.storage import SQLiteMeasurementSink
+from rf_sentinel.storage import SQLiteSweepReader
 
 
 NOW = datetime(2026, 9, 8, tzinfo=UTC)
@@ -57,6 +58,18 @@ def test_time_window_is_half_open_and_ordered(tmp_path):
     store.store_sweep(sweep(3, started=NOW + timedelta(seconds=3)))
     result = store.query_sweeps(NOW, NOW + timedelta(seconds=3))
     assert [item.sweep_id for item in result] == ["sweep-1", "sweep-2"]
+
+
+def test_report_iterator_decodes_compact_arrays_without_fetchall(tmp_path):
+    from array import array
+
+    store = SQLiteMeasurementSink(tmp_path / "sweeps.sqlite3")
+    store.store_sweep(sweep())
+    reader = SQLiteSweepReader(tmp_path / "sweeps.sqlite3")
+    item = next(reader.iter_sweeps(NOW, NOW + timedelta(seconds=2)))
+    reader.close()
+    assert isinstance(item.powers, array)
+    assert item.powers == array("d", (-40.0, -50.0))
 
 
 def test_restart_reopen_and_duplicate_id(tmp_path):

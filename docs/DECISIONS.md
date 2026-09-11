@@ -20,9 +20,9 @@
 
 ## ADR-003: Establish command-line acquisition as an experimental baseline
 
-- **Status:** EXPERIMENT REQUIRED
+- **Status:** IMPLEMENTED FOR CURRENT BASELINE; broader hardware validation remains evidence-gated
 - **Context:** Research identifies `rtl_power` and `hackrf_sweep` as mature candidate sweep tools, but their CM4 performance, output behavior, recovery, and profile sufficiency are not yet demonstrated.
-- **Decision:** Evaluate supervised `rtl_power` and `hackrf_sweep` adapters as first baseline implementations; do not make either a permanent dependency yet.
+- **Decision:** The current baseline implements supervised `rtl_power` acquisition. `hackrf_sweep` remains a future adapter candidate; broader device/profile validation remains evidence-gated.
 - **Alternatives:** Direct device libraries first; SoapySDR first; custom DSP pipeline first.
 - **Consequences:** Tool processes require strict timeout, reaping, version/output validation, reservation, and recovery behavior. A validated shortfall may justify an API adapter.
 - **Evidence required:** Sustainable workload, FFT/measurement throughput, scan revisit, USB stability, RTL-SDR/HackRF endurance, and recovery experiments in [EXPERIMENTS.md](research/EXPERIMENTS.md).
@@ -112,3 +112,11 @@
 - **Архітектурні межі:** Пропозиція не приймає draft SDR Device Architecture APIs і не змінює ADR-003, ADR-006, ADR-008, ADR-009 або ADR-010. Зберігаються RX-only, цільова платформа CM4/Linux ARM64, підтримка RTL-SDR/HackRF, одна systemd-supervised station service із supervised acquisition child processes, Device Manager як єдиний reservation authority та контрольована Command/Query boundary для Telegram без прямого SDR/shell authority. Новий runtime process model або message broker не запроваджується; persistence, SoapySDR та optional IQ/classification не приймаються цим рішенням.
 - **Свідомо відкладено:** Точна Python version; package name; dependency/package manager; build backend; `pyproject.toml`; formatter; linter; type checker; test framework; CI; concurrency implementation; configuration format/library; persistence technology; native bindings mechanism; SoapySDR adoption; optional IQ/classification implementation. Конкретні libraries та runtime dependencies не обираються.
 - **Review та необхідні підтвердження:** Рішення ACCEPTED. CM4 workload, memory, storage/report processing, endurance і subprocess failure/recovery перевіряються за [EXPERIMENTS.md](research/EXPERIMENTS.md); вибір мови не замінює ці перевірки й не встановлює performance thresholds.
+
+## ADR-013: Separate acquisition and reporting storage/lifecycle boundaries
+
+- **Status:** ACCEPTED / implemented in current stable baseline
+- **Context:** Acquisition must continue while reports are read, rendered and delivered. A shared logical database does not require a shared connection or lifecycle.
+- **Decision:** Open a separate writable SQLite connection for acquisition persistence and a separate writable SQLite connection for report scheduler incident/state-related persistence. `SQLiteReportEngine` opens a separate read-only SQLite connection (`mode=ro`, `PRAGMA query_only=ON`). Report generation is outside the acquisition path. Report generation/delivery failures are isolated to report health/incident handling and must not terminate acquisition. Shutdown drains/stops components with bounded deadlines and closes each connection independently.
+- **Consequences:** SQLite remains the durable hand-off, while writer/read lifecycle and failure ownership are explicit. Report readers cannot initialize or mutate the database. A report may fail or be retried without stopping the SDR worker; committed sweeps remain available for later reports.
+- **Evidence:** Current `application.py`, `scheduler.py`, `reporting.py` and `storage.py` implementation plus hardware-free station/report concurrency tests.

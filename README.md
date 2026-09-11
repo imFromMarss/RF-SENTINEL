@@ -1,66 +1,54 @@
 # RF Sentinel
 
-RF Sentinel — автономний сервер моніторингу RF-спектра, що працює лише на приймання (RX-only), для систем на базі Raspberry Pi Compute Module 4. Він призначений для безперервного спостереження за налаштованими діапазонами спектра, збереження історії спостережень і надання hourly/daily та on-demand звітів через Telegram-бота.
+RF Sentinel — RX-only станція моніторингу RF-спектра для Raspberry Pi Compute Module 4 / Linux ARM64. Система приймає спектральні sweep-и, зберігає їх локально та формує hourly/daily і on-demand reports. Вона не декодує вміст приватних комунікацій і не є передавачем.
 
-Проєкт зосереджений на спостереженні за спектром і визначенні характеристик сигналів. Він не призначений для розшифрування захищених комунікацій, обходу контролю доступу або перехоплення вмісту приватних комунікацій.
+## Current stable baseline
 
-## Стан проєкту
-
-Проєкт перебуває на етапі **LOCAL SURVEY PROTOTYPE / architecture review**. Див. [визначення проєкту](docs/PROJECT.md) і [поточний стан](docs/STATUS.md).
-
-## Межі першого прототипу
-
-Поточний прототип створює безпечну й відтворювану основу для спостереження без постійної участі оператора. Canonical deployment entrypoint — `python -m rf_sentinel station`: один RF Sentinel process об'єднує continuous acquisition, async SQLite persistence, report scheduler і Telegram inbound/outbound та запускає supervised `rtl_power` child processes. Raspberry Pi/systemd deployment ще не завершений, а частина production-рішень і hardware validation залишається предметом review.
-
-## Цільове середовище
-
-- Raspberry Pi Compute Module 4
-- Linux ARM64
-- Робота лише на приймання (RX-only)
-- SDR-пристрої RTL-SDR і HackRF
-
-## Документація
-
-- [Визначення проєкту](docs/PROJECT.md) — місія, межі, те, що не входить до цілей, і початкова термінологія.
-- [Системні вимоги](docs/REQUIREMENTS.md) — нормативна поведінка й очікування щодо приймання.
-- [Стан проєкту](docs/STATUS.md) — поточний етап і стан review.
-- [Мовна політика](docs/LANGUAGE_POLICY.md) — мова документації, технічна термінологія та правила поступового перекладу.
-- [Початкова архітектура системи](docs/ARCHITECTURE.md) — прийняті межі відповідальності, компоненти й потоки.
-- [Архітектурні рішення](docs/DECISIONS.md) — записи рішень та їхні статуси.
-- [Архітектурні питання](docs/ARCHITECTURE_QUESTIONS.md) — невирішені питання й необхідні підтвердження.
-- [Архітектура SDR-пристроїв](docs/design/SDR_DEVICE_ARCHITECTURE.md) — детальний дизайн Device Manager і Acquisition Adapter, що наразі проходить review.
-- [Дослідження наявних рішень](docs/research/EXISTING_SOLUTIONS.md) — оцінка відповідних SDR-підходів, яка не встановлює обов'язкових рішень.
-- [Технологічні кандидати](docs/research/TECHNOLOGY_CANDIDATES.md) — реєстр варіантів і можливих напрямів, який не встановлює обов'язкових рішень.
-- [Експерименти з обладнанням CM4](docs/research/EXPERIMENTS.md) — заплановані перевірки для обґрунтування рішень, залежних від обладнання та продуктивності.
-
-## Canonical station runtime
-
-Запуск production-like topology:
+Canonical integrated runtime:
 
 ```sh
 python -m rf_sentinel station
 ```
 
-`station` утримує process-wide exclusive lock у `DATA_DIR/station.lock`. Другий instance
-завершується fail-fast із safe diagnostic і не запускає acquisition, report scheduler або
-Telegram polling. Per-SDR lock залишається окремою hardware safety boundary.
+Stable baseline включає continuous acquisition через supervised `rtl_power`, persistent SQLite sweeps, calendar report scheduler, report artifacts, Telegram boundary, health snapshots, structured logs і bounded recovery/shutdown.
 
-## Локальні та diagnostic режими
+Hardware-free validation: **186 passed, 2 skipped**. Skipped checks є opt-in:
 
-Доступні standalone/diagnostic контури: `python -m rf_sentinel acquire`
-(`rtl_power → SQLite`) та `python -m rf_sentinel report-schedule`
-(`SQLite → report.json/report.txt/waterfall.png/heatmap.png → Telegram`).
-Вони не є цільовою production deployment topology.
-`python -m rf_sentinel` зберігає попередню identity-only поведінку; режими `survey`
-і `schedule` запускають одноразовий або continuous application workflow. Налаштування,
-історичні артефакти, logging, recovery, локальні команди та hardware-free tests описані
-в [LOCAL_SURVEY.md](docs/LOCAL_SURVEY.md).
+- real RTL-SDR test requires `RF_SENTINEL_TEST_HARDWARE=1`;
+- 30-minute full-range hardware test requires `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
-## Continuous acquisition
+Characterization/calibration — WIP/roadmap. Це не stable functionality і не повинно трактуватися як реалізована ідентифікація, класифікація або absolute-power calibration.
 
-`python -m rf_sentinel station` запускає canonical unified runtime. `python -m rf_sentinel acquire`
-залишається незалежним RX producer без Telegram і report generation для standalone/diagnostic use.
-Hardware benchmark показав, що full-range cadence ≤10 с через `rtl_power` недосяжний:
-practical full-range baseline — 24–1766 МГц із cadence budget 60 с.
-Sweep-и та bounded incident history зберігаються persistent у SQLite, а logs і atomic health snapshot доповнюють observability.
-Конфігурація, діагностика та обмеження: [Continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).
+## CLI matrix
+
+| Command | Current meaning |
+| --- | --- |
+| `python -m rf_sentinel station` | canonical integrated runtime: acquisition + reports + Telegram |
+| `python -m rf_sentinel acquire` | standalone acquisition producer (`rtl_power` → SQLite), без report/Telegram |
+| `python -m rf_sentinel report-schedule` | standalone calendar report scheduler |
+| `python -m rf_sentinel survey` | legacy/compatibility one-shot survey workflow |
+| `python -m rf_sentinel schedule` | legacy/compatibility continuous survey workflow |
+| `python -m rf_sentinel` | identity-only behavior: друкує `RF Sentinel`, завершується з exit code `0` і не запускає hardware/network runtime |
+
+`acquire` і `report-schedule` не слід запускати паралельно з `station` для того самого SDR/data store.
+
+## Current acquisition
+
+Default acquisition profile: `24 MHz`–`1766 MHz`, `ACQUISITION_BIN_HZ=500000`, cadence budget `60 s`, recovery delay `60 s`. `250 kHz` не є current default. Worker виконує послідовні sweep-и; overlap і catch-up відсутні. Failed acquisition attempts persist у SQLite як rows з terminal status `failed`; missing intervals не створюють synthetic SQLite records. Missing intervals спостерігаються через report gaps, cadence/health counters і logs. Failed persisted rows можуть відображатися renderer-ом gray/hatch; renderer не створює synthetic missing rows.
+
+Acquisition не генерує reports і не виконує Telegram delivery у своєму path. Report generation/delivery не завершує acquisition. Деталі: [continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).
+
+## Reporting, Telegram і deployment
+
+Scheduler формує completed hourly reports на початку наступної години та daily reports о 00:00 у configured timezone (default `Europe/Kyiv`). Report windows half-open; failed rows присутні в timeline та outcome counts. Деталі storage/report semantics і Telegram authorization: [STATUS](docs/STATUS.md) та [DECISIONS](docs/DECISIONS.md).
+
+Практичний current-state runbook для CM4: [DEPLOYMENT](docs/DEPLOYMENT.md). Repository не містить повністю відтворюваного production `systemd` unit.
+
+## Документація
+
+- [Стан проєкту](docs/STATUS.md)
+- [Continuous acquisition](docs/CONTINUOUS_ACQUISITION.md)
+- [Legacy/local survey workflow](docs/LOCAL_SURVEY.md)
+- [Architecture decisions](docs/DECISIONS.md)
+- [Deployment runbook](docs/DEPLOYMENT.md)
+- [Requirements](docs/REQUIREMENTS.md) і [початкова архітектура](docs/ARCHITECTURE.md) — контекст та roadmap, не заміна committed implementation.

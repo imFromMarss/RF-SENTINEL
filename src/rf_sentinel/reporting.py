@@ -1,13 +1,105 @@
 """Українські звіти та інженерна карта спектра, незалежні від транспорту."""
 
 import json
-from dataclasses import asdict, dataclass
+import os
+import heapq
+import math
+from array import array
+from collections.abc import Sequence
+from tempfile import TemporaryFile
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from rf_sentinel.storage import SQLiteSweepReader
 from rf_sentinel.spectrum import ScanProfile, ScanResult
+
+_SORT_RUN_VALUES = 65536
+_MERGE_FAN_IN = 32
+
+
+class _PayloadFile:
+    """Private snapshot, unlinked/closed when its last numeric view is released."""
+
+    def __init__(self, file=None):
+        self.file = TemporaryFile() if file is None else file
+
+    def append(self, values):
+        offset = self.file.tell()
+        packed = array("d", values)
+        self.file.write(packed.tobytes())
+        self.file.flush()
+        return _DiskValues(self, offset, len(packed)) if packed else ()
+
+
+class _DiskValues(Sequence):
+    """Read-only float64 sequence; reads do not change the shared file position."""
+
+    def __init__(self, owner, offset, count):
+        self.owner, self.offset, self.count = owner, offset, count
+
+    def __len__(self):
+        return self.count
+
+    def __iter__(self):
+        for start in range(0, self.count, 4096):
+            count = min(4096, self.count - start)
+            blob = os.pread(self.owner.file.fileno(), count * 8, self.offset + start * 8)
+            if len(blob) != count * 8:
+                raise OSError("Truncated report payload snapshot")
+            values = array("d")
+            values.frombytes(blob)
+            yield from values
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(self.count)))
+        if index < 0:
+            index += self.count
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        values = array("d")
+        values.frombytes(os.pread(self.owner.file.fileno(), 8, self.offset + index * 8))
+        return values[0]
+
+    def __eq__(self, other):
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        return len(self) == len(other) and all(a == b for a, b in zip(self, other))
+
+
+def _json_value(value):
+    """Explicit materialization only for callers of the legacy to_dict API."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if is_dataclass(value):
+        return {field.name: _json_value(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, (Sequence, array)) and not isinstance(value, str):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _write_json(stream, value):
+    """Stream dataclasses and numeric sequences without constructing a JSON tree."""
+    if is_dataclass(value):
+        stream.write("{")
+        for index, field in enumerate(fields(value)):
+            if index:
+                stream.write(",")
+            stream.write(json.dumps(field.name) + ":")
+            _write_json(stream, getattr(value, field.name))
+        stream.write("}")
+    elif isinstance(value, (Sequence, array)) and not isinstance(value, str):
+        stream.write("[")
+        for index, item in enumerate(value):
+            if index:
+                stream.write(",")
+            _write_json(stream, item)
+        stream.write("]")
+    else:
+        stream.write(json.dumps(value.isoformat() if isinstance(value, datetime) else value,
+                                ensure_ascii=False))
 
 
 @dataclass(frozen=True)
@@ -34,8 +126,8 @@ class ReportSweep:
     finished_at: datetime
     outcome: str
     coverage: float
-    frequencies_hz: tuple[float, ...] = ()
-    powers: tuple[float, ...] = ()
+    frequencies_hz: Sequence[float] = ()
+    powers: Sequence[float] = ()
     frequency_start_hz: float | None = None
     frequency_stop_hz: float | None = None
     bin_width_hz: float | None = None
@@ -50,6 +142,11 @@ class ReportData:
     known.  ``gaps`` includes the window edges and every positive interval
     between sweep finish and the next sweep start; failed sweeps remain in the
     ordered timeline and in all outcome counts.
+
+    Engine-built/restored reports keep numeric payloads in an owned temporary
+    snapshot, independent of the source database. Only sweep/gap metadata stays
+    resident. Sequence indexing and iteration remain supported. ``to_dict`` is
+    the explicit, potentially large compatibility API; package writing streams.
     """
 
     window_start: datetime
@@ -67,17 +164,8 @@ class ReportData:
     gaps: tuple[ReportGap, ...]
 
     def to_dict(self) -> dict:
-        """Return a JSON-compatible mapping with stable English keys."""
-        value = asdict(self)
-        value["window_start"] = self.window_start.isoformat()
-        value["window_end"] = self.window_end.isoformat()
-        for gap in value["gaps"]:
-            gap["start"] = gap["start"].isoformat()
-            gap["end"] = gap["end"].isoformat()
-        for sweep in value["sweeps"]:
-            sweep["started_at"] = sweep["started_at"].isoformat()
-            sweep["finished_at"] = sweep["finished_at"].isoformat()
-        return value
+        """Materialize a JSON-compatible mapping; package generation streams instead."""
+        return _json_value(self)
 
     @classmethod
     def from_dict(cls, value: dict) -> "ReportData":
@@ -90,12 +178,13 @@ class ReportData:
             if payload["frequency_range_hz"] is not None else None
         )
         payload["time_ordering"] = tuple(payload["time_ordering"])
+        snapshot = _PayloadFile()
         payload["sweeps"] = tuple(
             ReportSweep(
                 item["sweep_id"], datetime.fromisoformat(item["started_at"]),
                 datetime.fromisoformat(item["finished_at"]), item["outcome"],
-                item["coverage"], tuple(item.get("frequencies_hz", ())),
-                tuple(item.get("powers", ())), item.get("frequency_start_hz"),
+                item["coverage"], snapshot.append(item.get("frequencies_hz", ())),
+                snapshot.append(item.get("powers", ())), item.get("frequency_start_hz"),
                 item.get("frequency_stop_hz"), item.get("bin_width_hz"),
             ) for item in payload["sweeps"]
         )
@@ -201,38 +290,41 @@ class SQLiteReportEngine:
             raise ValueError("report window timestamps must be timezone-aware")
         if end <= start:
             raise ValueError("report window must be non-empty")
+        snapshot = _PayloadFile()
         reader = SQLiteSweepReader(self.path)
+        ordered = []
+        counts = {outcome: 0 for outcome in ("success", "partial", "failed")}
+        expected = observed = 0
+        ranges = []
+        peak_frequency = peak_power = None
+        gaps = []
         try:
-            sweeps = reader.query_sweeps(start, end)
+            for item in reader.iter_sweeps(start, end):
+                counts[item.outcome] += 1
+                expected += item.coverage.expected_bins
+                observed += item.coverage.observed_bins
+                if item.outcome != "failed":
+                    payload = ReportSweep(
+                        item.sweep_id, item.started_at, item.finished_at, item.outcome,
+                        item.coverage.fraction, snapshot.append(item.frequencies_hz),
+                        snapshot.append(item.powers), item.start_hz, item.stop_hz,
+                        item.bin_width_hz)
+                    ranges.append((item.start_hz, item.stop_hz))
+                    for frequency, power in zip(item.frequencies_hz, item.powers):
+                        if peak_power is None or power > peak_power:
+                            peak_frequency, peak_power = frequency, power
+                else:
+                    payload = ReportSweep(
+                        item.sweep_id, item.started_at, item.finished_at, item.outcome,
+                        item.coverage.fraction)
+                ordered.append(payload)
         finally:
             reader.close()
-        ordered = tuple(sorted(sweeps, key=lambda item: (item.started_at, item.sweep_id)))
-        counts = {outcome: sum(item.outcome == outcome for item in ordered)
-                  for outcome in ("success", "partial", "failed")}
-        expected = sum(item.coverage.expected_bins for item in ordered)
-        observed = sum(item.coverage.observed_bins for item in ordered)
+        ordered = tuple(ordered)
+        payloads = ordered
         coverage = observed / expected if expected else 0.0
-        payloads = tuple(
-            ReportSweep(item.sweep_id, item.started_at, item.finished_at, item.outcome,
-                        item.coverage.fraction,
-                        item.frequencies_hz if item.outcome != "failed" else (),
-                        item.powers if item.outcome != "failed" else (),
-                        item.start_hz if item.outcome != "failed" else None,
-                        item.stop_hz if item.outcome != "failed" else None,
-                        item.bin_width_hz if item.outcome != "failed" else None)
-            for item in ordered
-        )
-        measurements = [
-            (frequency, power)
-            for item in payloads
-            for frequency, power in zip(item.frequencies_hz, item.powers)
-        ]
-        peak_frequency, peak_power = (max(measurements, key=lambda value: value[1])
-                                      if measurements else (None, None))
-        ranges = [(item.start_hz, item.stop_hz) for item in ordered if item.outcome != "failed"]
         frequency_range = ((min(value[0] for value in ranges), max(value[1] for value in ranges))
                            if ranges else None)
-        gaps = []
         if not ordered:
             gaps.append(ReportGap(start, end, "window"))
         else:
@@ -265,19 +357,68 @@ def _report_limits(report: ReportData) -> tuple[float, float]:
 
 
 def _report_color_limits(report: ReportData) -> tuple[float, float]:
+    """Exact linear P2/P98 using sorted disk runs and bounded merge buffers."""
     import numpy as np
 
-    values = np.asarray(
-        [power for sweep in report.sweeps for power in sweep.powers], dtype=float,
-    )
-    return color_limits(values) if values.size else (-1.0, 1.0)
+    from itertools import islice
+
+    source = (power for sweep in report.sweeps for power in sweep.powers)
+    with TemporaryFile() as scratch:
+        owner = _PayloadFile(scratch)
+        runs = []
+        total = 0
+        while True:
+            chunk = np.fromiter(islice(source, _SORT_RUN_VALUES), dtype=float)
+            if not chunk.size:
+                break
+            if not np.isfinite(chunk).all():
+                raise ValueError("Карта спектра потребує скінченних вимірювань")
+            chunk.sort()
+            offset = scratch.tell()
+            scratch.write(chunk.tobytes())
+            runs.append(_DiskValues(owner, offset, len(chunk)))
+            total += len(chunk)
+        if not total:
+            return -1.0, 1.0
+        scratch.flush()
+        # Bound merge fan-in (and its 4096-value read buffers), even for long
+        # windows. Intermediate runs stay on the same private scratch file.
+        while len(runs) > _MERGE_FAN_IN:
+            merged_runs = []
+            for start in range(0, len(runs), _MERGE_FAN_IN):
+                group = runs[start:start + _MERGE_FAN_IN]
+                offset = scratch.tell()
+                merged = heapq.merge(*(iter(run) for run in group))
+                while True:
+                    block = array("d", islice(merged, 65536))
+                    if not block:
+                        break
+                    scratch.write(block.tobytes())
+                scratch.flush()
+                merged_runs.append(_DiskValues(owner, offset, sum(map(len, group))))
+            runs = merged_runs
+        ranks = [(total - 1) * q for q in (0.02, 0.98)]
+        wanted = {int(math.floor(r)) for r in ranks} | {int(math.ceil(r)) for r in ranks}
+        selected = {}
+        last_rank = max(wanted)
+        for index, value in enumerate(heapq.merge(*(iter(run) for run in runs))):
+            if index in wanted:
+                selected[index] = value
+            if index == last_rank:
+                break
+        low, high = (selected[math.floor(r)] + (r % 1) *
+                     (selected[math.ceil(r)] - selected[math.floor(r)]) for r in ranks)
+        if high - low < 1.0:
+            midpoint = (low + high) / 2
+            low, high = midpoint - 0.5, midpoint + 0.5
+        return float(low), float(high)
 
 
-def _frequency_edges(frequencies: tuple[float, ...], low: float, high: float,
+def _frequency_edges(frequencies: Sequence[float], low: float, high: float,
                      bin_width_hz: float | None):
     import numpy as np
 
-    centers = np.asarray(frequencies, dtype=float)
+    centers = np.fromiter(frequencies, dtype=float, count=len(frequencies))
     if centers.size == 0 or not np.isfinite(centers).all() or not (np.diff(centers) > 0).all():
         raise ValueError("ReportData has invalid frequency bins")
     if centers.size == 1:
@@ -292,29 +433,51 @@ def _frequency_edges(frequencies: tuple[float, ...], low: float, high: float,
 
 
 def _report_meshes(axes, report: ReportData, *, cmap, norm, failed_color: str):
-    """Draw only persisted bins; absent rows remain the axes background."""
+    """Retain one lightweight artist; create/draw/release one sweep at a time."""
     import numpy as np
+    from matplotlib.artist import Artist
     from matplotlib.patches import Rectangle
 
     low, high = _report_limits(report)
-    for sweep in report.sweeps:
-        y_start = sweep.started_at.timestamp() / 86400
-        y_end = sweep.finished_at.timestamp() / 86400
-        if sweep.powers:
-            if len(sweep.frequencies_hz) != len(sweep.powers):
-                raise ValueError("ReportData frequency/power payload lengths differ")
-            edges = _frequency_edges(sweep.frequencies_hz, low, high,
-                                     sweep.bin_width_hz) / 1e6
-            axes.pcolormesh(
-                edges, [y_start, y_end], np.asarray([sweep.powers], dtype=float),
-                shading="flat", antialiased=False, rasterized=True, cmap=cmap, norm=norm,
-            )
-        elif sweep.outcome == "failed":
-            axes.add_patch(Rectangle(
-                (low / 1e6, y_start), (high - low) / 1e6, y_end - y_start,
-                facecolor=failed_color, edgecolor=failed_color, hatch="///", linewidth=0,
-                alpha=0.38, zorder=3,
-            ))
+
+    class SweepArtist(Artist):
+        def __init__(self, failed):
+            super().__init__()
+            self.failed = failed
+            self.set_zorder(3 if failed else 1)
+
+        def draw(self, renderer):
+            for sweep in report.sweeps:
+                y_start = sweep.started_at.timestamp() / 86400
+                y_end = sweep.finished_at.timestamp() / 86400
+                if self.failed:
+                    if sweep.powers or sweep.outcome != "failed":
+                        continue
+                    artist = Rectangle(
+                        (low / 1e6, y_start), (high - low) / 1e6, y_end - y_start,
+                        facecolor=failed_color, edgecolor=failed_color, hatch="///",
+                        linewidth=0, alpha=0.38, zorder=3)
+                    axes.add_patch(artist)
+                else:
+                    if not sweep.powers:
+                        continue
+                    if len(sweep.frequencies_hz) != len(sweep.powers):
+                        raise ValueError("ReportData frequency/power payload lengths differ")
+                    edges = _frequency_edges(sweep.frequencies_hz, low, high,
+                                             sweep.bin_width_hz) / 1e6
+                    powers = np.fromiter(sweep.powers, dtype=float, count=len(sweep.powers))
+                    artist = axes.pcolormesh(
+                        edges, [y_start, y_end], powers[None, :], shading="flat",
+                        antialiased=False, rasterized=True, cmap=cmap, norm=norm)
+                try:
+                    artist.draw(renderer)
+                finally:
+                    artist.remove()
+                    del artist
+            self.stale = False
+
+    axes.add_artist(SweepArtist(False))
+    axes.add_artist(SweepArtist(True))
 
 
 def _format_report_axes(figure, axes, report: ReportData, timezone: str, title: str,
@@ -356,8 +519,10 @@ def _render_report_png(report: ReportData, destination: Path, timezone: str, *,
     _report_meshes(axes, report, cmap=palette, norm=Normalize(low, high),
                    failed_color=failed_color)
     _format_report_axes(figure, axes, report, timezone, title, mesh, top_x=top_x)
-    figure.savefig(destination, format="png", dpi=150, facecolor=figure_facecolor)
-    figure.clear()
+    try:
+        figure.savefig(destination, format="png", dpi=150, facecolor=figure_facecolor)
+    finally:
+        figure.clear()
 
 
 def render_report_heatmap(report: ReportData, destination: str | Path,
@@ -414,8 +579,9 @@ def generate_report_package(report: ReportData, destination: str | Path,
     report_txt = directory / "report.txt"
     waterfall = directory / "waterfall.png"
     heatmap = directory / "heatmap.png"
-    report_json.write_text(json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n",
-                           encoding="utf-8")
+    with report_json.open("w", encoding="utf-8") as stream:
+        _write_json(stream, report)
+        stream.write("\n")
     report_txt.write_text(report.to_text(timezone) + "\n", encoding="utf-8")
     render_report_images(report, waterfall, heatmap, timezone)
     return ReportPackage(directory, report_json, report_txt, waterfall, heatmap,

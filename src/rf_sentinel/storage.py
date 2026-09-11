@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 import struct
+from collections.abc import Iterator
 from typing import Iterable
 from uuid import uuid4
 
@@ -39,14 +40,21 @@ def _pack(values: Iterable[float]) -> bytes:
     return struct.pack(f"<{len(values)}d", *values) if values else b""
 
 
-def _unpack(blob: bytes | None, count: int, field: str) -> tuple[float, ...]:
+def _unpack(blob: bytes | None, count: int, field: str, *, compact: bool = False):
     if blob is None:
         if count == 0:
             return ()
         raise ValueError(f"missing {field} payload")
     if len(blob) != count * _FLOAT64.size:
         raise ValueError(f"invalid {field} payload length")
-    return struct.unpack(f"<{count}d", blob) if count else ()
+    if not count:
+        return ()
+    if compact:
+        from array import array
+        values = array("d")
+        values.frombytes(blob)
+        return values
+    return struct.unpack(f"<{count}d", blob)
 
 
 def _timestamp(value: datetime) -> int:
@@ -266,7 +274,7 @@ class SQLiteMeasurementSink(MeasurementSink):
             rows = self._db.execute(
                 "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
                 "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
-                "ORDER BY started_at_us, sweep_id", (start_us, end_us)).fetchall()
+                "ORDER BY started_at_us, sweep_id", (start_us, end_us))
             return [self._decode(row) for row in rows]
         except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
             raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
@@ -304,11 +312,24 @@ class SQLiteSweepReader:
     def query_sweeps(self, start: datetime, end: datetime) -> list[SpectrumSweep]:
         try:
             start_us, end_us = _timestamp(start), _timestamp(end)
-            rows = self._db.execute(
+            cursor = self._db.execute(
                 "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
                 "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
-                "ORDER BY started_at_us, sweep_id", (start_us, end_us)).fetchall()
-            return [_decode_sweep_row(row) for row in rows]
+                "ORDER BY started_at_us, sweep_id", (start_us, end_us))
+            return [_decode_sweep_row(row) for row in cursor]
+        except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
+            raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
+
+    def iter_sweeps(self, start: datetime, end: datetime) -> Iterator[SpectrumSweep]:
+        """Yield report rows one at a time, keeping SQLite and decoded rows bounded."""
+        try:
+            start_us, end_us = _timestamp(start), _timestamp(end)
+            cursor = self._db.execute(
+                "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
+                "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
+                "ORDER BY started_at_us, sweep_id", (start_us, end_us))
+            while (row := cursor.fetchone()) is not None:
+                yield _decode_sweep_row(row, compact=True)
         except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
             raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
 
@@ -319,10 +340,10 @@ class SQLiteSweepReader:
             raise MeasurementPersistenceError("Could not close SQLite measurement store") from error
 
 
-def _decode_sweep_row(row) -> SpectrumSweep:
+def _decode_sweep_row(row, *, compact: bool = False) -> SpectrumSweep:
     data = json.loads(row[0])
-    frequencies = _unpack(row[2], row[1], "frequency")
-    powers = _unpack(row[4], row[3], "power")
+    frequencies = _unpack(row[2], row[1], "frequency", compact=compact)
+    powers = _unpack(row[4], row[3], "power", compact=compact)
 
     def profile(value):
         return None if value is None else SweepProfileMetadata(**value)

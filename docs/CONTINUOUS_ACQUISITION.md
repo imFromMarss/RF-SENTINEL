@@ -1,191 +1,65 @@
 # Continuous acquisition
 
-Canonical deployment entrypoint Stage 6A–6C — `python -m rf_sentinel station`.
-Він запускає один RF Sentinel process із internal continuous acquisition, async SQLite
-persistence, report scheduler, Telegram inbound/outbound і supervised `rtl_power`
-child processes. `station` утримує process-wide exclusive lock у
-`DATA_DIR/station.lock`; другий instance fail-fast і не запускає компоненти.
+## Stable boundary
 
-`python -m rf_sentinel acquire` залишається standalone/diagnostic режимом для producer-а;
-`python -m rf_sentinel report-schedule` — standalone/diagnostic режимом для scheduler-а.
-Вони не є цільовою production deployment topology.
+Canonical start:
 
-Runtime acquisition boundary: `RTLPowerScanner.acquire` →
-`SpectrumAcquisitionWorker` → `MeasurementSink.store_sweep`.
-Acquisition не імпортує Telegram або reporting, не будує PNG і не чекає звітів.
-`survey` та `schedule` залишаються попередніми workflows; нова цільова точка входу —
-`python -m rf_sentinel station`. Не запускайте standalone режими одночасно з station для
-одного SDR.
+```sh
+python -m rf_sentinel station
+```
 
-`SpectrumSweep` — canonical durable record одного acquisition attempt. Він має
-`schema_version`, `sweep_id`, `sequence`, timestamps, optional `correlation_id`,
-requested/actual profile, device identity, backend/tool version, coverage/quality
-та terminal `status`: `success`, `partial` або `failed`. `error_classification`
-зберігає стабільну категорію/код, а не raw exception text.
+Flow: `RTLPowerScanner.acquire` → `SpectrumAcquisitionWorker` → bounded `AsyncMeasurementSink` → `SQLiteMeasurementSink`. `station` також запускає незалежний report scheduler і Telegram polling threads. Acquisition path не імпортує report generation як частину sweep processing, не будує PNG і не чекає delivery.
 
-`success` вимагає повний spectrum payload, complete coverage і valid quality.
-`partial` зберігає record із degraded quality та partial coverage; payload може
-бути неповним. `failed` є durable attempt metadata contract навіть без payload:
-coverage=`none`, quality=`unavailable` і обов’язкова error classification. Це
-відрізняє відсутність покриття від тихого спектра. `schema_version` — explicit
-compatibility boundary (`spectrum-sweep.v1`); storage engine не є частиною цього
-контракту. CSV залишається форматом адаптера `rtl_power`, а не domain contract.
+| Variable | Default |
+| --- | ---: |
+| `RF_SENTINEL_ACQUISITION_START_HZ` | `24000000` |
+| `RF_SENTINEL_ACQUISITION_STOP_HZ` | `1766000000` |
+| `RF_SENTINEL_ACQUISITION_BIN_HZ` | `500000` |
+| `RF_SENTINEL_ACQUISITION_CADENCE_BUDGET_SECONDS` | `60` |
+| `RF_SENTINEL_ACQUISITION_RECOVERY_SECONDS` | `60` |
+| `RF_SENTINEL_RTL_DEVICE_INDEX` | `0` |
 
-## Прийом і cadence
+`250 kHz` не є current default. Cadence budget — operational budget між початками проходів, а не гарантія фактичної тривалості sweep. Якщо sweep довший за budget, наступний старт відбувається після його завершення; overlap/catch-up немає.
 
-Backend запускає RX-only `rtl_power -f START:STOP:BIN -i 1 -1 -d INDEX -`.
-Не застосовуються direct sampling, offset tuning, bias-T або experimental options.
-Одноразовий процес передає лише один завершений CSV frame; parser відхиляє
-неузгоджені комірки, неповне покриття, NaN та декілька frames.
-`-i 1` задає мінімальний інтервал накопичення, а не обіцянку проходу за секунду.
-За [реалізацією Osmocom](https://github.com/osmocom/rtl-sdr/blob/master/src/rtl_power.c)
-single-shot завершується після циклу сканування й виведення frame.
+## Durable sweep semantics
 
-`ACQUISITION_CADENCE_BUDGET_SECONDS` — configured operational budget між початками
-проходів; default 60 секунд для full-range baseline. Це не прогноз фактичної тривалості
-sweep: worker враховує весь цикл. Якщо sweep триває довше budget, наступний прохід
-починається відразу після нього.
-Overlap та catch-up відсутні. `flock` на локальному lock-файлі для device index
-також виключає другий scanner RF Sentinel; сторонні SDR-програми цим lock не керуються.
-Пристрій відкривається заново для кожного проходу; цей overhead входить у benchmark.
-Safety timeout одноразового subprocess — 90 секунд, CSV ≤64 MiB, stderr ≤1 MiB.
+Кожна спроба має `SpectrumSweep` з profile, actual/requested geometry, device/tool provenance, timestamps, coverage, quality та terminal status:
 
-Runtime sink має швидко приймати frame без rendering/reporting. Production `acquire`
-використовує persistent `SQLiteMeasurementSink` у `runtime/sweeps.sqlite3`: один
-SQLite row на sweep, payload і metadata з reopen support. `SQLiteReportEngine` читає
-це сховище окремо, тому generation reports не зупиняє acquisition.
-`AsyncMeasurementSink` має
-bounded in-process queue і один non-daemon writer: acquisition чекає лише bounded
-`enqueue_timeout`, а не latency storage. Результат hand-off має чотири стани:
-`accepted` означає ownership queue (не durability), `persisted` — downstream підтвердив
-запис, `rejected` — queue/стан sink не прийняв frame, `failed` — downstream не зміг
-записати frame. Queue-full збільшує explicit rejection counter; writer failure є
-sticky і піднімається через `flush`/`close`, тому не стає тихою втратою.
+- `success` — повний payload і complete coverage;
+- `partial` — persisted attempt із degraded quality/partial coverage;
+- `failed` — persisted metadata без payload, `coverage.status=none`, `quality.status=unavailable` та `error_classification`.
 
-`flush` чекає завершення всіх accepted frames і помиляється, якщо будь-який не став
-`persisted`. `close` спочатку drains queue, закриває downstream і зупиняє writer;
-після hard crash queued-but-not-persisted frames не вважаються durable й можуть
-бути втрачені в межах bounded queue. Committed SQLite records залишаються authoritative;
-`LatestSweepSink` залишається lightweight RAM implementation для
-hardware-free tests, але не production storage.
+Failed acquisition attempts persist у SQLite як rows з outcome `failed`; parser failure і persistence failure також залишаються observable через health counters, incident history та logs. Missing intervals не створюють synthetic SQLite records: вони визначаються/спостерігаються через report gaps, cadence/health counters і logs. Committed SQLite rows є authoritative; bounded queue може втратити queued-but-not-persisted frames після hard crash.
 
-## Великий report і bounded memory
+## Recovery і shutdown
 
-24h reporting не повинен використовувати legacy materializing path для великих
-вікон. `SQLiteReportEngine` читає sweeps потоково, payload зберігає в тимчасовому
-snapshot, JSON записує потоково, а percentile та rendering обробляють дані
-bounded-способом. `ReportData.to_dict()` збережено як compatibility API, але він
-матеріалізує payload і не є preferred path для production report generation.
+Scan/parser failure переводить стан у `recovering` і планує повтор після configurable recovery delay (default `60 s`), без tight retry. Повторні failure alerts пригнічуються; recovery success observable. Ctrl+C/SIGINT і SIGTERM set stop event, переривають wait і active `rtl_power`, не дозволяють новий цикл. Child завершується bounded sequence `terminate` → до 2 s wait → `kill` → `reap`.
 
-Під час CM4 validation report успішно обробив 1392 sweeps із peak RSS близько
-90 MiB без OOM. Тривалість 24h report становила приблизно 12–13 хвилин, а peak
-temporary disk space — близько 714 MiB. Це прийнятний trade-off: acquisition
-продовжує власний 60-секундний cadence незалежно від report generation. Host
-повинен мати достатній disk headroom.
+У `station` acquisition thread має deadline join до 30 s, report thread — до 10 s; sink drain/close має timeout 10 s і SQLite connections закриваються окремо. Shutdown deterministic/bounded; перевищення deadline логуються.
 
-## Відмови та завершення
+## Storage/lifecycle boundary
 
-SDR/parse failure збільшує counters, записує безпечний reason/exit code та переводить
-стан у `recovering`. Повтор — через configurable delay (default 60 с), без tight retry.
-Перший успіх скидає consecutive counter і створює `recovery_success` event.
-Ctrl+C/SIGINT та SIGTERM переривають також recovery/cadence wait, забороняють новий
-прохід і завершують child: terminate → до 2 с очікування → kill → reap.
-Обидва сигнали повертають exit code 130; звичайне завершення — 0, відмова — 1.
-Обробники сигналів відновлюються, logging закривається.
+Після PR #10 межа така:
 
-## Конфігурація
+- acquisition має окремий writable `SQLiteMeasurementSink` connection;
+- report scheduler має окремий writable SQLite connection для incident/state-related persistence;
+- `SQLiteReportEngine` читає через окремий read-only SQLite connection (`mode=ro`, `PRAGMA query_only=ON`);
+- report generation не виконується в acquisition path;
+- report generation/delivery failure не повинен завершувати acquisition;
+- scheduler і acquisition мають окреме bounded shutdown lifecycle.
 
-Environment читає тільки `Settings`; `.env` автоматично не завантажується.
-Безпечний перелік змінних є в `.env.example`. Режим `acquire` ігнорує Telegram,
-report та legacy survey configuration, включно з некоректними credentials.
+`WAL`, busy timeout і async bounded queue допомагають співіснуванню writer/readers. Report engine stream-ить rows і тримає numeric payload у temporary snapshot; `to_dict()` — compatibility API, не preferred large-report path.
 
-| Змінна `RF_SENTINEL_…` | Default |
-|---|---:|
-| `ACQUISITION_START_HZ` | 24000000 |
-| `ACQUISITION_STOP_HZ` | 1766000000 |
-| `ACQUISITION_BIN_HZ` | 500000, application default |
-| `ACQUISITION_CADENCE_BUDGET_SECONDS` | 60 |
-| `ACQUISITION_RECOVERY_SECONDS` | 60 |
-| `DATA_DIR` | runtime |
-| `LOG_MAX_BYTES` | 5000000 |
-| `LOG_BACKUPS` | 3 |
+## Report semantics
 
-Також застосовуються `RTL_DEVICE_INDEX`, `RTL_GAIN`.
-Межі 24–1766 МГц підтверджені benchmark для під’єднаного RTL2838UHIDIR/R820T.
-Практичний current full-range baseline використовує 250 kHz requested bin і
-60-секундний cadence budget.
+Scheduler формує completed hourly window на початку кожної години та completed daily window о 00:00 у `TIMEZONE` (default `Europe/Kyiv`). Вікна half-open: sweep із `started_at >= start` і `started_at < end` належить report; empty window також є валідним report dataset.
+
+`coverage` — persisted-bin coverage: `sum(observed_bins) / sum(expected_bins)`, включно з failed sweeps, якщо для них відомий expected count. `gaps` явно містить window gap для порожнього dataset або `leading`, `between`, `trailing` intervals, де немає persisted sweep start/finish coverage. Failed sweep залишається ordered timeline row і входить у success/partial/failed counts, але має no payload; у `waterfall` та `heatmap` така row позначається окремим сірим hatch-патерном, а не нульовою потужністю. Positive gaps не вигадують RF measurements.
+
+`waterfall.png` і `heatmap.png` будуються з одного `ReportData` dataset; відмінність — renderer palette/layout. Report JSON/text і обидві PNG описують те саме report window та sweep ordering.
 
 ## Observability
 
-`runtime/logs/rf-sentinel.log` — JSON Lines з українськими повідомленнями,
-англійськими keys/events, часом, duration, bins, effective range, metadata,
-startup/configuration/backend, recovery та shutdown. Size rotation: 5 000 000 bytes,
-3 backups (приблизно 20 MB загалом). Журнал не містить raw power arrays, credentials,
-довільних текстів exception або external URLs. Scanner передає child тільки PATH,
-TZ та LC_ALL. Нові acquire events використовують явний whitelist контексту.
+`DATA_DIR/sweeps.sqlite3` містить persisted sweep rows та bounded incidents. `DATA_DIR/status/health.json` містить counters/status, timestamps і report/acquisition health. `DATA_DIR/logs/rf-sentinel.log` — rotated JSON Lines; secrets, Telegram URL і response body не логуються. Missing intervals представлені report gaps, а не rows. Renderer не створює synthetic missing rows; persisted failed rows можуть бути позначені gray/hatch і не маскуються порожнім «успішним» spectrum.
 
-`runtime/status/health.json` містить application status, started_at, timestamps
-останнього початку/успішного завершення, останню duration, total_sweeps (успішні плюс
-невдалі завершені спроби), failed_sweeps, consecutive_sweep_failures, backend,
-configured/actual range та bin width, cadence budget/recovery intervals, bin count і безпечну
-останню помилку. Перерваний сигналом прохід не рахується завершеним.
-`cadence_budget_seconds` — configured budget; `last_sweep_duration_seconds` — фактична
-тривалість останньої спроби; `last_sweep_cadence_seconds` — фактично виміряний
-інтервал між початками поточного та попереднього проходу.
-Поточну тривалість читач оцінює від `last_sweep_started_at`, коли status=`acquiring`.
-Оновлення: temporary file у тому самому каталозі → atomic replace; це захист від
-half-written JSON, а не гарантія durability після втрати живлення.
-
-Health, JSON-lines logs і bounded SQLite incident history (default 1000 records)
-утворюють поточний observability baseline. Runtime artifacts Git ignored.
-
-## Короткий benchmark і поточне обмеження
-
-Команда після hardware-free checks: `.venv/bin/python scripts/benchmark_acquisition.py`.
-Три послідовні candidates: 250, 500, 1000 кГц; жодних довгих continuous tests.
-Кожен subprocess має safety timeout. CSV, stderr і `results.json` залишаються в
-`runtime/benchmarks/<UTC>/`. Nonzero exit benchmark означає невдалі trials.
-
-2026-09-08/09 benchmark виконано на Raspberry Pi ARM64 з RTL2838UHIDIR/R820T та
-Ubuntu `rtl-sdr`/`librtlsdr2` 2.0.1. Усі проходи були послідовними; overlap і сторонніх
-SDR-процесів не було. Один початковий `PLL not locked` виникав у кожному запуску,
-після чого tuner працював у всьому requested range без повторних PLL warnings.
-
-| Range | Requested bin | Effective bin | Hops | Bins | Elapsed | CSV | Exit |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 24–1766 МГц | 250 кГц | 174.76 кГц | 623 | 9968 | >30.22 с | 108546 B | 124 |
-| 24–1766 МГц | 500 кГц | 349.52 кГц | 623 | 4984 | >40.21 с | 79045 B | 124 |
-| 24–1766 МГц | 1000 кГц | 699.04 кГц | 1742 | 1742 | >72.00 с | 0 B | 137 |
-
-250 і 500 кГц записали complete-range frame від 24 МГц до 1765.99958 МГц під час
-timeout shutdown, але subprocess не завершився природно. Тому elapsed — нижня межа,
-а не фактична стала cadence. 1000 кГц не завершив scan pass і не записав frame.
-Machine-readable результати та raw diagnostics: `runtime/benchmarks/20260908T191649Z/`.
-
-Target ≤10 с для одного full-range RTL-SDR через `rtl_power` недосяжний у перевіреній
-конфігурації. Bottleneck — послідовне перестроювання тюнера: 250/500 кГц потребують
-623 hops. Для 1000 кГц внутрішня евристика зменшує dongle bandwidth до 1 МГц і
-збільшує план до 1742 hops, тому грубіший requested bin тут повільніший.
-
-Практичний full-range компроміс — 250 кГц і operational cadence budget не менше
-60 с: він дає вдвічі більше bins за той самий hop count, що й 500 кГц. Це budget,
-підтриманий виміряними нижніми межами та попереднім 60-секундним режимом, але не
-новий вимір природного завершення. Поточний code default cadence budget — 60 с.
-Worker не створює overlap; фактичний cadence визначається тривалістю sweep та
-overhead sink/health і записується окремо від configured budget.
-
-Для cadence близько 10 с можна сканувати послідовні вікна приблизно 300–400 МГц;
-повне покриття тоді оновлюватиметься раз на 5–6 вікон. Persistent in-process
-`librtlsdr` backend прибере process startup, але не усуне сотні tuner retunes та
-instantaneous-bandwidth limit. Фундаментально менше hops потребує кількох RTL-SDR
-або ширшосмугового hardware backend, наприклад майбутнього HackRF.
-
-SSH використовувався лише для benchmark та validation; CM4/systemd boot lifecycle
-і unattended operation validated, без зміни runtime topology.
-У canonical `station` report scheduler і report handler працюють як internal downstream
-components: hourly report доставляється на початку кожної години, daily report — о 00:00
-у configured timezone (default `Europe/Kyiv`). Acquisition під час report generation не
-зупиняється. Scheduled Telegram delivery має at-least-once semantics: у вузькому crash
-window після успішного send і до durable ledger update можливий duplicate report. Inbound
-last-hour request також може повторитися після crash до Telegram acknowledgement. Exactly-once
-delivery не заявляється.
+`LatestSweepSink` — тільки lightweight test implementation, не production history.

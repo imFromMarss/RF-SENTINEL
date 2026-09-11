@@ -45,18 +45,6 @@ def _stop_telegram_polling(thread, stop: Event) -> None:
         thread.join(timeout=20)
 
 
-class _DisabledNotifier:
-    def send_package(self, package):
-        from rf_sentinel.telegram import DeliveryResult
-        return DeliveryResult("failed", {}, "telegram_disabled")
-
-    def send_message(self, text):
-        return None
-
-    def send_photo(self, path, caption=""):
-        return None
-
-
 class _StationProcessLock:
     """Own the station-wide Linux lock for the complete process lifecycle."""
 
@@ -118,13 +106,15 @@ def _run_station_lifecycle(settings: Settings) -> int:
                               settings.acquisition_cadence_budget_seconds,
                               settings.acquisition_recovery_seconds)
     health = HealthOwner(health_path, state)
-    storage = SQLiteMeasurementSink(settings.sweeps_path,
-                                    incident_retention=settings.incident_retention)
-    sink = AsyncMeasurementSink(storage, close_downstream=False,
+    acquisition_storage = SQLiteMeasurementSink(
+        settings.sweeps_path, incident_retention=settings.incident_retention)
+    report_storage = SQLiteMeasurementSink(
+        settings.sweeps_path, incident_retention=settings.incident_retention)
+    sink = AsyncMeasurementSink(acquisition_storage, close_downstream=False,
                                 thread_name="station-measurement-writer")
     observer = AcquisitionObserver(health_path, profile,
                                    settings.acquisition_cadence_budget_seconds,
-                                   settings.acquisition_recovery_seconds, storage=storage,
+                                   settings.acquisition_recovery_seconds, storage=acquisition_storage,
                                    health_owner=health)
     worker = SpectrumAcquisitionWorker(
         RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain, stop=stop), sink,
@@ -132,11 +122,11 @@ def _run_station_lifecycle(settings: Settings) -> int:
         settings.acquisition_recovery_seconds,
     )
     notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
-                if settings.telegram_enabled else _DisabledNotifier())
+                if settings.telegram_enabled else None)
     runner = ScheduledReportRunner(
         SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
         timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
-        storage=storage, health_path=health_path, state=state, health_owner=health,
+        storage=report_storage, health_path=health_path, state=state, health_owner=health,
     )
 
     def run_component(label, operation):
@@ -183,10 +173,15 @@ def _run_station_lifecycle(settings: Settings) -> int:
             logging.getLogger("rf_sentinel.application").exception(
                 "Station measurement sink close failed")
         try:
-            storage.close()
+            acquisition_storage.close()
         except BaseException:
             logging.getLogger("rf_sentinel.application").exception(
-                "Station SQLite close failed")
+                "Station acquisition SQLite close failed")
+        try:
+            report_storage.close()
+        except BaseException:
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station report SQLite close failed")
         for sig, handler in previous.items():
             signal.signal(sig, handler)
     return 0
@@ -213,12 +208,8 @@ def main(argv: list[str] | None = None) -> int:
 
             configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
             from rf_sentinel.storage import SQLiteMeasurementSink
-            notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id) \
-                if settings.telegram_enabled else None
-            if notifier is None:
-                logger = logging.getLogger("rf_sentinel.application")
-                logger.error("Report scheduler requires Telegram configuration")
-                return 1
+            notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+                        if settings.telegram_enabled else None)
             storage = SQLiteMeasurementSink(settings.sweeps_path,
                                             incident_retention=settings.incident_retention)
             runner = ScheduledReportRunner(
@@ -227,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
                 storage=storage,
             )
             stop = Event()
-            inbound_thread = _start_telegram_polling(settings, stop, notifier)
+            inbound_thread = (_start_telegram_polling(settings, stop, notifier)
+                              if settings.telegram_enabled else None)
             previous = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, _shutdown_signal)
             try:
@@ -310,7 +302,7 @@ def run_acquisition(settings: Settings) -> int:
             signal.signal(sig, _shutdown_signal)
         storage = SQLiteMeasurementSink(settings.sweeps_path,
                                         incident_retention=settings.incident_retention)
-        sink = AsyncMeasurementSink(storage)
+        sink = AsyncMeasurementSink(storage, close_downstream=False)
         observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
                                        settings.acquisition_cadence_budget_seconds,
                                        settings.acquisition_recovery_seconds, storage=storage)
@@ -324,6 +316,18 @@ def run_acquisition(settings: Settings) -> int:
         logging.getLogger(__name__).error("Помилка запису operational artifacts")
         return 1
     finally:
+        if sink is not None:
+            try:
+                sink.close(timeout=10)
+            except BaseException:
+                logging.getLogger(__name__).exception(
+                    "Acquisition measurement sink close failed")
+        if storage is not None:
+            try:
+                storage.close()
+            except BaseException:
+                logging.getLogger(__name__).exception(
+                    "Acquisition SQLite close failed")
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         logging.shutdown()

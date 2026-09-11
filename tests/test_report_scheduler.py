@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rf_sentinel.reporting import (ReportData, ReportGap,
+                                   generate_report_package as real_generate_report_package)
 from rf_sentinel.scheduler import ScheduledReportRunner
 from rf_sentinel.telegram import DeliveryResult
 
@@ -31,6 +33,59 @@ class Notifier:
     def send_package(self, package):
         self.packages.append(package)
         return DeliveryResult(self.status, {"report": 1, "waterfall": 2, "heatmap": 3})
+
+
+def _empty_report(start, end):
+    return ReportData(
+        start, end, 0, 0, 0, 0, 0.0, None, (), None, None, (),
+        (ReportGap(start, end, "window"),),
+    )
+
+
+def test_disabled_telegram_still_generates_and_persists_package(monkeypatch, tmp_path):
+    engine = Engine()
+    engine.build = lambda start, end: (engine.windows.append((start, end)) or
+                                        _empty_report(start, end))
+    generated = []
+
+    def generate(report, destination, timezone):
+        package = real_generate_report_package(report, destination, timezone)
+        generated.append(package)
+        return package
+
+    monkeypatch.setattr("rf_sentinel.scheduler.generate_report_package", generate)
+    runner = ScheduledReportRunner(engine, None, tmp_path, timezone="UTC")
+    now = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
+
+    assert runner.run_pending(now) == ("hourly",)
+    assert runner.run_pending(now) == ()
+    assert len(generated) == 1
+    assert all(path.exists() for path in generated[0].paths)
+    assert runner.state.total_completed_reports == 1
+    assert runner.state.total_failed_reports == 0
+
+
+def test_delivery_failure_leaves_generated_package_persisted(monkeypatch, tmp_path):
+    engine = Engine()
+    engine.build = lambda start, end: (engine.windows.append((start, end)) or
+                                        _empty_report(start, end))
+    generated = []
+
+    def generate(report, destination, timezone):
+        package = real_generate_report_package(report, destination, timezone)
+        generated.append(package)
+        return package
+
+    notifier = Notifier(status="failed")
+    monkeypatch.setattr("rf_sentinel.scheduler.generate_report_package", generate)
+    runner = ScheduledReportRunner(engine, notifier, tmp_path, timezone="UTC")
+    now = datetime(2026, 9, 9, 11, 0, tzinfo=UTC)
+
+    assert runner.run_pending(now) == ()
+    assert len(generated) == 1
+    assert all(path.exists() for path in generated[0].paths)
+    assert len(notifier.packages) == 1
+    assert runner.state.last_report_error_reason == "telegram_delivery"
 
 
 def test_hourly_boundary_and_duplicate_protection(monkeypatch, tmp_path):

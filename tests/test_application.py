@@ -1,6 +1,7 @@
 import subprocess
 import signal
 import sys
+from threading import Barrier, Thread
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -89,6 +90,30 @@ def test_scheduler_keyboard_interrupt_exit(monkeypatch):
     assert main(["schedule"]) == 130
 
 
+def test_report_scheduler_generates_without_telegram(monkeypatch, tmp_path):
+    monkeypatch.setenv("RF_SENTINEL_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("RF_SENTINEL_TELEGRAM_CHAT_ID", "")
+    monkeypatch.setenv("RF_SENTINEL_DATA_DIR", str(tmp_path))
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            captured["notifier"] = args[1]
+
+    def forbidden_notifier(*args, **kwargs):
+        raise AssertionError("Telegram notifier must not be initialized")
+
+    monkeypatch.setattr("rf_sentinel.scheduler.ScheduledReportRunner", FakeRunner)
+    monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler",
+                        lambda runner, stop: captured.update(runner=runner))
+    monkeypatch.setattr("rf_sentinel.telegram.TelegramNotifier", forbidden_notifier)
+    monkeypatch.setattr("rf_sentinel.application.configure_logging", lambda *args: None)
+
+    assert main(["report-schedule"]) == 0
+    assert captured["notifier"] is None
+    assert isinstance(captured["runner"], FakeRunner)
+
+
 def test_sigterm_requests_graceful_interrupt():
     with pytest.raises(KeyboardInterrupt):
         _shutdown_signal(signal.SIGTERM, None)
@@ -130,3 +155,52 @@ def test_acquisition_composes_async_sink_over_sqlite(monkeypatch, tmp_path):
         assert stored.fetch_sweep(sweep.sweep_id) == sweep
     finally:
         stored.close()
+
+
+def test_acquisition_and_report_incident_use_independent_sqlite_connections(tmp_path):
+    from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumSweep
+    from rf_sentinel.scheduler import ScheduledReportRunner
+    from rf_sentinel.storage import SQLiteMeasurementSink
+
+    now = datetime(2026, 9, 8, tzinfo=UTC)
+    sweep = SpectrumSweep(now, now + timedelta(seconds=1), 1, 24e6, 26e6,
+                          (24.5e6, 25.5e6), 1e6, (-40.0, -50.0), "test")
+    acquisition_storage = SQLiteMeasurementSink(tmp_path / "sweeps.sqlite3")
+    report_storage = SQLiteMeasurementSink(tmp_path / "sweeps.sqlite3")
+    acquisition_sink = AsyncMeasurementSink(acquisition_storage)
+    runner = ScheduledReportRunner(object(), None, tmp_path, storage=report_storage)
+    barrier = Barrier(2)
+    errors = []
+
+    def write_sweep():
+        try:
+            barrier.wait()
+            receipt = acquisition_sink.store_sweep(sweep)
+            acquisition_sink.flush(timeout=5)
+            assert receipt.status == "persisted"
+        except BaseException as error:
+            errors.append(error)
+
+    def write_incident():
+        try:
+            barrier.wait()
+            runner._incident("report_generation", "synthetic report failure", "retry_scheduled")
+        except BaseException as error:
+            errors.append(error)
+
+    acquisition_thread = Thread(target=write_sweep)
+    report_thread = Thread(target=write_incident)
+    acquisition_thread.start()
+    report_thread.start()
+    acquisition_thread.join(timeout=10)
+    report_thread.join(timeout=10)
+    try:
+        assert not acquisition_thread.is_alive()
+        assert not report_thread.is_alive()
+        assert errors == []
+        assert acquisition_storage.fetch_sweep(sweep.sweep_id) == sweep
+        assert len(report_storage.query_incidents()) == 1
+    finally:
+        acquisition_sink.close(timeout=5)
+        acquisition_storage.close()
+        report_storage.close()

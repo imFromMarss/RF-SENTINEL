@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import rf_sentinel.cw_frequency_accuracy as cw_frequency_accuracy
 from rf_sentinel.cw_characterization import build_point_command
 from rf_sentinel.cw_frequency_accuracy import (
     RTL_POWER_FFT_WINDOWS,
@@ -203,6 +204,125 @@ def test_resume_skips_completed_frequency_accuracy_point(tmp_path):
         args, scpi=FakeScpi(), runner=unexpected,
         preflight_runner=unexpected, sleeper=lambda _: None)
     assert len(records) == 1
+
+
+@pytest.mark.parametrize("corruption", [
+    "configuration",
+    "wrong_schema",
+    "missing_schema",
+    "missing_points",
+    "duplicate_stored",
+    "foreign_stored",
+    "logical_mismatch",
+    "duplicate_planned",
+])
+def test_corrupt_checkpoint_fails_before_side_effects(
+        tmp_path, monkeypatch, corruption):
+    args = _args(tmp_path)
+    run_frequency_accuracy(
+        args, scpi=FakeScpi(), runner=_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    checkpoint = tmp_path / "results.json"
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+    if corruption == "configuration":
+        args.gain = 1.0
+    elif corruption == "wrong_schema":
+        payload["schema_version"] = "rtl-sdr-cw-frequency-accuracy.v2"
+    elif corruption == "missing_schema":
+        payload.pop("schema_version")
+    elif corruption == "missing_points":
+        payload.pop("points")
+    elif corruption == "duplicate_stored":
+        payload["points"].append(dict(payload["points"][0]))
+    elif corruption == "foreign_stored":
+        payload["points"][0]["checkpoint_identity"] = (
+            expand_frequency_accuracy_matrix(
+                (501_000_000,), args.center_offsets_hz, args.repeats,
+                args.tuning_modes)[0].checkpoint_identity)
+    elif corruption == "logical_mismatch":
+        payload["points"][0]["requested_tuner_center_hz"] += 1
+    elif corruption == "duplicate_planned":
+        point = expand_frequency_accuracy_matrix(
+            args.frequencies_hz, args.center_offsets_hz, args.repeats,
+            args.tuning_modes)[0]
+        monkeypatch.setattr(
+            cw_frequency_accuracy, "expand_frequency_accuracy_matrix",
+            lambda *_: [point, point])
+
+    if corruption not in {"configuration", "duplicate_planned"}:
+        checkpoint.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    args.resume = True
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    calls = []
+
+    def unexpected(*unused_args, **unused_kwargs):
+        calls.append("side effect")
+        raise AssertionError("checkpoint validation did not fail early")
+
+    monkeypatch.setattr(cw_frequency_accuracy, "LibreVNAScpi", unexpected)
+    with pytest.raises(ValueError):
+        run_frequency_accuracy(
+            args, runner=unexpected, preflight_runner=unexpected,
+            sleeper=unexpected)
+
+    assert calls == []
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_valid_partial_resume_preserves_artifacts_and_runs_only_pending_point(tmp_path):
+    args = _args(tmp_path)
+    args.center_offsets_hz = (0, 250_000)
+    calls = 0
+
+    def interrupt_second(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _runner(command, **kwargs)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_frequency_accuracy(
+            args, scpi=FakeScpi(), runner=interrupt_second,
+            preflight_runner=_preflight, sleeper=lambda _: None,
+            clock=iter((1.0, 2.0, 3.0)).__next__)
+
+    plan = expand_frequency_accuracy_matrix(
+        args.frequencies_hz, args.center_offsets_hz, args.repeats,
+        args.tuning_modes)
+    completed_raw = tmp_path / "point-001-500MHz-c+0-r1-normal.csv"
+    completed_stderr = tmp_path / "point-001-500MHz-c+0-r1-normal.stderr.txt"
+    completed_contents = (completed_raw.read_bytes(), completed_stderr.read_bytes())
+    pending_raw = tmp_path / "point-002-500MHz-c+250000-r1-normal.csv"
+    pending_stderr = tmp_path / "point-002-500MHz-c+250000-r1-normal.stderr.txt"
+    pending_raw.write_text("stale raw", encoding="ascii")
+    pending_stderr.write_text("stale stderr", encoding="ascii")
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep", encoding="ascii")
+    resumed_calls = []
+
+    def resume_runner(command, **kwargs):
+        resumed_calls.append(command)
+        assert not pending_raw.exists()
+        assert completed_raw.exists()
+        assert completed_stderr.exists()
+        assert unrelated.read_text(encoding="ascii") == "keep"
+        return _runner(command, **kwargs)
+
+    args.resume = True
+    records = run_frequency_accuracy(
+        args, scpi=FakeScpi(), runner=resume_runner,
+        preflight_runner=_preflight, sleeper=lambda _: None,
+        clock=iter((4.0, 5.0)).__next__)
+
+    assert len(resumed_calls) == 1
+    assert [record.checkpoint_identity for record in records] == [
+        point.checkpoint_identity for point in plan]
+    assert (completed_raw.read_bytes(), completed_stderr.read_bytes()) == completed_contents
+    assert pending_raw.read_text(encoding="ascii") == _raw_csv()
+    assert pending_stderr.read_text(encoding="utf-8").startswith("FFT bin size")
+    assert unrelated.read_text(encoding="ascii") == "keep"
 
 
 def test_frequency_accuracy_exit_is_nonzero_for_unverified(monkeypatch, tmp_path):

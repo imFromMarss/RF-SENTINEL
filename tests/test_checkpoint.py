@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from rf_sentinel.checkpoint import atomic_write_json, canonical_point_identity
+from rf_sentinel.checkpoint import (
+    atomic_write_json,
+    canonical_point_identity,
+    validate_checkpoint_envelope,
+    validate_checkpoint_identities,
+)
 from rf_sentinel.cw_frequency_accuracy import FrequencyAccuracyPoint
 from rf_sentinel.cw_matrix import MatrixPoint
 
@@ -48,6 +53,52 @@ def test_invalid_identity_values_are_rejected(value) -> None:
 def test_non_string_identity_key_is_rejected() -> None:
     with pytest.raises(TypeError, match="keys must be strings"):
         canonical_point_identity({433_000_000: "normal"})
+
+
+def test_checkpoint_envelope_requires_exact_schema_configuration_and_points() -> None:
+    configuration = {"device": 0, "modes": ["normal"]}
+    payload = {
+        "schema_version": "example.v1",
+        "configuration": configuration,
+        "points": [{"checkpoint_identity": "one"}],
+    }
+
+    assert validate_checkpoint_envelope(
+        payload, expected_schema_version="example.v1",
+        expected_configuration=configuration) == payload["points"]
+
+    for corrupted in (
+        {**payload, "schema_version": "example.v2"},
+        {**payload, "configuration": {"device": False, "modes": ["normal"]}},
+        {key: value for key, value in payload.items() if key != "points"},
+    ):
+        with pytest.raises(ValueError):
+            validate_checkpoint_envelope(
+                corrupted, expected_schema_version="example.v1",
+                expected_configuration=configuration)
+
+
+def test_checkpoint_identity_validation_returns_exact_stored_set() -> None:
+    assert validate_checkpoint_identities(
+        planned_identities=("one", "two"),
+        stored_identities=("two",),
+        recomputed_identities=("two",),
+    ) == {"two"}
+
+
+@pytest.mark.parametrize("planned,stored,recomputed", [
+    (("one", "one"), (), ()),
+    (("one",), ("one", "one"), ("one", "one")),
+    (("one",), ("foreign",), ("foreign",)),
+    (("one", "two"), ("one",), ("two",)),
+])
+def test_checkpoint_identity_validation_rejects_invalid_sets(
+        planned, stored, recomputed) -> None:
+    with pytest.raises(ValueError):
+        validate_checkpoint_identities(
+            planned_identities=planned,
+            stored_identities=stored,
+            recomputed_identities=recomputed)
 
 
 def test_atomic_write_json_preserves_expected_json(tmp_path) -> None:

@@ -13,7 +13,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from rf_sentinel.cw_characterization import (
     DEFAULT_EXPECTED_FREQUENCY_TOLERANCE_HZ,
@@ -32,7 +32,15 @@ from rf_sentinel.cw_matrix import _run_preflight
 from rf_sentinel.capture import (
     _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text,
 )
-from rf_sentinel.checkpoint import atomic_write_json, canonical_point_identity
+from rf_sentinel.checkpoint import (
+    atomic_write_json,
+    canonical_point_identity,
+    validate_checkpoint_envelope,
+    validate_checkpoint_identities,
+)
+
+
+CHECKPOINT_SCHEMA_VERSION = "rtl-sdr-cw-frequency-accuracy.v1"
 
 
 DEFAULT_FREQUENCIES_HZ = (230_000_000, 500_000_000, 1_000_000_000, 1_500_000_000)
@@ -244,7 +252,7 @@ def _persist(output_dir: Path, configuration: dict,
         "unverified": sum(record.status == "unverified" for record in records),
     }
     payload = {
-        "schema_version": "rtl-sdr-cw-frequency-accuracy.v1",
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "created_at": created_at,
         "updated_at": datetime.now(UTC).isoformat(),
         "frequency_correction_applied": False,
@@ -293,15 +301,43 @@ def _persist(output_dir: Path, configuration: dict,
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines))
 
 
-def _load_resume(output_dir: Path, configuration: dict) -> tuple[str, dict | None, list[FrequencyAccuracyRecord]]:
+def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
+    return canonical_point_identity({
+        "center_offset_hz": record["center_offset_hz"],
+        "repeat": record["repeat"],
+        "requested_cw_frequency_hz": record["requested_cw_frequency_hz"],
+        "requested_tuner_center_hz": record["requested_tuner_center_hz"],
+        "tuning_mode": record["tuning_mode"],
+    })
+
+
+def _load_resume(
+        output_dir: Path, configuration: dict,
+        planned_identities: Sequence[str],
+) -> tuple[str, dict | None, list[FrequencyAccuracyRecord]]:
     path = output_dir / "results.json"
     if not path.exists():
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=(), recomputed_identities=())
         return datetime.now(UTC).isoformat(), None, []
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("configuration") != configuration:
-        raise ValueError("Resume configuration не збігається з existing dataset")
-    records = [FrequencyAccuracyRecord(**record) for record in payload.get("points", [])]
-    return payload["created_at"], payload.get("preflight"), records
+    point_payloads = validate_checkpoint_envelope(
+        payload, expected_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        expected_configuration=configuration)
+    try:
+        stored_identities = [record["checkpoint_identity"] for record in point_payloads]
+        recomputed_identities = [
+            _record_checkpoint_identity(record) for record in point_payloads]
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=stored_identities,
+            recomputed_identities=recomputed_identities)
+        records = [FrequencyAccuracyRecord(**record) for record in point_payloads]
+        created_at = payload["created_at"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("Invalid frequency-accuracy checkpoint record") from error
+    return created_at, payload.get("preflight"), records
 
 
 def run_frequency_accuracy(
@@ -321,7 +357,9 @@ def run_frequency_accuracy(
         raise ValueError(f"Frequency-accuracy matrix має містити 1–{MAX_POINTS} points")
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
-    created_at, preflight, records = _load_resume(output_dir, configuration)
+    planned_identities = [point.checkpoint_identity for point in plan]
+    created_at, preflight, records = _load_resume(
+        output_dir, configuration, planned_identities)
     completed_identities = {record.checkpoint_identity for record in records}
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]

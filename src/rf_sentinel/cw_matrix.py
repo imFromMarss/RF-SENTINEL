@@ -14,7 +14,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from rf_sentinel.cw_characterization import (
     DEFAULT_EXPECTED_FREQUENCY_TOLERANCE_HZ,
@@ -29,7 +29,15 @@ from rf_sentinel.cw_characterization import (
     generator_shutdown_command,
 )
 from rf_sentinel.capture import _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text
-from rf_sentinel.checkpoint import atomic_write_json, canonical_point_identity
+from rf_sentinel.checkpoint import (
+    atomic_write_json,
+    canonical_point_identity,
+    validate_checkpoint_envelope,
+    validate_checkpoint_identities,
+)
+
+
+CHECKPOINT_SCHEMA_VERSION = "rtl-sdr-cw-matrix.v1"
 
 
 @dataclass(frozen=True)
@@ -163,7 +171,7 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
         "failed": sum(record.status == "failed" for record in records),
     }
     payload = {
-        "schema_version": "rtl-sdr-cw-matrix.v1",
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "created_at": created_at,
         "updated_at": datetime.now(UTC).isoformat(),
         "correction_applied": False,
@@ -210,15 +218,44 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines) + "\n")
 
 
-def _load_resume(output_dir: Path, configuration: dict) -> tuple[str, dict | None, list[MatrixRecord]]:
+def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
+    gain = record["requested_gain_db"]
+    if not isinstance(gain, float):
+        raise TypeError("requested_gain_db must be a float")
+    return canonical_point_identity({
+        "requested_bin_hz": record["requested_bin_hz"],
+        "requested_frequency_hz": record["requested_frequency_hz"],
+        "requested_gain_db_hex": gain.hex(),
+    })
+
+
+def _load_resume(
+        output_dir: Path, configuration: dict,
+        planned_identities: Sequence[str],
+) -> tuple[str, dict | None, list[MatrixRecord]]:
     path = output_dir / "results.json"
     if not path.exists():
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=(), recomputed_identities=())
         return datetime.now(UTC).isoformat(), None, []
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("configuration") != configuration:
-        raise ValueError("Resume configuration не збігається з existing dataset")
-    records = [MatrixRecord(**record) for record in payload.get("points", [])]
-    return payload["created_at"], payload.get("preflight"), records
+    point_payloads = validate_checkpoint_envelope(
+        payload, expected_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        expected_configuration=configuration)
+    try:
+        stored_identities = [record["checkpoint_identity"] for record in point_payloads]
+        recomputed_identities = [
+            _record_checkpoint_identity(record) for record in point_payloads]
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=stored_identities,
+            recomputed_identities=recomputed_identities)
+        records = [MatrixRecord(**record) for record in point_payloads]
+        created_at = payload["created_at"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("Invalid matrix checkpoint record") from error
+    return created_at, payload.get("preflight"), records
 
 
 def _run_preflight(device: int, *, runner=subprocess.run) -> dict:
@@ -257,7 +294,9 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
         raise ValueError("Matrix обмежена 10000 points")
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
-    created_at, preflight, records = _load_resume(output_dir, configuration)
+    planned_identities = [point.checkpoint_identity for point in plan]
+    created_at, preflight, records = _load_resume(
+        output_dir, configuration, planned_identities)
     completed_identities = {record.checkpoint_identity for record in records}
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]

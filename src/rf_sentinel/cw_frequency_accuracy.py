@@ -9,12 +9,11 @@ from datetime import UTC, datetime
 import itertools
 import json
 import math
-import os
 from pathlib import Path
 import shlex
 import subprocess
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from rf_sentinel.cw_characterization import (
     DEFAULT_EXPECTED_FREQUENCY_TOLERANCE_HZ,
@@ -29,7 +28,19 @@ from rf_sentinel.cw_characterization import (
     generator_commands,
     generator_shutdown_command,
 )
-from rf_sentinel.cw_matrix import _diagnostics, _run_preflight
+from rf_sentinel.cw_matrix import _run_preflight
+from rf_sentinel.capture import (
+    _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text,
+)
+from rf_sentinel.checkpoint import (
+    atomic_write_json,
+    canonical_point_identity,
+    validate_checkpoint_envelope,
+    validate_checkpoint_identities,
+)
+
+
+CHECKPOINT_SCHEMA_VERSION = "rtl-sdr-cw-frequency-accuracy.v1"
 
 
 DEFAULT_FREQUENCIES_HZ = (230_000_000, 500_000_000, 1_000_000_000, 1_500_000_000)
@@ -62,13 +73,13 @@ class FrequencyAccuracyPoint:
 
     @property
     def checkpoint_identity(self) -> str:
-        return json.dumps({
+        return canonical_point_identity({
             "center_offset_hz": self.center_offset_hz,
             "repeat": self.repeat,
             "requested_cw_frequency_hz": self.requested_cw_frequency_hz,
             "requested_tuner_center_hz": self.requested_tuner_center_hz,
             "tuning_mode": self.tuning_mode,
-        }, sort_keys=True, separators=(",", ":"))
+        })
 
 
 @dataclass(frozen=True)
@@ -227,10 +238,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
-def _persist(output_dir: Path, configuration: dict,
-             plan: Sequence[FrequencyAccuracyPoint],
-             records: Sequence[FrequencyAccuracyRecord], *,
-             created_at: str, preflight: dict | None) -> None:
+def _write_derived_artifacts(
+        output_dir: Path, configuration: dict,
+        plan: Sequence[FrequencyAccuracyPoint],
+        records: Sequence[FrequencyAccuracyRecord], *,
+        preflight: dict | None) -> None:
+    """Rebuild only the artifacts derived from the canonical checkpoint data."""
     counts = {
         "planned": len(plan),
         "completed": len(records),
@@ -240,20 +253,6 @@ def _persist(output_dir: Path, configuration: dict,
         "unsupported": sum(record.status == "unsupported" for record in records),
         "unverified": sum(record.status == "unverified" for record in records),
     }
-    payload = {
-        "schema_version": "rtl-sdr-cw-frequency-accuracy.v1",
-        "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
-        "frequency_correction_applied": False,
-        "normalization_applied": False,
-        "configuration": configuration,
-        "preflight": preflight,
-        "counts": counts,
-        "points": [asdict(record) for record in records],
-    }
-    _atomic_write_text(output_dir / "results.json",
-                       json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
     fields = list(FrequencyAccuracyRecord.__annotations__)
     temporary = output_dir / "results.csv.tmp"
     with temporary.open("w", encoding="utf-8", newline="") as stream:
@@ -288,18 +287,75 @@ def _persist(output_dir: Path, configuration: dict,
             f"{record.requested_tuner_center_hz}; status={record.status}; "
             f"rc={record.return_code}"
         )
+    _ = preflight
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines))
 
 
-def _load_resume(output_dir: Path, configuration: dict) -> tuple[str, dict | None, list[FrequencyAccuracyRecord]]:
+def _persist(output_dir: Path, configuration: dict,
+             plan: Sequence[FrequencyAccuracyPoint],
+             records: Sequence[FrequencyAccuracyRecord], *,
+             created_at: str, preflight: dict | None) -> None:
+    counts = {
+        "planned": len(plan),
+        "completed": len(records),
+        "valid": sum(record.status == "valid" for record in records),
+        "invalid": sum(record.status == "invalid" for record in records),
+        "failed": sum(record.status == "failed" for record in records),
+        "unsupported": sum(record.status == "unsupported" for record in records),
+        "unverified": sum(record.status == "unverified" for record in records),
+    }
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "created_at": created_at,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "frequency_correction_applied": False,
+        "normalization_applied": False,
+        "configuration": configuration,
+        "preflight": preflight,
+        "counts": counts,
+        "points": [asdict(record) for record in records],
+    }
+    atomic_write_json(output_dir / "results.json", payload)
+    _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
+
+
+def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
+    return canonical_point_identity({
+        "center_offset_hz": record["center_offset_hz"],
+        "repeat": record["repeat"],
+        "requested_cw_frequency_hz": record["requested_cw_frequency_hz"],
+        "requested_tuner_center_hz": record["requested_tuner_center_hz"],
+        "tuning_mode": record["tuning_mode"],
+    })
+
+
+def _load_resume(
+        output_dir: Path, configuration: dict,
+        planned_identities: Sequence[str],
+) -> tuple[str, dict | None, list[FrequencyAccuracyRecord]]:
     path = output_dir / "results.json"
     if not path.exists():
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=(), recomputed_identities=())
         return datetime.now(UTC).isoformat(), None, []
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("configuration") != configuration:
-        raise ValueError("Resume configuration не збігається з existing dataset")
-    records = [FrequencyAccuracyRecord(**record) for record in payload.get("points", [])]
-    return payload["created_at"], payload.get("preflight"), records
+    point_payloads = validate_checkpoint_envelope(
+        payload, expected_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        expected_configuration=configuration)
+    try:
+        stored_identities = [record["checkpoint_identity"] for record in point_payloads]
+        recomputed_identities = [
+            _record_checkpoint_identity(record) for record in point_payloads]
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=stored_identities,
+            recomputed_identities=recomputed_identities)
+        records = [FrequencyAccuracyRecord(**record) for record in point_payloads]
+        created_at = payload["created_at"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("Invalid frequency-accuracy checkpoint record") from error
+    return created_at, payload.get("preflight"), records
 
 
 def run_frequency_accuracy(
@@ -319,11 +375,14 @@ def run_frequency_accuracy(
         raise ValueError(f"Frequency-accuracy matrix має містити 1–{MAX_POINTS} points")
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
-    created_at, preflight, records = _load_resume(output_dir, configuration)
+    planned_identities = [point.checkpoint_identity for point in plan]
+    created_at, preflight, records = _load_resume(
+        output_dir, configuration, planned_identities)
     completed_identities = {record.checkpoint_identity for record in records}
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]
     if not pending:
+        _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
         return records
 
     preflight = _run_preflight(args.device, runner=preflight_runner)
@@ -421,15 +480,9 @@ def run_frequency_accuracy(
                 for scpi_command in scpi_commands:
                     scpi.send(scpi_command)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False,
-                    )
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired) as error:
                 return_code = 124
                 failure_warning = f"{type(error).__name__}: {error}"
@@ -438,8 +491,7 @@ def run_frequency_accuracy(
                 failure_warning = f"{type(error).__name__}: {error}"
 
             try:
-                stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
-                               if stderr_path.exists() else "")
+                stderr_text = (read_stderr_text(stderr_path) if stderr_path.exists() else "")
             except OSError as error:
                 stderr_text = ""
                 return_code = 125
@@ -454,8 +506,8 @@ def run_frequency_accuracy(
             analysis = None
             non_cw_peaks: list[dict[str, float]] = []
             try:
-                capture_usable = (return_code == 0 and raw_csv_path.exists()
-                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = (return_code == 0
+                                  and raw_csv_within_limit(raw_csv_path, MAX_CSV_BYTES))
             except OSError as error:
                 capture_usable = False
                 return_code = 125

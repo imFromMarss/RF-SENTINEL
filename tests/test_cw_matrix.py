@@ -7,6 +7,7 @@ import tomllib
 
 import pytest
 
+import rf_sentinel.cw_matrix as cw_matrix
 from rf_sentinel.cw_matrix import _matrix_succeeded, build_parser, expand_matrix, run_matrix
 
 
@@ -157,6 +158,164 @@ def test_resume_skips_completed_points(tmp_path):
     records = run_matrix(args, scpi=FakeScpi(), runner=unexpected,
                          preflight_runner=unexpected, sleeper=lambda _: None)
     assert len(records) == 1
+
+
+@pytest.mark.parametrize("artifact", ["results.csv", "summary.md"])
+@pytest.mark.parametrize("replacement", [None, "stale/truncated"])
+def test_complete_resume_repairs_derived_artifact_without_side_effects(
+        tmp_path, artifact, replacement, monkeypatch):
+    args = _args(tmp_path)
+    scpi = FakeScpi()
+    records = run_matrix(
+        args, scpi=scpi, runner=_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    checkpoint = tmp_path / "results.json"
+    checkpoint_before = checkpoint.read_bytes()
+    raw = tmp_path / "point-001-50MHz-g10-b100000.csv"
+    stderr = tmp_path / "point-001-50MHz-g10-b100000.stderr.txt"
+    raw_before, stderr_before = raw.read_bytes(), stderr.read_bytes()
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep", encoding="ascii")
+
+    derived = tmp_path / artifact
+    expected_derived = derived.read_bytes()
+    if replacement is None:
+        derived.unlink()
+    else:
+        derived.write_text(replacement, encoding="utf-8")
+
+    args.resume = True
+
+    def unexpected(*unused_args, **unused_kwargs):
+        raise AssertionError("complete derived regeneration triggered RF side effect")
+
+    monkeypatch.setattr(cw_matrix, "LibreVNAScpi", unexpected)
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda *unused_args, **unused_kwargs: (
+            (_ for _ in ()).throw(
+                AssertionError("complete derived regeneration cleaned an artifact"))),
+    )
+    resumed = run_matrix(
+        args, scpi=None, runner=unexpected,
+        preflight_runner=unexpected, sleeper=unexpected)
+
+    assert resumed == records
+    assert checkpoint.read_bytes() == checkpoint_before
+    assert raw.read_bytes() == raw_before
+    assert stderr.read_bytes() == stderr_before
+    assert unrelated.read_text(encoding="ascii") == "keep"
+    assert derived.read_bytes() == expected_derived
+
+
+@pytest.mark.parametrize("corruption", [
+    "configuration",
+    "wrong_schema",
+    "missing_schema",
+    "missing_points",
+    "duplicate_stored",
+    "foreign_stored",
+    "logical_mismatch",
+    "duplicate_planned",
+])
+def test_corrupt_checkpoint_fails_before_side_effects(
+        tmp_path, monkeypatch, corruption):
+    args = _args(tmp_path)
+    run_matrix(
+        args, scpi=FakeScpi(), runner=_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    checkpoint = tmp_path / "results.json"
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+    if corruption == "configuration":
+        args.physical_configuration = "different-configuration"
+    elif corruption == "wrong_schema":
+        payload["schema_version"] = "rtl-sdr-cw-matrix.v2"
+    elif corruption == "missing_schema":
+        payload.pop("schema_version")
+    elif corruption == "missing_points":
+        payload.pop("points")
+    elif corruption == "duplicate_stored":
+        payload["points"].append(dict(payload["points"][0]))
+    elif corruption == "foreign_stored":
+        payload["points"][0]["checkpoint_identity"] = expand_matrix(
+            (51_000_000,), args.gains_db, args.bins_hz)[0].checkpoint_identity
+    elif corruption == "logical_mismatch":
+        payload["points"][0]["requested_frequency_hz"] += 1
+    elif corruption == "duplicate_planned":
+        point = expand_matrix(
+            args.frequencies_hz, args.gains_db, args.bins_hz)[0]
+        monkeypatch.setattr(cw_matrix, "expand_matrix", lambda *_: [point, point])
+
+    if corruption not in {"configuration", "duplicate_planned"}:
+        checkpoint.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    args.resume = True
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    calls = []
+
+    def unexpected(*unused_args, **unused_kwargs):
+        calls.append("side effect")
+        raise AssertionError("checkpoint validation did not fail early")
+
+    monkeypatch.setattr(cw_matrix, "LibreVNAScpi", unexpected)
+    with pytest.raises(ValueError):
+        run_matrix(args, runner=unexpected, preflight_runner=unexpected,
+                   sleeper=unexpected)
+
+    assert calls == []
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_valid_partial_resume_preserves_artifacts_and_runs_only_pending_point(tmp_path):
+    args = _args(tmp_path, frequencies=(50_000_000, 100_000_000))
+    calls = 0
+
+    def interrupt_second(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        return _runner(command, **kwargs)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_matrix(
+            args, scpi=FakeScpi(), runner=interrupt_second,
+            preflight_runner=_preflight, sleeper=lambda _: None,
+            clock=iter((1.0, 2.0, 3.0)).__next__)
+
+    plan = expand_matrix(args.frequencies_hz, args.gains_db, args.bins_hz)
+    completed_raw = tmp_path / "point-001-50MHz-g10-b100000.csv"
+    completed_stderr = tmp_path / "point-001-50MHz-g10-b100000.stderr.txt"
+    completed_contents = (completed_raw.read_bytes(), completed_stderr.read_bytes())
+    pending_raw = tmp_path / "point-002-100MHz-g10-b100000.csv"
+    pending_stderr = tmp_path / "point-002-100MHz-g10-b100000.stderr.txt"
+    pending_raw.write_text("stale raw", encoding="ascii")
+    pending_stderr.write_text("stale stderr", encoding="ascii")
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep", encoding="ascii")
+    resumed_calls = []
+
+    def resume_runner(command, **kwargs):
+        resumed_calls.append(command)
+        assert not pending_raw.exists()
+        assert completed_raw.exists()
+        assert completed_stderr.exists()
+        assert unrelated.read_text(encoding="ascii") == "keep"
+        return _runner(command, **kwargs)
+
+    args.resume = True
+    records = run_matrix(
+        args, scpi=FakeScpi(), runner=resume_runner,
+        preflight_runner=_preflight, sleeper=lambda _: None,
+        clock=iter((4.0, 5.0)).__next__)
+
+    assert len(resumed_calls) == 1
+    assert [record.checkpoint_identity for record in records] == [
+        point.checkpoint_identity for point in plan]
+    assert (completed_raw.read_bytes(), completed_stderr.read_bytes()) == completed_contents
+    assert pending_raw.read_text(encoding="ascii") == RAW_CSV
+    assert pending_stderr.read_text(encoding="utf-8") == STDERR
+    assert unrelated.read_text(encoding="ascii") == "keep"
 
 
 def test_interrupted_resume_does_not_skip_close_distinct_gain(tmp_path):

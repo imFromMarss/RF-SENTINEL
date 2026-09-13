@@ -6,14 +6,16 @@ import argparse
 import csv
 from datetime import UTC, datetime
 import json
-import math
-import os
 from pathlib import Path
 import shlex
 import subprocess
 import time
 from dataclasses import asdict, dataclass
 from typing import Sequence
+
+from rf_sentinel.capture import (
+    decode_rtl_power_row, invoke_rtl_power, raw_csv_within_limit,
+)
 
 
 DEFAULT_OUTPUT_DIR = Path(".local/characterization")
@@ -53,34 +55,13 @@ def _inspect_csv(path: Path) -> tuple[int, int, float | None, float | None]:
         for columns in csv.reader(stream, skipinitialspace=True):
             if not columns:
                 continue
-            if len(columns) < 7:
-                continue
-            try:
-                low, high, step = map(float, columns[2:5])
-                values = [float(value) for value in columns[6:]]
-                if not (math.isfinite(low) and math.isfinite(high) and math.isfinite(step)):
-                    continue
-                if not values or not all(math.isfinite(value) for value in values):
-                    continue
-                if low >= high or step <= 0:
-                    continue
-                expected_bins = round((high - low) / step)
-                if (expected_bins <= 0
-                        or abs(expected_bins * step - (high - low))
-                        > 2 + expected_bins * 0.0051):
-                    continue
-                # rtl_power повторює останній FFT value у кожному CSV row.
-                if (len(values) == expected_bins + 1
-                        and values[-1] == values[-2]):
-                    values = values[:-1]
-                if len(values) != expected_bins:
-                    continue
-            except (ValueError, TypeError):
+            decoded = decode_rtl_power_row(columns, require_positive_low=False)
+            if decoded is None:
                 continue
             rows += 1
-            bins += len(values)
-            starts.append(low)
-            stops.append(high)
+            bins += len(decoded.power_bins)
+            starts.append(decoded.low)
+            stops.append(decoded.high)
     return rows, bins, (min(starts) if starts else None), (max(stops) if stops else None)
 
 
@@ -121,17 +102,12 @@ def run_characterization(args: argparse.Namespace, *, runner=subprocess.run,
         started = clock()
         timestamp = now().isoformat()
         try:
-            with stderr_path.open("wb") as diagnostics:
-                completed = runner(
-                    command, shell=False, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL, stderr=diagnostics,
-                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                         "TZ": "UTC", "LC_ALL": "C"},
-                    timeout=(SINGLE_SWEEP_TIMEOUT_SECONDS if getattr(args, "single_sweep", False) else
-                             args.duration_seconds + max(15, args.integration_seconds + 30)),
-                    check=False,
-                )
-            return_code = completed.returncode
+            return_code = invoke_rtl_power(
+                command, stderr_path=stderr_path,
+                timeout=(SINGLE_SWEEP_TIMEOUT_SECONDS if getattr(args, "single_sweep", False) else
+                         args.duration_seconds + max(15, args.integration_seconds + 30)),
+                runner=runner,
+            )
         except FileNotFoundError:
             return_code = 127
         except (subprocess.TimeoutExpired, OSError):
@@ -139,7 +115,7 @@ def run_characterization(args: argparse.Namespace, *, runner=subprocess.run,
         duration = clock() - started
         rows = bins = 0
         coverage_start = coverage_stop = None
-        if csv_path.exists() and csv_path.stat().st_size <= MAX_CSV_BYTES:
+        if raw_csv_within_limit(csv_path, MAX_CSV_BYTES):
             try:
                 rows, bins, coverage_start, coverage_stop = _inspect_csv(csv_path)
             except (OSError, UnicodeError):

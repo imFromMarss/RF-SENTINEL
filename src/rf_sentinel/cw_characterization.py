@@ -7,14 +7,16 @@ import csv
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import json
-import math
-import os
 from pathlib import Path
 import shlex
 import socket
 import subprocess
 import time
 from typing import Callable, Iterable, Sequence
+
+from rf_sentinel.capture import (
+    decode_rtl_power_row, invoke_rtl_power, raw_csv_within_limit,
+)
 
 
 DEFAULT_FREQUENCIES_HZ = (
@@ -117,28 +119,13 @@ def _rtl_power_points(path: Path) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     with path.open("r", encoding="ascii", errors="strict", newline="") as stream:
         for columns in csv.reader(stream, skipinitialspace=True):
-            if not columns or len(columns) < 7:
+            if not columns:
                 continue
-            try:
-                low, high, step = map(float, columns[2:5])
-                values = [float(value) for value in columns[6:]]
-            except (ValueError, TypeError):
+            decoded = decode_rtl_power_row(columns, require_positive_low=True)
+            if decoded is None:
                 continue
-            if (not all(math.isfinite(value) for value in (low, high, step, *values))
-                    or not values or not 0 < low < high or step <= 0):
-                continue
-            expected_bins = round((high - low) / step)
-            if (expected_bins <= 0
-                    or abs(expected_bins * step - (high - low))
-                    > 2 + expected_bins * 0.0051):
-                continue
-            if (len(values) == expected_bins + 1
-                    and values[-1] == values[-2]):
-                values = values[:-1]
-            if len(values) != expected_bins:
-                continue
-            points.extend((low + (index + 0.5) * step, value)
-                          for index, value in enumerate(values))
+            points.extend((decoded.low + (index + 0.5) * decoded.step, value)
+                          for index, value in enumerate(decoded.power_bins))
     return points
 
 
@@ -233,21 +220,15 @@ def run_cw_characterization(args: argparse.Namespace, *, scpi=None,
                 for command_text in scpi_commands:
                     scpi.send(command_text)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False)
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired):
                 return_code = 124
             analysis = CWSpectrumAnalysis(None, None, None, None, None, False)
             capture_failed = return_code != 0
             try:
-                capture_usable = (csv_path.exists()
-                                  and csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = raw_csv_within_limit(csv_path, MAX_CSV_BYTES)
             except OSError:
                 capture_usable = False
             if return_code == 0 and capture_usable:

@@ -11,11 +11,10 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 import subprocess
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from rf_sentinel.cw_characterization import (
     DEFAULT_EXPECTED_FREQUENCY_TOLERANCE_HZ,
@@ -29,10 +28,16 @@ from rf_sentinel.cw_characterization import (
     generator_commands,
     generator_shutdown_command,
 )
+from rf_sentinel.capture import _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text
+from rf_sentinel.checkpoint import (
+    atomic_write_json,
+    canonical_point_identity,
+    validate_checkpoint_envelope,
+    validate_checkpoint_identities,
+)
 
 
-_GAIN_RE = re.compile(r"Tuner gain set to\s+([-+0-9.]+)\s+dB", re.IGNORECASE)
-_FFT_BIN_RE = re.compile(r"FFT bin size:\s*([-+0-9.]+)\s*Hz", re.IGNORECASE)
+CHECKPOINT_SCHEMA_VERSION = "rtl-sdr-cw-matrix.v1"
 
 
 @dataclass(frozen=True)
@@ -49,11 +54,11 @@ class MatrixPoint:
 
     @property
     def checkpoint_identity(self) -> str:
-        return json.dumps({
+        return canonical_point_identity({
             "requested_bin_hz": self.requested_bin_hz,
             "requested_frequency_hz": self.requested_frequency_hz,
             "requested_gain_db_hex": self.requested_gain_db.hex(),
-        }, sort_keys=True, separators=(",", ":"))
+        })
 
 
 @dataclass(frozen=True)
@@ -129,21 +134,6 @@ def _bins(value: str) -> tuple[int, ...]:
     return result
 
 
-def _diagnostics(stderr_text: str) -> tuple[float | None, float | None, list[str]]:
-    gain_match = _GAIN_RE.search(stderr_text)
-    bin_match = _FFT_BIN_RE.search(stderr_text)
-    warnings = [
-        line.strip() for line in stderr_text.splitlines()
-        if ("pll not locked" in line.lower() or "warning" in line.lower()
-            or "error" in line.lower() or "no e4000" in line.lower())
-    ]
-    return (
-        float(gain_match.group(1)) if gain_match else None,
-        float(bin_match.group(1)) if bin_match else None,
-        warnings,
-    )
-
-
 def _configuration(args: argparse.Namespace) -> dict:
     return {
         "physical_configuration": args.physical_configuration,
@@ -170,9 +160,10 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
-def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
-             records: Sequence[MatrixRecord], *, created_at: str,
-             preflight: dict | None) -> None:
+def _write_derived_artifacts(
+        output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
+        records: Sequence[MatrixRecord], *, preflight: dict | None) -> None:
+    """Rebuild only the artifacts derived from the canonical checkpoint data."""
     counts = {
         "planned": len(plan),
         "completed": len(records),
@@ -180,32 +171,6 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
         "invalid": sum(record.status == "invalid" for record in records),
         "failed": sum(record.status == "failed" for record in records),
     }
-    payload = {
-        "schema_version": "rtl-sdr-cw-matrix.v1",
-        "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
-        "correction_applied": False,
-        "interpolation_applied": False,
-        "normalization_applied": False,
-        "configuration": configuration,
-        "preflight": preflight,
-        "counts": counts,
-        "points": [asdict(record) for record in records],
-    }
-    _atomic_write_text(
-        output_dir / "results.json",
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-    )
-
-    fields = list(MatrixRecord.__annotations__)
-    csv_path = output_dir / "results.csv"
-    csv_temporary = csv_path.with_name(csv_path.name + ".tmp")
-    with csv_temporary.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(asdict(record) for record in records)
-    csv_temporary.replace(csv_path)
-
     lines = [
         "# LibreVNA → RTL-SDR CW matrix",
         "",
@@ -228,18 +193,82 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
             f"- {record.point_key}: {carrier}; delta={record.carrier_delta_db}; "
             f"status={record.status}; rc={record.return_code}"
         )
+    _ = preflight
+    fields = list(MatrixRecord.__annotations__)
+    csv_path = output_dir / "results.csv"
+    csv_temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with csv_temporary.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(asdict(record) for record in records)
+    csv_temporary.replace(csv_path)
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines) + "\n")
 
 
-def _load_resume(output_dir: Path, configuration: dict) -> tuple[str, dict | None, list[MatrixRecord]]:
+def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
+             records: Sequence[MatrixRecord], *, created_at: str,
+             preflight: dict | None) -> None:
+    counts = {
+        "planned": len(plan),
+        "completed": len(records),
+        "valid": sum(record.status == "valid" for record in records),
+        "invalid": sum(record.status == "invalid" for record in records),
+        "failed": sum(record.status == "failed" for record in records),
+    }
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "created_at": created_at,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "correction_applied": False,
+        "interpolation_applied": False,
+        "normalization_applied": False,
+        "configuration": configuration,
+        "preflight": preflight,
+        "counts": counts,
+        "points": [asdict(record) for record in records],
+    }
+    atomic_write_json(output_dir / "results.json", payload)
+    _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
+
+
+def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
+    gain = record["requested_gain_db"]
+    if not isinstance(gain, float):
+        raise TypeError("requested_gain_db must be a float")
+    return canonical_point_identity({
+        "requested_bin_hz": record["requested_bin_hz"],
+        "requested_frequency_hz": record["requested_frequency_hz"],
+        "requested_gain_db_hex": gain.hex(),
+    })
+
+
+def _load_resume(
+        output_dir: Path, configuration: dict,
+        planned_identities: Sequence[str],
+) -> tuple[str, dict | None, list[MatrixRecord]]:
     path = output_dir / "results.json"
     if not path.exists():
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=(), recomputed_identities=())
         return datetime.now(UTC).isoformat(), None, []
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("configuration") != configuration:
-        raise ValueError("Resume configuration не збігається з existing dataset")
-    records = [MatrixRecord(**record) for record in payload.get("points", [])]
-    return payload["created_at"], payload.get("preflight"), records
+    point_payloads = validate_checkpoint_envelope(
+        payload, expected_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        expected_configuration=configuration)
+    try:
+        stored_identities = [record["checkpoint_identity"] for record in point_payloads]
+        recomputed_identities = [
+            _record_checkpoint_identity(record) for record in point_payloads]
+        validate_checkpoint_identities(
+            planned_identities=planned_identities,
+            stored_identities=stored_identities,
+            recomputed_identities=recomputed_identities)
+        records = [MatrixRecord(**record) for record in point_payloads]
+        created_at = payload["created_at"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("Invalid matrix checkpoint record") from error
+    return created_at, payload.get("preflight"), records
 
 
 def _run_preflight(device: int, *, runner=subprocess.run) -> dict:
@@ -278,11 +307,14 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
         raise ValueError("Matrix обмежена 10000 points")
     if (output_dir / "results.json").exists() and not args.resume:
         raise ValueError("Output dataset існує; використайте --resume")
-    created_at, preflight, records = _load_resume(output_dir, configuration)
+    planned_identities = [point.checkpoint_identity for point in plan]
+    created_at, preflight, records = _load_resume(
+        output_dir, configuration, planned_identities)
     completed_identities = {record.checkpoint_identity for record in records}
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]
     if not pending:
+        _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
         return records
 
     preflight = _run_preflight(args.device, runner=preflight_runner)
@@ -324,29 +356,22 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
                 for scpi_command in scpi_commands:
                     scpi.send(scpi_command)
                 sleeper(args.settle_seconds)
-                with stderr_path.open("wb") as diagnostics:
-                    completed = runner(
-                        command, shell=False, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL, stderr=diagnostics,
-                        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                             "TZ": "UTC", "LC_ALL": "C"},
-                        timeout=POINT_TIMEOUT_SECONDS, check=False,
-                    )
-                return_code = completed.returncode
+                return_code = invoke_rtl_power(
+                    command, stderr_path=stderr_path, timeout=POINT_TIMEOUT_SECONDS,
+                    runner=runner)
             except (OSError, subprocess.TimeoutExpired) as error:
                 return_code = 124
                 failure_warning = f"{type(error).__name__}: {error}"
 
-            stderr_text = (stderr_path.read_text(encoding="utf-8", errors="replace")
-                           if stderr_path.exists() else "")
+            stderr_text = (read_stderr_text(stderr_path) if stderr_path.exists() else "")
             actual_gain, effective_bin, warnings = _diagnostics(stderr_text)
             if failure_warning:
                 warnings.append(failure_warning)
             analysis = None
             capture_failed = return_code != 0
             try:
-                capture_usable = (return_code == 0 and raw_csv_path.exists()
-                                  and raw_csv_path.stat().st_size <= MAX_CSV_BYTES)
+                capture_usable = (return_code == 0
+                                  and raw_csv_within_limit(raw_csv_path, MAX_CSV_BYTES))
             except OSError as error:
                 capture_usable = False
                 warnings.append(f"capture: {type(error).__name__}: {error}")

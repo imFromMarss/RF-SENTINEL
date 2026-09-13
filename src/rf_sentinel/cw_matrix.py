@@ -29,6 +29,7 @@ from rf_sentinel.cw_characterization import (
     generator_shutdown_command,
 )
 from rf_sentinel.capture import _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text
+from rf_sentinel.checkpoint import atomic_write_json, canonical_point_identity
 
 
 @dataclass(frozen=True)
@@ -45,11 +46,11 @@ class MatrixPoint:
 
     @property
     def checkpoint_identity(self) -> str:
-        return json.dumps({
+        return canonical_point_identity({
             "requested_bin_hz": self.requested_bin_hz,
             "requested_frequency_hz": self.requested_frequency_hz,
             "requested_gain_db_hex": self.requested_gain_db.hex(),
-        }, sort_keys=True, separators=(",", ":"))
+        })
 
 
 @dataclass(frozen=True)
@@ -173,10 +174,7 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
         "counts": counts,
         "points": [asdict(record) for record in records],
     }
-    _atomic_write_text(
-        output_dir / "results.json",
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-    )
+    atomic_write_json(output_dir / "results.json", payload)
 
     fields = list(MatrixRecord.__annotations__)
     csv_path = output_dir / "results.csv"

@@ -32,6 +32,7 @@ from rf_sentinel.cw_matrix import _run_preflight
 from rf_sentinel.capture import (
     _diagnostics, invoke_rtl_power, raw_csv_within_limit, read_stderr_text,
 )
+from rf_sentinel.checkpoint import atomic_write_json, canonical_point_identity
 
 
 DEFAULT_FREQUENCIES_HZ = (230_000_000, 500_000_000, 1_000_000_000, 1_500_000_000)
@@ -64,13 +65,13 @@ class FrequencyAccuracyPoint:
 
     @property
     def checkpoint_identity(self) -> str:
-        return json.dumps({
+        return canonical_point_identity({
             "center_offset_hz": self.center_offset_hz,
             "repeat": self.repeat,
             "requested_cw_frequency_hz": self.requested_cw_frequency_hz,
             "requested_tuner_center_hz": self.requested_tuner_center_hz,
             "tuning_mode": self.tuning_mode,
-        }, sort_keys=True, separators=(",", ":"))
+        })
 
 
 @dataclass(frozen=True)
@@ -253,8 +254,7 @@ def _persist(output_dir: Path, configuration: dict,
         "counts": counts,
         "points": [asdict(record) for record in records],
     }
-    _atomic_write_text(output_dir / "results.json",
-                       json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_json(output_dir / "results.json", payload)
 
     fields = list(FrequencyAccuracyRecord.__annotations__)
     temporary = output_dir / "results.csv.tmp"

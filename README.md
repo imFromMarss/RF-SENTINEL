@@ -12,12 +12,14 @@ python -m rf_sentinel station
 
 Stable baseline включає continuous acquisition через supervised `rtl_power`, persistent SQLite sweeps, calendar report scheduler, report artifacts, Telegram boundary, health snapshots, structured logs і bounded recovery/shutdown.
 
-Hardware-free validation: **186 passed, 2 skipped**. Skipped checks є opt-in:
+Stable functionality також включає bounded RTL-SDR baseline characterization, CW point characterization, resumable CW matrix та frequency-accuracy/tuner diagnostics.
+
+Hardware-free validation: **299 passed, 2 skipped**. Skipped checks є opt-in:
 
 - real RTL-SDR test requires `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
-Characterization/calibration — WIP/roadmap. Це не stable functionality і не повинно трактуватися як реалізована ідентифікація, класифікація або absolute-power calibration.
+WIP/roadmap залишаються absolute amplitude calibration, actual/reference source measurement, LibreVNA raw/reference receiver, calibration correction map, normalization/interpolation, cable/source corrections та uncertainty/stability work. Characterization не є calibrated measurement system і не повинно трактуватися як absolute-power measurement.
 
 ## CLI matrix
 

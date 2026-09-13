@@ -11,10 +11,15 @@ Stable behavior включає:
 - hourly/daily calendar reports, half-open windows, persisted-bin coverage, gaps і failed rows у timeline;
 - спільний `ReportData` для `report.json`, `report.txt`, `waterfall.png` і `heatmap.png`;
 - allowlisted Telegram read-only report request, health snapshot, structured logs і bounded incident history.
+- bounded RTL-SDR baseline characterization, CW point characterization, resumable CW matrix та frequency-accuracy/tuner diagnostics.
+
+### Characterization persistence / resume
+
+`results.json` є canonical checkpoint; logical point identities lossless/stable для current schema. Incompatible або corrupted checkpoints fail-fast до preflight/SCPI/capture/cleanup, тоді як valid partial runs resumable. Complete resume відновлює `results.csv` і `summary.md` із canonical `results.json`; regeneration derived artifacts не запускає новий RF capture.
 
 ### Validation baseline
 
-Committed hardware-free suite: **186 passed, 2 skipped**. Skips:
+Committed hardware-free suite: **299 passed, 2 skipped**. Skips:
 
 - real RTL-SDR requires explicit opt-in `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires explicit opt-in `RF_SENTINEL_TEST_FULL_RANGE=1`.
@@ -33,7 +38,7 @@ CM4 deployment/acquisition/reporting validation була виконана зов
 
 ## WIP / roadmap
 
-Characterization, calibration, RF event detection, IQ capture, classification, multi-SDR deployment policy та production retention policy не є реалізованою stable functionality у цьому baseline. Не описувати їх як готові можливості.
+Absolute amplitude calibration, actual/reference source measurement, LibreVNA raw/reference receiver, calibration correction map, normalization/interpolation, cable/source corrections та uncertainty/stability work залишаються calibration/reference roadmap. RF event detection, IQ capture, classification, multi-SDR deployment policy та production retention policy також не є реалізованою stable functionality у цьому baseline. Characterization не є calibrated measurement system.
 
 Повністю відтворюваний production `systemd` unit і boot-time deployment recipe також залишаються deployment work; див. [DEPLOYMENT.md](DEPLOYMENT.md).
 

@@ -160,6 +160,51 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def _write_derived_artifacts(
+        output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
+        records: Sequence[MatrixRecord], *, preflight: dict | None) -> None:
+    """Rebuild only the artifacts derived from the canonical checkpoint data."""
+    counts = {
+        "planned": len(plan),
+        "completed": len(records),
+        "valid": sum(record.status == "valid" for record in records),
+        "invalid": sum(record.status == "invalid" for record in records),
+        "failed": sum(record.status == "failed" for record in records),
+    }
+    lines = [
+        "# LibreVNA → RTL-SDR CW matrix",
+        "",
+        f"Configuration: {configuration['physical_configuration']}",
+        "Correction: ні",
+        "Normalization: ні",
+        f"Planned: {counts['planned']}",
+        f"Completed: {counts['completed']}",
+        f"Valid: {counts['valid']}",
+        f"Invalid: {counts['invalid']}",
+        f"Failed: {counts['failed']}",
+        "",
+        "## Points",
+        "",
+    ]
+    for record in records:
+        carrier = (f"{record.carrier_frequency_hz:.2f} Hz / {record.carrier_level_db:.3f} dB"
+                   if record.carrier_frequency_hz is not None else "немає valid carrier")
+        lines.append(
+            f"- {record.point_key}: {carrier}; delta={record.carrier_delta_db}; "
+            f"status={record.status}; rc={record.return_code}"
+        )
+    _ = preflight
+    fields = list(MatrixRecord.__annotations__)
+    csv_path = output_dir / "results.csv"
+    csv_temporary = csv_path.with_name(csv_path.name + ".tmp")
+    with csv_temporary.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(asdict(record) for record in records)
+    csv_temporary.replace(csv_path)
+    _atomic_write_text(output_dir / "summary.md", "\n".join(lines) + "\n")
+
+
 def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
              records: Sequence[MatrixRecord], *, created_at: str,
              preflight: dict | None) -> None:
@@ -183,39 +228,7 @@ def _persist(output_dir: Path, configuration: dict, plan: Sequence[MatrixPoint],
         "points": [asdict(record) for record in records],
     }
     atomic_write_json(output_dir / "results.json", payload)
-
-    fields = list(MatrixRecord.__annotations__)
-    csv_path = output_dir / "results.csv"
-    csv_temporary = csv_path.with_name(csv_path.name + ".tmp")
-    with csv_temporary.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(asdict(record) for record in records)
-    csv_temporary.replace(csv_path)
-
-    lines = [
-        "# LibreVNA → RTL-SDR CW matrix",
-        "",
-        f"Configuration: {configuration['physical_configuration']}",
-        "Correction: ні",
-        "Normalization: ні",
-        f"Planned: {counts['planned']}",
-        f"Completed: {counts['completed']}",
-        f"Valid: {counts['valid']}",
-        f"Invalid: {counts['invalid']}",
-        f"Failed: {counts['failed']}",
-        "",
-        "## Points",
-        "",
-    ]
-    for record in records:
-        carrier = (f"{record.carrier_frequency_hz:.2f} Hz / {record.carrier_level_db:.3f} dB"
-                   if record.carrier_frequency_hz is not None else "немає valid carrier")
-        lines.append(
-            f"- {record.point_key}: {carrier}; delta={record.carrier_delta_db}; "
-            f"status={record.status}; rc={record.return_code}"
-        )
-    _atomic_write_text(output_dir / "summary.md", "\n".join(lines) + "\n")
+    _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
 
 
 def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
@@ -301,6 +314,7 @@ def run_matrix(args: argparse.Namespace, *, scpi=None, runner=subprocess.run,
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]
     if not pending:
+        _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
         return records
 
     preflight = _run_preflight(args.device, runner=preflight_runner)

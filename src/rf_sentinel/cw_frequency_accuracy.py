@@ -238,10 +238,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
-def _persist(output_dir: Path, configuration: dict,
-             plan: Sequence[FrequencyAccuracyPoint],
-             records: Sequence[FrequencyAccuracyRecord], *,
-             created_at: str, preflight: dict | None) -> None:
+def _write_derived_artifacts(
+        output_dir: Path, configuration: dict,
+        plan: Sequence[FrequencyAccuracyPoint],
+        records: Sequence[FrequencyAccuracyRecord], *,
+        preflight: dict | None) -> None:
+    """Rebuild only the artifacts derived from the canonical checkpoint data."""
     counts = {
         "planned": len(plan),
         "completed": len(records),
@@ -251,19 +253,6 @@ def _persist(output_dir: Path, configuration: dict,
         "unsupported": sum(record.status == "unsupported" for record in records),
         "unverified": sum(record.status == "unverified" for record in records),
     }
-    payload = {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "created_at": created_at,
-        "updated_at": datetime.now(UTC).isoformat(),
-        "frequency_correction_applied": False,
-        "normalization_applied": False,
-        "configuration": configuration,
-        "preflight": preflight,
-        "counts": counts,
-        "points": [asdict(record) for record in records],
-    }
-    atomic_write_json(output_dir / "results.json", payload)
-
     fields = list(FrequencyAccuracyRecord.__annotations__)
     temporary = output_dir / "results.csv.tmp"
     with temporary.open("w", encoding="utf-8", newline="") as stream:
@@ -298,7 +287,36 @@ def _persist(output_dir: Path, configuration: dict,
             f"{record.requested_tuner_center_hz}; status={record.status}; "
             f"rc={record.return_code}"
         )
+    _ = preflight
     _atomic_write_text(output_dir / "summary.md", "\n".join(lines))
+
+
+def _persist(output_dir: Path, configuration: dict,
+             plan: Sequence[FrequencyAccuracyPoint],
+             records: Sequence[FrequencyAccuracyRecord], *,
+             created_at: str, preflight: dict | None) -> None:
+    counts = {
+        "planned": len(plan),
+        "completed": len(records),
+        "valid": sum(record.status == "valid" for record in records),
+        "invalid": sum(record.status == "invalid" for record in records),
+        "failed": sum(record.status == "failed" for record in records),
+        "unsupported": sum(record.status == "unsupported" for record in records),
+        "unverified": sum(record.status == "unverified" for record in records),
+    }
+    payload = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "created_at": created_at,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "frequency_correction_applied": False,
+        "normalization_applied": False,
+        "configuration": configuration,
+        "preflight": preflight,
+        "counts": counts,
+        "points": [asdict(record) for record in records],
+    }
+    atomic_write_json(output_dir / "results.json", payload)
+    _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
 
 
 def _record_checkpoint_identity(record: Mapping[str, object]) -> str:
@@ -364,6 +382,7 @@ def run_frequency_accuracy(
     pending = [point for point in plan
                if point.checkpoint_identity not in completed_identities]
     if not pending:
+        _write_derived_artifacts(output_dir, configuration, plan, records, preflight=preflight)
         return records
 
     preflight = _run_preflight(args.device, runner=preflight_runner)

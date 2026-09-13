@@ -160,6 +160,54 @@ def test_resume_skips_completed_points(tmp_path):
     assert len(records) == 1
 
 
+@pytest.mark.parametrize("artifact", ["results.csv", "summary.md"])
+@pytest.mark.parametrize("replacement", [None, "stale/truncated"])
+def test_complete_resume_repairs_derived_artifact_without_side_effects(
+        tmp_path, artifact, replacement, monkeypatch):
+    args = _args(tmp_path)
+    scpi = FakeScpi()
+    records = run_matrix(
+        args, scpi=scpi, runner=_runner, preflight_runner=_preflight,
+        sleeper=lambda _: None, clock=iter((1.0, 2.0)).__next__)
+    checkpoint = tmp_path / "results.json"
+    checkpoint_before = checkpoint.read_bytes()
+    raw = tmp_path / "point-001-50MHz-g10-b100000.csv"
+    stderr = tmp_path / "point-001-50MHz-g10-b100000.stderr.txt"
+    raw_before, stderr_before = raw.read_bytes(), stderr.read_bytes()
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("keep", encoding="ascii")
+
+    derived = tmp_path / artifact
+    expected_derived = derived.read_bytes()
+    if replacement is None:
+        derived.unlink()
+    else:
+        derived.write_text(replacement, encoding="utf-8")
+
+    args.resume = True
+
+    def unexpected(*unused_args, **unused_kwargs):
+        raise AssertionError("complete derived regeneration triggered RF side effect")
+
+    monkeypatch.setattr(cw_matrix, "LibreVNAScpi", unexpected)
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda *unused_args, **unused_kwargs: (
+            (_ for _ in ()).throw(
+                AssertionError("complete derived regeneration cleaned an artifact"))),
+    )
+    resumed = run_matrix(
+        args, scpi=None, runner=unexpected,
+        preflight_runner=unexpected, sleeper=unexpected)
+
+    assert resumed == records
+    assert checkpoint.read_bytes() == checkpoint_before
+    assert raw.read_bytes() == raw_before
+    assert stderr.read_bytes() == stderr_before
+    assert unrelated.read_text(encoding="ascii") == "keep"
+    assert derived.read_bytes() == expected_derived
+
+
 @pytest.mark.parametrize("corruption", [
     "configuration",
     "wrong_schema",

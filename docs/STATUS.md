@@ -19,7 +19,7 @@ Stable behavior включає:
 
 ### Validation baseline
 
-Committed hardware-free suite: **299 passed, 2 skipped**. Skips:
+Committed hardware-free suite: **387 passed, 2 skipped**. Skips:
 
 - real RTL-SDR requires explicit opt-in `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires explicit opt-in `RF_SENTINEL_TEST_FULL_RANGE=1`.

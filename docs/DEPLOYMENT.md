@@ -74,7 +74,7 @@ Hardware-free suite:
 .venv/bin/python -m pytest -q
 ```
 
-Expected: `186 passed, 2 skipped`. Explicit hardware checks:
+Expected: `387 passed, 2 skipped`. Explicit hardware checks:
 
 ```sh
 RF_SENTINEL_TEST_HARDWARE=1 .venv/bin/python -m pytest -q -m hardware

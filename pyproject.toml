@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "rf-sentinel"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["matplotlib>=3.8,<4"]
+dependencies = ["matplotlib>=3.8,<4", "Pillow>=10,<13"]
 
 [project.scripts]
 rf-characterize = "rf_sentinel.characterization:main"
@@ -19,6 +19,9 @@ dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+rf_sentinel = ["assets/*.ttf", "assets/Vera-LICENSE.txt"]
 
 [tool.pytest.ini_options]
 markers = ["hardware: opt-in real RTL-SDR integration test"]

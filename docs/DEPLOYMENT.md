@@ -1,6 +1,6 @@
 # Deployment runbook — current state
 
-Це practical runbook для target Raspberry Pi Compute Module 4 / Linux ARM64. Він описує current implementation і manual foreground operation. Repository **не містить повністю відтворюваного production `systemd` deployment/unit**; systemd unit у цьому runbook не додається.
+Це practical runbook для deployed Raspberry Pi Compute Module 4 / Ubuntu Server. Поточний target працює з `rf-sentinel.service`, автоматично стартує при boot і розгорнутий із `main` на baseline HEAD `6db0a6637688bbaf030214412e972d9e3fb524d3`. Repository не містить unit як повністю відтворюваний deployment artifact; наведені нижче команди також придатні для foreground validation.
 
 ## Prerequisites
 
@@ -41,7 +41,19 @@ set +a
 
 Telegram requires both `RF_SENTINEL_TELEGRAM_BOT_TOKEN` and `RF_SENTINEL_TELEGRAM_CHAT_ID`. Restrict inbound report requests with numeric `RF_SENTINEL_TELEGRAM_ALLOWED_CHAT_IDS`; optionally set numeric `RF_SENTINEL_TELEGRAM_ALLOWED_USER_IDS`. `TELEGRAM_ALLOWED_CHAT_IDS` defaults to configured `TELEGRAM_CHAT_ID` when omitted. Telegram is read-only: it can request the last-hour report, not start/stop/configure SDR or execute shell commands. Unauthorized updates are rejected before report generation; monitoring remains independent of Telegram polling.
 
-## Start and stop
+## Service operation
+
+На deployed CM4 primary lifecycle належить systemd:
+
+```sh
+sudo systemctl status rf-sentinel.service
+sudo systemctl restart rf-sentinel.service
+sudo journalctl -u rf-sentinel.service -f
+```
+
+Service enabled для автоматичного запуску при boot. Не запускайте паралельний foreground `station` на тому самому `DATA_DIR`: station lock захищає від другого instance.
+
+Для локальної validation без systemd:
 
 Canonical foreground start:
 
@@ -49,7 +61,7 @@ Canonical foreground start:
 .venv/bin/python -m rf_sentinel station
 ```
 
-Keep this process under an operator terminal during manual validation. Do not claim unattended boot/restart until an external supervisor is configured and tested. Stop with Ctrl+C or SIGTERM. The runtime sets a stop event, interrupts active `rtl_power`, drains bounded acquisition work, joins components within deadlines and closes SQLite connections. Logs report if a component exceeds its shutdown deadline.
+Keep this process under an operator terminal during manual validation. Stop with Ctrl+C or SIGTERM. The runtime sets a stop event, interrupts active `rtl_power`, drains bounded acquisition work, joins components within deadlines and closes SQLite connections. Logs report if a component exceeds its shutdown deadline.
 
 ## Logs, health and artifacts
 
@@ -60,11 +72,11 @@ find "${RF_SENTINEL_DATA_DIR:-runtime}" -maxdepth 3 -type f -print
 tail -f "${RF_SENTINEL_DATA_DIR:-runtime}/logs/rf-sentinel.log"
 ```
 
-Key artifacts are `sweeps.sqlite3`, `status/health.json`, JSONL logs, `reports/scheduled/` and `reports/last-hour/`. Failed sweeps and report failures remain observable in health/logs/incidents; do not delete them while diagnosing. Log rotation defaults to 5,000,000 bytes with 3 backups.
+On the deployed target the primary artifacts are `runtime/sweeps.sqlite3`, `runtime/status/health.json` and `runtime/logs/rf-sentinel.log`; reports are under `runtime/reports/`. Failed sweeps and report failures remain observable in health/logs/incidents; do not delete them while diagnosing. Log rotation defaults to 5,000,000 bytes with 3 backups.
 
 ## Storage and operations
 
-Reserve disk headroom for SQLite WAL/activity, report artifacts and temporary report payload/render work. Large reports can use temporary disk substantially; retention/cleanup policy is not a fully implemented production policy. Monitor free space and SQLite size, back up artifacts before maintenance, and avoid placing `DATA_DIR` on an unreliable or nearly full filesystem.
+Reserve disk headroom for SQLite WAL/activity, report artifacts and temporary report payload/render work. Large reports can use temporary disk substantially; retention/cleanup policy remains production-hardening work. `.local*` / `.local-validation/` are disposable local validation only; runtime data is operational; canonical characterization/calibration datasets are long-lived and must not be treated as disposable. Monitor free space and SQLite size, back up artifacts before maintenance, and avoid placing `DATA_DIR` on an unreliable or nearly full filesystem.
 
 ## Validation
 
@@ -81,4 +93,4 @@ RF_SENTINEL_TEST_HARDWARE=1 .venv/bin/python -m pytest -q -m hardware
 RF_SENTINEL_TEST_FULL_RANGE=1 .venv/bin/python -m pytest -q tests/test_hardware.py::test_real_full_range_survey
 ```
 
-The first opt-in uses real RTL-SDR; the second is the 30-minute test. A passing test validates the selected host/device/profile only, not a universal calibrated measurement or production boot deployment.
+The first opt-in uses real RTL-SDR; the second is the 30-minute test. A passing test validates the selected host/device/profile only, not a universal calibrated measurement. Do not run hardware tests as part of the canonical hardware-free validation.

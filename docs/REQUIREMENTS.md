@@ -128,6 +128,10 @@ Where a numeric threshold depends on the specific CM4, storage, SDR, antenna, sp
 - A guarantee that every RF transmission within a configured range will be detected; coverage depends on validated hardware, antenna, environment, scan profile, and operating conditions.
 - Detailed architecture, library, database, message-bus, user-interface, or deployment-technology selection at this requirements stage.
 
+## Current validation and next evidence milestone
+
+The canonical hardware-free baseline is **387 passed, 2 skipped**. Hardware tests are explicit opt-in only. The next major milestone is **Observability & CM4 Capacity Preparation**: CPU/RSS/I/O/temperature telemetry, sweep duration/cadence/jitter, reporting/Telegram impact on acquisition, storage/queue behavior, process/CPU-isolation assessment, and evidence-based CM4 capacity/platform decisions. These are not yet implemented capabilities.
+
 ## Open acceptance baselines
 
 The following values require evidence from target-hardware experiments and approval before they become binding acceptance thresholds: supported scan ranges and bandwidths, scan revisit time, measurement resolution, detector false-positive/false-negative behavior, maximum sustainable workload, endurance duration, storage reserve and retention horizons, recovery time, heatmap/report generation capacity, and classification quality. See [EXPERIMENTS.md](research/EXPERIMENTS.md).

@@ -28,7 +28,7 @@ def report(*, outcome="success", with_data=True):
     )
 
 
-def test_text_report_contains_window_quality_and_uncalibrated_note(tmp_path):
+def test_text_report_contains_window_quality_and_uncalibrated_note():
     text = report(outcome="partial").to_text("UTC")
     assert "Початок вікна:" in text
     assert "Завершення вікна:" in text
@@ -36,9 +36,33 @@ def test_text_report_contains_window_quality_and_uncalibrated_note(tmp_path):
     assert "0 успішних, 1 неповних, 0 невдалих" in text
     assert "Покриття: 50.0%" in text
     assert "Діапазон частот: 0.000050–0.000250 МГц" in text
-    assert "Пікова частота/потужність: 0.000200 МГц, -20.00 dB" in text
-    assert "Попередження якості:" in text
+    assert "Попередження якості:" not in text
+    assert "Пікова частота/потужність:" not in text
+    assert "Прогалини:" not in text
+    assert "виявлено прогалини:" not in text
     assert "рівні dB некалібровані" in text
+
+
+def test_generated_text_omits_peak_and_gap_fields(tmp_path):
+    package = generate_report_package(report(), tmp_path / "window", "UTC")
+    text = package.report_txt.read_text(encoding="utf-8")
+    assert "Пікова частота/потужність:" not in text
+    assert "Прогалини:" not in text
+    assert "Попередження якості:" not in text
+
+
+def test_report_text_omits_quality_fields_for_all_report_states():
+    empty = ReportData(
+        START, START + timedelta(minutes=1), 0, 0, 0, 0, 0.0, None, (), None, None, (),
+        (ReportGap(START, START + timedelta(minutes=1), "window"),),
+    )
+    for data in (report(), report(outcome="partial"), report(outcome="failed", with_data=False), empty):
+        text = data.to_text("UTC")
+        assert "Пікова частота" not in text
+        assert "Пікова потужність" not in text
+        assert "Прогалини" not in text
+        assert "Попередження якості" not in text
+        assert "виявлено прогалини" not in text
 
 
 def test_empty_and_failed_windows_still_get_all_png_artifacts(tmp_path):

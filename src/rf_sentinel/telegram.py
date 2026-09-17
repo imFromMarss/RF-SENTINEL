@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 LAST_HOUR_REPORT_BUTTON = "📊 Звіт за останню годину"
 
 MAX_PHOTO_BYTES = 9 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_UPDATE_BATCH = 100
 
@@ -354,6 +355,27 @@ class TelegramNotifier:
         ).encode() + photo + f"\r\n--{boundary}--\r\n".encode()
         return self._post("sendPhoto", body, f"multipart/form-data; boundary={boundary}")
 
+    def _send_document(self, path: Path, caption: str, filename: str) -> int | None:
+        try:
+            with path.open("rb") as source:
+                document = source.read(MAX_DOCUMENT_BYTES + 1)
+        except OSError:
+            raise NotificationError("Не вдалося прочитати файл для сповіщення") from None
+        if len(document) > MAX_DOCUMENT_BYTES:
+            raise NotificationError("Файл має бути в межах дозволеного розміру")
+        if len(caption) > 1024:
+            raise NotificationError("Підпис файлу має містити до 1024 символів")
+        boundary = uuid.uuid4().hex
+        body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n'
+            f'{self._chat_id}\r\n--{boundary}\r\n'
+            'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f'{caption}\r\n--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            'Content-Type: application/octet-stream\r\n\r\n'
+        ).encode() + document + f"\r\n--{boundary}--\r\n".encode()
+        return self._post("sendDocument", body, f"multipart/form-data; boundary={boundary}")
+
     def send_photo(self, path: Path, caption: str = "") -> int | None:
         # Preserve the original primitive's stable multipart filename.
         return self._send_photo(path, caption, "heatmap.png")
@@ -370,9 +392,9 @@ class TelegramNotifier:
         failures: list[str] = []
         operations = (
             ("report", lambda: self.send_message(package.report_txt.read_text(encoding="utf-8"))),
-            ("waterfall", lambda: self._send_photo(
+            ("waterfall", lambda: self._send_document(
                 package.waterfall, "RF Sentinel — waterfall спектра", "waterfall.png")),
-            ("heatmap", lambda: self._send_photo(
+            ("heatmap", lambda: self._send_document(
                 package.heatmap, "RF Sentinel — теплова карта спектра", "heatmap.png")),
         )
         for name, operation in operations:

@@ -4,6 +4,7 @@ import json
 import os
 import heapq
 import math
+import bisect
 from array import array
 from collections.abc import Sequence
 from tempfile import TemporaryFile
@@ -17,6 +18,16 @@ from rf_sentinel.spectrum import ScanProfile, ScanResult
 
 _SORT_RUN_VALUES = 65536
 _MERGE_FAN_IN = 32
+_WATERFALL_TAPE_COLOR = (255, 255, 0)
+_WATERFALL_INK_COLOR = (0, 0, 0)
+_WATERFALL_TOP_TAPE_HEIGHT = 26
+_WATERFALL_TAPE_POINT_SIZE = 10
+_WATERFALL_TIME_MINOR_TICK_LENGTH = 2
+_WATERFALL_TIME_MAJOR_TICK_LENGTH = 6
+_WATERFALL_TIME_DATE_TICK_LENGTH = 10
+_WATERFALL_TIME_DATE_X_OFFSET = -4
+_WATERFALL_SHORT_LABEL_WINDOW_SECONDS = 2 * 60 * 60
+_ROW_QUANTUM_BOUNDARY_TOLERANCE_SECONDS = 0.1
 
 
 class _PayloadFile:
@@ -131,6 +142,17 @@ class ReportSweep:
     frequency_start_hz: float | None = None
     frequency_stop_hz: float | None = None
     bin_width_hz: float | None = None
+    duration_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ReportTimeTick:
+    """One timestamp on the report's half-open, canonical Q-grid axis."""
+
+    timestamp: datetime
+    kind: str
+    label: str | None
+    row_index: int
 
 
 @dataclass(frozen=True)
@@ -186,6 +208,7 @@ class ReportData:
                 item["coverage"], snapshot.append(item.get("frequencies_hz", ())),
                 snapshot.append(item.get("powers", ())), item.get("frequency_start_hz"),
                 item.get("frequency_stop_hz"), item.get("bin_width_hz"),
+                item.get("duration_seconds"),
             ) for item in payload["sweeps"]
         )
         payload["gaps"] = tuple(
@@ -205,18 +228,6 @@ class ReportData:
         if self.frequency_range_hz is not None:
             frequency = (f"{self.frequency_range_hz[0] / 1e6:.6f}–"
                          f"{self.frequency_range_hz[1] / 1e6:.6f} МГц")
-        peak = "дані відсутні"
-        if self.peak_frequency_hz is not None:
-            peak = (f"{self.peak_frequency_hz / 1e6:.6f} МГц, "
-                    f"{self.peak_power_db:.2f} dB")
-        quality = []
-        if self.partial_count:
-            quality.append("є неповні проходи")
-        if self.failed_count:
-            quality.append("є невдалі проходи")
-        if self.gaps:
-            quality.append(f"виявлено прогалини: {len(self.gaps)}")
-        warning = "; ".join(quality) if quality else "критичних застережень не виявлено"
         return (
             "RF Sentinel — звіт часового вікна\n\n"
             f"Початок вікна: {start:%d.%m.%Y %H:%M:%S} ({timezone})\n"
@@ -226,9 +237,7 @@ class ReportData:
             f"{self.failed_count} невдалих (усього {self.sweep_count})\n"
             f"Покриття: {self.coverage * 100:.1f}%\n"
             f"Діапазон частот: {frequency}\n"
-            f"Пікова частота/потужність: {peak}\n"
-            f"Прогалини: {len(self.gaps)}\n"
-            f"Попередження якості: {warning}\n\n"
+            "\n"
             "Примітка: рівні dB некалібровані та придатні лише для відносного порівняння."
         )
 
@@ -308,7 +317,7 @@ class SQLiteReportEngine:
                         item.sweep_id, item.started_at, item.finished_at, item.outcome,
                         item.coverage.fraction, snapshot.append(item.frequencies_hz),
                         snapshot.append(item.powers), item.start_hz, item.stop_hz,
-                        item.bin_width_hz)
+                        item.bin_width_hz, item.duration_seconds)
                     ranges.append((item.start_hz, item.stop_hz))
                     for frequency, power in zip(item.frequencies_hz, item.powers):
                         if peak_power is None or power > peak_power:
@@ -525,9 +534,9 @@ def _render_report_png(report: ReportData, destination: Path, timezone: str, *,
         figure.clear()
 
 
-def render_report_heatmap(report: ReportData, destination: str | Path,
-                          timezone: str = "Europe/Kyiv") -> None:
-    """Render a classic rtl_power-style heatmap from ReportData only."""
+def render_report_matplotlib_heatmap(report: ReportData, destination: str | Path,
+                                     timezone: str = "Europe/Kyiv") -> None:
+    """Render the retained RF Sentinel matplotlib heatmap variant."""
     from matplotlib.colors import LinearSegmentedColormap
 
     palette = LinearSegmentedColormap.from_list(
@@ -542,21 +551,394 @@ def render_report_heatmap(report: ReportData, destination: str | Path,
     )
 
 
+def _waterfall_font_path() -> Path:
+    """Return the packaged Bitstream Vera face used by keenerd's heatmap."""
+    path = Path(__file__).with_name("assets") / "Vera.ttf"
+    if not path.is_file():
+        raise RuntimeError("Packaged waterfall scale font is unavailable")
+    return path
+
+
+def _closest_frequency_index(value: float, frequencies: Sequence[float],
+                             *, interpolate: bool = False):
+    """Mirror keenerd heatmap.py's frequency-to-native-column search."""
+    if not frequencies:
+        raise ValueError("Frequency vector must not be empty")
+    right = bisect.bisect_left(frequencies, value)
+    if right <= 0:
+        return (0, 0) if interpolate else 0
+    if right >= len(frequencies):
+        last = len(frequencies) - 1
+        return (last, last) if interpolate else last
+    if frequencies[right] == value:
+        return (right, right) if interpolate else right
+    left = right - 1
+    if interpolate:
+        return left, right
+    return left if value - frequencies[left] <= frequencies[right] - value else right
+
+
+def _blend_tape_tick(percent: float) -> tuple[int, int, int]:
+    # This intentionally preserves keenerd's yellow/black sub-pixel tick blend.
+    level = int(round(255 * percent))
+    return level, level, 0
+
+
+def _keenerd_frequency_tape(frequencies: Sequence[float]):
+    """Build keenerd's adaptive 25 px tape plus its one-pixel divider row."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    width = len(frequencies)
+    image = Image.new("RGB", (width, _WATERFALL_TOP_TAPE_HEIGHT),
+                      _WATERFALL_TAPE_COLOR)
+    draw = ImageDraw.Draw(image)
+    minimum, maximum = min(frequencies), max(frequencies)
+    label_base_power = 9
+    for power in range(label_base_power, 0, -1):
+        interval = int(10 ** power)
+        low = int((minimum // interval) * interval)
+        high = int((1 + maximum // interval) * interval)
+        if len(range(low, high, interval)) >= 4:
+            label_base_power = power
+            break
+    label_base = 10 ** label_base_power
+    used_lines: set[float] = set()
+    used_labels: set[float] = set()
+    font_path = _waterfall_font_path()
+
+    def tape_lines(interval: float, y1: int, y2: int) -> int:
+        low = int((minimum // interval) * interval)
+        high = int((1 + maximum // interval) * interval)
+        hits = 0
+        for frequency in range(low, high, int(interval)):
+            if not minimum < frequency < maximum:
+                continue
+            hits += 1
+            if frequency in used_lines:
+                continue
+            x1, x2 = _closest_frequency_index(frequency, frequencies, interpolate=True)
+            if x1 == x2:
+                draw.line((x1, y1, x1, y2), fill=_WATERFALL_INK_COLOR)
+            else:
+                percent = ((frequency - frequencies[x1]) /
+                           (frequencies[x2] - frequencies[x1]))
+                draw.line((x1, y1, x1, y2), fill=_blend_tape_tick(percent))
+                draw.line((x2, y1, x2, y2), fill=_blend_tape_tick(1 - percent))
+            used_lines.add(frequency)
+        return hits
+
+    def tape_text(interval: float, y: int) -> None:
+        low = int((minimum // interval) * interval)
+        high = int((1 + maximum // interval) * interval)
+        for frequency in range(low, high, int(interval)):
+            if frequency in used_labels or not minimum < frequency < maximum:
+                continue
+            x = _closest_frequency_index(frequency, frequencies)
+            if interval >= 1e6:
+                label = f"{int(frequency / 1e6)}M"
+            elif interval > 1000:
+                label = f"{int((frequency / 1e3) % 1000)}k"
+                if label.startswith("0"):
+                    label = f"{int(frequency / 1e6)}M"
+            else:
+                label = f"{int(frequency % 1000)}"
+                if label.startswith("0"):
+                    label = f"{int((frequency / 1e3) % 1000)}k"
+                if label.startswith("0"):
+                    label = f"{int(frequency / 1e6)}M"
+            large = ImageFont.truetype(str(font_path), _WATERFALL_TAPE_POINT_SIZE * 3)
+            box = large.getbbox(label)
+            label_image = Image.new(
+                "RGB", (box[2] - box[0], _WATERFALL_TAPE_POINT_SIZE * 3 + 3),
+                _WATERFALL_TAPE_COLOR,
+            )
+            ImageDraw.Draw(label_image).text((0, 0), label, font=large,
+                                             fill=_WATERFALL_INK_COLOR)
+            label_image = label_image.resize(
+                (label_image.width // 3, label_image.height // 3), Image.Resampling.LANCZOS)
+            image.paste(label_image, (x - label_image.width // 2, y))
+            used_labels.add(frequency)
+
+    for scale, y in ((1, 10), (5, 15), (10, 19), (50, 22), (100, 24), (500, 25)):
+        interval = label_base / scale
+        hits = tape_lines(interval, y, 25)
+        pixels_per_hit = width / hits
+        if pixels_per_hit > 50:
+            tape_text(interval, y - _WATERFALL_TAPE_POINT_SIZE)
+        if pixels_per_hit < 10:
+            break
+    return image
+
+
+def _keenerd_color_limits(report: ReportData) -> tuple[float, float]:
+    """Mirror keenerd's default palette limits (0 floor, observed minimum)."""
+    low, high = 0.0, -100.0
+    for sweep in report.sweeps:
+        for value in sweep.powers:
+            low = min(low, float(value))
+            high = max(high, float(value))
+    if high <= low:
+        high = low + 1.0
+    return low, high
+
+
+def render_report_keenerd_heatmap(report: ReportData, destination: str | Path,
+                                  timezone: str = "Europe/Kyiv") -> None:
+    """Render the accepted native keenerd/rtl-sdr-misc heatmap style.
+
+    This is a ReportData adapter for the validated upstream heatmap behavior:
+    one native frequency column per stored bin, one native row per canonical
+    time slot, the original grayscale-blue palette, yellow frequency tape and
+    legacy footer.  It intentionally has no matplotlib axes or colorbar.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    rows = tuple(sweep for sweep in report.sweeps if sweep.powers)
+    if not rows:
+        raise ValueError("keenerd heatmap requires at least one successful sweep")
+    width = len(rows[0].powers)
+    frequencies = tuple(rows[0].frequencies_hz)
+    if len(frequencies) != width or any(len(sweep.powers) != width for sweep in rows):
+        raise ValueError("keenerd heatmap rows must preserve native bin counts")
+    if any(tuple(sweep.frequencies_hz) != frequencies for sweep in rows[1:]):
+        raise ValueError("keenerd heatmap rows must share one canonical frequency vector")
+
+    slot_times, slot_rows, _ = _canonical_time_grid(report, rows)
+    low, high = _keenerd_color_limits(report)
+    palette = tuple((index, index, 50) for index in range(256))
+    raster = Image.new("RGB", (width, len(slot_rows) + 1), (0, 0, 0))
+    pixels = raster.load()
+    for y, sweep in enumerate(slot_rows, start=1):
+        if sweep is None:
+            continue
+        for x, value in enumerate(sweep.powers):
+            tone = int((float(value) - low) / (high - low) * 255)
+            pixels[x, y] = palette[max(0, min(255, tone))]
+
+    image = Image.new("RGB", (width, _WATERFALL_TOP_TAPE_HEIGHT + len(slot_rows)),
+                      _WATERFALL_TAPE_COLOR)
+    image.paste(_keenerd_frequency_tape(frequencies), (0, 0))
+    image.paste(raster, (0, _WATERFALL_TOP_TAPE_HEIGHT - 1))
+
+    # The accepted keenerd invocation used its native footer and no synthetic
+    # clock-label overlay; preserve that behavior for report packages.
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    first = rows[0].started_at.astimezone(ZoneInfo(timezone)).replace(tzinfo=None)
+    last = rows[-1].finished_at.astimezone(ZoneInfo(timezone)).replace(tzinfo=None)
+    duration = max(0.0, (last - first).total_seconds() + 30.0)
+    hours, remainder = divmod(int(duration), 3600)
+    minutes = remainder // 60
+    spacing = tuple(b - a for a, b in zip(frequencies, frequencies[1:]))
+    pixel_bandwidth = (sorted(spacing)[len(spacing) // 2] if spacing else
+                       (rows[0].bin_width_hz or 0.0))
+    pixel_height = duration / max(len(slot_times), 1)
+
+    def shadow_text(y: int, text: str) -> None:
+        draw.text((3, y + 1), text, font=font, fill="black")
+        draw.text((2, y), text, font=font, fill="white")
+
+    shadow_text(image.height - 45, f"Duration: {hours}:{minutes:02d}")
+    shadow_text(image.height - 35,
+                f"Range: {min(frequencies) / 1e6:.2f}MHz - "
+                f"{(max(frequencies) + pixel_bandwidth) / 1e6:.2f}MHz")
+    shadow_text(image.height - 25,
+                f"Pixel: {pixel_bandwidth:.2f}Hz x {int(round(pixel_height))}s")
+    shadow_text(image.height - 15, f"Started: {first}")
+    image.save(Path(destination), format="PNG")
+
+
+def render_report_heatmap(report: ReportData, destination: str | Path,
+                          timezone: str = "Europe/Kyiv") -> None:
+    """Render the canonical package heatmap via the accepted keenerd adapter."""
+    if not any(sweep.powers for sweep in report.sweeps):
+        # There is no native frequency vector for an empty/failed window. Keep
+        # the established all-artifacts failure contract for that edge case;
+        # normal successful packages always take the keenerd path above.
+        return render_report_matplotlib_heatmap(report, destination, timezone)
+    render_report_keenerd_heatmap(report, destination, timezone)
+
+
+def _time_tape_width(font, small_font) -> int:
+    """Smallest width fitting ticks and the widest required time/date label."""
+    from PIL import Image, ImageDraw
+
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    labels = (("00:00", font), ("00.00.0000", small_font))
+    widest = max(draw.textbbox((0, 0), label, font=face)[2] for label, face in labels)
+    return widest + 14
+
+
+def _representative_sweep_duration_seconds(data_rows: Sequence[ReportSweep],
+                                           window_duration: float) -> float:
+    """Select persisted/metadata duration, falling back to robust actual duration."""
+    persisted = tuple(sweep.duration_seconds for sweep in data_rows
+                      if sweep.duration_seconds is not None and sweep.duration_seconds > 0)
+    if persisted:
+        values = persisted
+    else:
+        values = tuple((sweep.finished_at - sweep.started_at).total_seconds()
+                       for sweep in data_rows
+                       if sweep.finished_at > sweep.started_at)
+    if not values:
+        return max(float(window_duration), 1.0)
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _row_quantum_seconds(data_rows: Sequence[ReportSweep], window_duration: float) -> float:
+    """Round representative sweep duration to a stable whole-minute raster quantum."""
+    duration = _representative_sweep_duration_seconds(data_rows, window_duration)
+    minutes = max(1, math.ceil((duration - _ROW_QUANTUM_BOUNDARY_TOLERANCE_SECONDS) / 60))
+    return float(minutes * 60)
+
+
+def _canonical_time_grid(report: ReportData,
+                         data_rows: Sequence[ReportSweep]) -> tuple[tuple[datetime, ...], tuple[ReportSweep | None, ...], float]:
+    """Return elapsed-time slots and their one-to-one observed sweep assignments."""
+    duration = (report.window_end - report.window_start).total_seconds()
+    quantum = _row_quantum_seconds(data_rows, duration)
+    slot_count = max(1, int(math.ceil(duration / quantum - 1e-9)))
+    slot_times = tuple(report.window_start + timedelta(seconds=index * quantum)
+                       for index in range(slot_count))
+    assigned: list[ReportSweep | None] = [None] * slot_count
+    tolerance = quantum / 2 + 1e-6
+    for sweep in data_rows:
+        offset = (sweep.started_at - report.window_start).total_seconds()
+        index = int(round(offset / quantum))
+        if not 0 <= index < slot_count:
+            raise ValueError("Sweep falls outside the canonical report time grid")
+        error = abs(offset - index * quantum)
+        if error > tolerance:
+            raise ValueError("Sweep cannot be assigned unambiguously to a time slot")
+        if assigned[index] is not None:
+            raise ValueError("Multiple sweeps assigned to one canonical time slot")
+        assigned[index] = sweep
+    return slot_times, tuple(assigned), quantum
+
+
+def _canonical_time_ticks(report: ReportData, slot_times: Sequence[datetime],
+                          quantum: float, timezone: str,
+                          *, label_minor_ticks: bool = False) -> tuple[ReportTimeTick, ...]:
+    """Return the shared half-open time axis for every raster renderer."""
+    zone = ZoneInfo(timezone)
+    local_start = report.window_start.astimezone(zone)
+    local_end = report.window_end.astimezone(zone)
+    target = local_start.replace(second=0, microsecond=0)
+    while target < local_start or target.minute % 10:
+        target += timedelta(minutes=1 if target.minute % 10 else 10)
+    ticks: list[ReportTimeTick] = []
+    while target < local_end and target < report.window_end:
+        offset = (target - report.window_start).total_seconds()
+        row_index = int(round(offset / quantum))
+        if 0 <= row_index < len(slot_times):
+            is_major = target.minute == 0
+            label = (target.strftime("%d.%m" if target.hour == 0 else "%H:%M")
+                     if is_major or label_minor_ticks else None)
+            ticks.append(ReportTimeTick(
+                target, "major" if is_major else "minor", label, row_index))
+        target += timedelta(minutes=10)
+    return tuple(ticks)
+
+
 def render_report_waterfall(report: ReportData, destination: str | Path,
                             timezone: str = "Europe/Kyiv") -> None:
-    """Render RF Sentinel's banded waterfall from ReportData only."""
-    from matplotlib.colors import LinearSegmentedColormap
+    """Render a native waterfall: one sweep row and one stored-bin column."""
+    from PIL import Image, ImageDraw, ImageFont
 
-    palette = LinearSegmentedColormap.from_list(
-        "rf_sentinel_waterfall",
-        ["#02040b", "#09203d", "#075985", "#00a6a6", "#72d572",
-         "#f3dc5b", "#ff8c42", "#fff2b2"], N=256,
-    )
-    _render_report_png(
-        report, Path(destination), timezone, palette=palette,
-        title="RF Sentinel — waterfall спектра", axes_facecolor="#02040b",
-        figure_facecolor="#070b13", failed_color="#556274", top_x=False,
-    )
+    data_rows = tuple(sweep for sweep in report.sweeps if sweep.powers)
+    if not data_rows:
+        # Preserve the established all-artifacts contract for empty/failed
+        # windows; native raster geometry only applies to measured rows.
+        from matplotlib.colors import LinearSegmentedColormap
+        palette = LinearSegmentedColormap.from_list(
+            "rf_sentinel_waterfall",
+            ["#02040b", "#09203d", "#075985", "#00a6a6", "#72d572",
+             "#f3dc5b", "#ff8c42", "#fff2b2"], N=256,
+        )
+        _render_report_png(
+            report, Path(destination), timezone, palette=palette,
+            title="RF Sentinel — waterfall спектра", axes_facecolor="#02040b",
+            figure_facecolor="#070b13", failed_color="#556274", top_x=False,
+        )
+        return
+    width = len(data_rows[0].powers)
+    if any(len(sweep.powers) != width or len(sweep.frequencies_hz) != width
+           for sweep in data_rows):
+        raise ValueError("Waterfall native rows must have equal frequency-bin counts")
+    canonical_frequencies = tuple(data_rows[0].frequencies_hz)
+    if any(tuple(sweep.frequencies_hz) != canonical_frequencies for sweep in data_rows[1:]):
+        raise ValueError("Waterfall rows must share one canonical frequency vector")
+    if any(current <= previous for previous, current
+           in zip(canonical_frequencies, canonical_frequencies[1:])):
+        raise ValueError("Waterfall canonical frequency vector must be strictly increasing")
+    low, high = _report_color_limits(report)
+    stops = ((2, 4, 11), (9, 32, 61), (7, 88, 133), (0, 166, 166),
+             (114, 213, 114), (243, 220, 91), (255, 140, 66), (255, 242, 178))
+    palette = []
+    for index in range(256):
+        position = index * (len(stops) - 1) / 255.0
+        lower = int(position)
+        upper = min(lower + 1, len(stops) - 1)
+        fraction = position - lower
+        palette.append(tuple(round(stops[lower][channel] * (1 - fraction) +
+                                   stops[upper][channel] * fraction)
+                            for channel in range(3)))
+    slot_times, slot_rows, _cadence = _canonical_time_grid(report, data_rows)
+    pixels = bytearray()
+    for sweep in slot_rows:
+        if sweep is None:
+            pixels.extend(b"\x00" * (width * 3))
+            continue
+        for value in sweep.powers:
+            index = int(max(0.0, min(1.0, (value - low) / (high - low))) * 255.0)
+            pixels.extend(palette[index])
+    raster = Image.frombytes("RGB", (width, len(slot_rows)), bytes(pixels))
+
+    font_path = _waterfall_font_path()
+    font = ImageFont.truetype(str(font_path), 12)
+    small = ImageFont.truetype(str(font_path), 10)
+    top = _WATERFALL_TOP_TAPE_HEIGHT
+    left = _time_tape_width(font, small)
+    image = Image.new("RGB", (left + width, top + len(slot_rows)),
+                      _WATERFALL_TAPE_COLOR)
+    draw = ImageDraw.Draw(image)
+    image.paste(raster, (left, top))
+    image.paste(_keenerd_frequency_tape(canonical_frequencies), (left, 0))
+
+    short_window = ((report.window_end - report.window_start).total_seconds()
+                    <= _WATERFALL_SHORT_LABEL_WINDOW_SECONDS)
+    time_ticks = _canonical_time_ticks(
+        report, slot_times, _cadence, timezone,
+        label_minor_ticks=short_window)
+    for tick in time_ticks:
+        is_major = tick.kind == "major"
+        is_date = is_major and tick.timestamp.hour == 0
+        y = top + tick.row_index
+        tick_length = (_WATERFALL_TIME_DATE_TICK_LENGTH if is_date else
+                       _WATERFALL_TIME_MAJOR_TICK_LENGTH if is_major else
+                       _WATERFALL_TIME_MINOR_TICK_LENGTH)
+        tick_end = left - 2
+        draw.line((tick_end - tick_length, y, tick_end, y),
+                  fill=_WATERFALL_INK_COLOR)
+        if tick.label is not None:
+            label = tick.label
+            box = draw.textbbox((0, 0), label, font=font)
+            label_y = int(y - (box[1] + box[3]) / 2)
+            # Keep the existing centered/clamped placement for visible labels,
+            # but never draw a terminal label whose unclamped bbox would leave
+            # the image. The tick itself remains part of the unchanged scale.
+            if label_y + box[1] < 0 or label_y + box[3] > image.height:
+                continue
+            label_y = max(top - box[1], min(label_y, image.height - box[3]))
+            x = left - 10 - (box[2] - box[0]) - box[0]
+            if is_date:
+                x += _WATERFALL_TIME_DATE_X_OFFSET
+            if x + box[0] < 0 or x + box[2] > image.width:
+                continue
+            draw.text((x, label_y), label, fill=_WATERFALL_INK_COLOR, font=font)
+    image.save(Path(destination), format="PNG")
 
 
 def render_report_images(report: ReportData, waterfall: str | Path,

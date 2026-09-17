@@ -1,5 +1,6 @@
 .DS_Store
 .local/
+.local-validation/
 
 # Local credentials/configuration; safe examples stay versioned.
 .env

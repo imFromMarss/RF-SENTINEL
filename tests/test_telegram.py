@@ -85,11 +85,21 @@ def test_report_package_delivery_returns_all_message_ids(tmp_path):
     }
     requests = [call[0][1] for call in connection.calls]
     assert requests == ["/bot0:synthetic_dummy/sendMessage",
-                        "/bot0:synthetic_dummy/sendPhoto",
-                        "/bot0:synthetic_dummy/sendPhoto"]
+                        "/bot0:synthetic_dummy/sendDocument",
+                        "/bot0:synthetic_dummy/sendDocument"]
     assert b"waterfall.png" in connection.calls[1][1]["body"]
     assert "waterfall спектра".encode() in connection.calls[1][1]["body"]
     assert "теплова карта спектра".encode() in connection.calls[2][1]["body"]
+    assert all(b"report.json" not in call[1]["body"] for call in connection.calls)
+
+
+def test_report_images_are_uploaded_as_documents(tmp_path):
+    connection = Connection()
+    result = notifier(connection).send_package(package(tmp_path))
+    assert result.status == "sent"
+    for call in connection.calls[1:]:
+        assert b'Content-Disposition: form-data; name="document"' in call[1]["body"]
+        assert b'Content-Disposition: form-data; name="photo"' not in call[1]["body"]
 
 
 def test_report_package_partial_delivery_is_machine_readable(tmp_path):

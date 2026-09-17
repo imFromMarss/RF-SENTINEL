@@ -2,20 +2,20 @@
 
 ## Implemented / stable
 
-Canonical runtime — `python -m rf_sentinel station`. Один process запускає acquisition, report scheduler і, за наявності credentials, Telegram polling; station lock у `DATA_DIR/station.lock` не дозволяє другий instance.
+Canonical runtime — `python -m rf_sentinel station`. Baseline: `main` at `6db0a6637688bbaf030214412e972d9e3fb524d3`. Один process запускає acquisition, report scheduler і, за наявності credentials, Telegram polling; station lock у `DATA_DIR/station.lock` не дозволяє другий instance.
 
 Stable behavior включає:
 
-- `rtl_power` RX acquisition з default `ACQUISITION_BIN_HZ=500000`, continuous lifecycle, persistent SQLite sweeps і bounded recovery;
+- continuous RTL-SDR acquisition через supervised `rtl_power` з default `ACQUISITION_BIN_HZ=500000`, persistent SQLite sweeps і bounded recovery;
 - окремі acquisition/reporting storage boundaries та bounded deterministic shutdown;
 - hourly/daily calendar reports, half-open windows, persisted-bin coverage, gaps і failed rows у timeline;
-- спільний `ReportData` для `report.json`, `report.txt`, `waterfall.png` і `heatmap.png`;
-- allowlisted Telegram read-only report request, health snapshot, structured logs і bounded incident history.
+- спільний `ReportData` для `report.json`, `report.txt`, `waterfall.png` і `heatmap.png`; canonical pixel-to-pixel waterfall, canonical time-slot grid і black missing rows; Keenerd-compatible heatmap;
+- allowlisted Telegram read-only report request із delivery як document/file, health snapshot, structured logs і bounded incident history;
 - bounded RTL-SDR baseline characterization, CW point characterization, resumable CW matrix та frequency-accuracy/tuner diagnostics.
 
 ### Characterization persistence / resume
 
-`results.json` є canonical checkpoint; logical point identities lossless/stable для current schema. Incompatible або corrupted checkpoints fail-fast до preflight/SCPI/capture/cleanup, тоді як valid partial runs resumable. Complete resume відновлює `results.csv` і `summary.md` із canonical `results.json`; regeneration derived artifacts не запускає новий RF capture.
+`results.json` є canonical checkpoint; logical point identities lossless/stable для current schema. Incompatible або corrupted checkpoints fail-fast до preflight/SCPI/capture/cleanup, тоді як valid partial runs resumable. Complete resume відновлює `results.csv` і `summary.md` із canonical `results.json`; regeneration derived artifacts не запускає новий RF capture. Calibration artifact model — immutable/self-identifying JSON artifact із versioned schema, receiver/profile/provenance, raw/reference dataset links, point-level corrections і забороненими interpolation/extrapolation; model описує artifact contract, а не завершену absolute calibration.
 
 ### Validation baseline
 
@@ -24,7 +24,7 @@ Committed hardware-free suite: **387 passed, 2 skipped**. Skips:
 - real RTL-SDR requires explicit opt-in `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires explicit opt-in `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
-CM4 deployment/acquisition/reporting validation була виконана зовнішньо для цього baseline. Це external validation, а не твердження, що production `systemd` deployment повністю відтворюється з repository.
+CM4 deployment/acquisition/reporting validation була виконана зовнішньо для цього baseline. Deployed target — CM4 / Ubuntu Server, `rf-sentinel.service`, automatic boot start, current `main` at the baseline HEAD. Repository не містить unit як reproducible deployment artifact; це не скасовує факт operational deployment.
 
 ## Validated externally
 
@@ -36,11 +36,15 @@ CM4 deployment/acquisition/reporting validation була виконана зов
 
 `survey` і `schedule` — старий workflow, залишений для сумісності. `acquire` і `report-schedule` — standalone/diagnostic контури; canonical topology — `station`. [LOCAL_SURVEY.md](LOCAL_SURVEY.md) зберігає корисні операційні деталі, але явно не є current source of truth.
 
-## WIP / roadmap
+## WIP
 
-Absolute amplitude calibration, actual/reference source measurement, LibreVNA raw/reference receiver, calibration correction map, normalization/interpolation, cable/source corrections та uncertainty/stability work залишаються calibration/reference roadmap. RF event detection, IQ capture, classification, multi-SDR deployment policy та production retention policy також не є реалізованою stable functionality у цьому baseline. Characterization не є calibrated measurement system.
+Наступний великий milestone — **Observability & CM4 Capacity Preparation**. Він охоплює CPU/RSS/I/O/temperature telemetry, sweep duration/cadence/jitter, вплив reporting і Telegram на acquisition, storage/queue behavior, визначення необхідності process/CPU isolation та evidence-based рішення щодо CM4 capacity і можливої зміни/розділення платформи. Ці можливості ще не реалізовані.
 
-Повністю відтворюваний production `systemd` unit і boot-time deployment recipe також залишаються deployment work; див. [DEPLOYMENT.md](DEPLOYMENT.md).
+## Future roadmap
+
+RFEvent detection, calibration/reference characterization, IQ capture/classification, multi-SDR/HackRF, retention/production hardening, а також actual/reference source measurement, LibreVNA raw/reference receiver, correction application, normalization/interpolation, cable/source corrections та uncertainty/stability work. Characterization не є calibrated measurement system.
+
+Lifecycle policy: `.local*` / `.local-validation/` — disposable local validation; runtime data — operational; canonical characterization/calibration datasets — long-lived і не disposable.
 
 ## CLI
 

@@ -10,16 +10,18 @@ Canonical integrated runtime:
 python -m rf_sentinel station
 ```
 
-Stable baseline включає continuous acquisition через supervised `rtl_power`, persistent SQLite sweeps, calendar report scheduler, report artifacts, Telegram boundary, health snapshots, structured logs і bounded recovery/shutdown.
+Stable baseline включає continuous RTL-SDR acquisition через supervised `rtl_power`, persistent SQLite sweeps, recovery/health/structured logs, calendar report scheduler, hourly/daily/on-demand report artifacts, і Telegram delivery.
 
-Stable functionality також включає bounded RTL-SDR baseline characterization, CW point characterization, resumable CW matrix та frequency-accuracy/tuner diagnostics.
+Stable functionality також включає canonical pixel-to-pixel waterfall, canonical time-slot grid із black rows для missing slots, Keenerd-compatible heatmap, Telegram report delivery як document/file, immutable calibration artifact model і bounded RTL-SDR characterization workflows: baseline, CW points, resumable CW matrix та frequency-accuracy/tuner diagnostics.
 
 Hardware-free validation: **387 passed, 2 skipped**. Skipped checks є opt-in:
 
 - real RTL-SDR test requires `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
-WIP/roadmap залишаються absolute amplitude calibration, actual/reference source measurement, LibreVNA raw/reference receiver, calibration correction map, normalization/interpolation, cable/source corrections та uncertainty/stability work. Characterization не є calibrated measurement system і не повинно трактуватися як absolute-power measurement.
+Calibration artifact model є stable, але actual/reference source measurement, calibration correction application, LibreVNA raw/reference receiver, normalization/interpolation, cable/source corrections та uncertainty/stability work — WIP/roadmap. Characterization не є calibrated measurement system і не повинно трактуватися як absolute-power measurement.
+
+Наступний великий milestone — **Observability & CM4 Capacity Preparation**: CPU/RSS/I/O/temperature telemetry, sweep duration/cadence/jitter, вплив reporting і Telegram на acquisition, storage/queue behavior, evidence-based рішення щодо process/CPU isolation та CM4 capacity/можливої зміни або розділення платформи. Ці можливості ще не заявляються як реалізовані.
 
 ## CLI matrix
 
@@ -36,7 +38,7 @@ WIP/roadmap залишаються absolute amplitude calibration, actual/refere
 
 ## Current acquisition
 
-Default acquisition profile: `24 MHz`–`1766 MHz`, `ACQUISITION_BIN_HZ=500000`, cadence budget `60 s`, recovery delay `60 s`. `250 kHz` не є current default. Worker виконує послідовні sweep-и; overlap і catch-up відсутні. Failed acquisition attempts persist у SQLite як rows з terminal status `failed`; missing intervals не створюють synthetic SQLite records. Missing intervals спостерігаються через report gaps, cadence/health counters і logs. Report renderer не вигадує synthetic RF data: canonical time grid містить окремі missing slots, які raster-яться як black/empty rows, без RF interpolation між sweep-ами або missing slots. Normal report використовує native waterfall і Keenerd-compatible heatmap; Matplotlib renderer залишається fallback лише для no-data/empty path.
+Default acquisition profile: `24 MHz`–`1766 MHz`, `ACQUISITION_BIN_HZ=500000`, cadence budget `60 s`, recovery delay `60 s`. `250 kHz` не є current default. Worker виконує послідовні sweep-и; overlap і catch-up відсутні. Failed acquisition attempts persist у SQLite як rows з terminal status `failed`; missing intervals не створюють synthetic SQLite records. Missing intervals спостерігаються через report gaps, cadence/health counters і logs. Report renderer не вигадує synthetic RF data: canonical time grid містить окремі missing slots, які raster-яться як black/empty rows, без RF interpolation між sweep-ами або missing slots. Normal report використовує canonical pixel-to-pixel waterfall і Keenerd-compatible heatmap; Matplotlib renderer залишається fallback лише для no-data/empty path.
 
 Acquisition не генерує reports і не виконує Telegram delivery у своєму path. Report generation/delivery не завершує acquisition. Деталі: [continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).
 
@@ -44,7 +46,7 @@ Acquisition не генерує reports і не виконує Telegram delivery
 
 Scheduler формує completed hourly reports на початку наступної години та daily reports о 00:00 у configured timezone (default `Europe/Kyiv`). Report windows half-open; failed rows присутні в timeline та outcome counts. Деталі storage/report semantics і Telegram authorization: [STATUS](docs/STATUS.md) та [DECISIONS](docs/DECISIONS.md).
 
-Практичний current-state runbook для CM4: [DEPLOYMENT](docs/DEPLOYMENT.md). Repository не містить повністю відтворюваного production `systemd` unit.
+Поточний deployment: CM4 / Ubuntu Server із `systemd` service `rf-sentinel.service`, автоматичним стартом при boot і deployed `main` на baseline HEAD. Operational artifacts: `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/logs/rf-sentinel.log`. Unit/deployment environment є operational artifact target, а не committed repository unit. Lifecycle policy: `.local*` і `.local-validation/` — disposable local validation; runtime data — operational; canonical characterization/calibration datasets — довгоживучі й не повинні випадково трактуватися як disposable. Runbook: [DEPLOYMENT](docs/DEPLOYMENT.md).
 
 ## Документація
 

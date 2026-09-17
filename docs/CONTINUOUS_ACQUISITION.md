@@ -8,7 +8,7 @@ Canonical start:
 python -m rf_sentinel station
 ```
 
-Flow: `RTLPowerScanner.acquire` → `SpectrumAcquisitionWorker` → bounded `AsyncMeasurementSink` → `SQLiteMeasurementSink`. `station` також запускає незалежний report scheduler і Telegram polling threads. Acquisition path не імпортує report generation як частину sweep processing, не будує PNG і не чекає delivery.
+Flow: `RTLPowerScanner.acquire` → `SpectrumAcquisitionWorker` → bounded `AsyncMeasurementSink` → `SQLiteMeasurementSink`. `station` також запускає незалежний report scheduler і Telegram polling threads. Acquisition path не імпортує report generation як частину sweep processing, не будує PNG і не чекає delivery. Це current stable continuous RTL-SDR path.
 
 | Variable | Default |
 | --- | ---: |
@@ -56,7 +56,7 @@ Scheduler формує completed hourly window на початку кожної 
 
 `coverage` — persisted-bin coverage: `sum(observed_bins) / sum(expected_bins)`, включно з failed sweeps, якщо для них відомий expected count. `gaps` явно містить window gap для порожнього dataset або `leading`, `between`, `trailing` intervals, де немає persisted sweep start/finish coverage. Failed sweep залишається ordered timeline row і входить у success/partial/failed counts, але має no payload. Canonical time grid містить окремі missing slots; normal native `waterfall` і Keenerd-compatible `heatmap` raster-ять такі slots як black/empty rows, без synthetic RF data або RF interpolation між sweep-ами чи missing slots. Positive gaps не вигадують RF measurements.
 
-`waterfall.png` і `heatmap.png` будуються з одного `ReportData` dataset; відмінність — renderer palette/layout. Report JSON/text і обидві PNG описують те саме report window та sweep ordering.
+`waterfall.png` і `heatmap.png` будуються з одного `ReportData` dataset; waterfall — canonical pixel-to-pixel renderer, heatmap — Keenerd-compatible renderer. Обидва використовують canonical frequency vector і canonical time-slot grid; missing slots стають black/empty rows. Report JSON/text і обидві PNG описують те саме report window та sweep ordering. Telegram відправляє report artifacts як documents/files.
 
 ## Observability
 

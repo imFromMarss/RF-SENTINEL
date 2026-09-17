@@ -22,6 +22,8 @@ RF activity is often intermittent, spread across wide frequency ranges, and diff
 - Provide access to summaries and reports through a Telegram bot.
 - Operate unattended for extended periods, with operational health and recoverability considered as project requirements.
 
+Поточний stable slice: continuous RTL-SDR acquisition, SQLite persistence, recovery/health/structured logs, hourly/daily/on-demand reports, canonical waterfall/heatmap rendering, Telegram document delivery, calibration artifact model і bounded characterization workflows. RFEvent detection, IQ/classification, multi-SDR/HackRF та production retention hardening залишаються roadmap.
+
 ## 4. Non-goals
 
 - Decrypting protected communications.
@@ -33,14 +35,14 @@ RF activity is often intermittent, spread across wide frequency ranges, and diff
 
 ## 5. Hardware platform
 
-The primary target is a Raspberry Pi Compute Module 4 running Linux ARM64. The system should be designed with the practical constraints of embedded, low-power, long-running operation in mind, including CPU, memory, storage endurance, USB connectivity, thermal behavior, and power reliability. Specific hardware configurations and performance targets are not yet decided.
+The deployed target is a Raspberry Pi Compute Module 4 running Ubuntu Server. The service is `rf-sentinel.service`, enabled at boot, with current `main` deployed at the baseline HEAD. CM4 CPU/RSS/I/O/temperature capacity evidence and possible process/CPU isolation or platform split are the next major milestone, not completed functionality.
 
 ## 6. SDR hardware
 
-Initial SDR device support is planned for:
+The current acquisition implementation uses RTL-SDR. HackRF support remains a future roadmap item:
 
-- RTL-SDR
-- HackRF
+- RTL-SDR (current acquisition implementation)
+- HackRF (future roadmap)
 
 Both devices will be used in receive-only mode. Device-specific supported frequency ranges, bandwidths, sample rates, gain behavior, calibration, USB requirements, and coexistence constraints need to be validated during requirements engineering and prototype work.
 

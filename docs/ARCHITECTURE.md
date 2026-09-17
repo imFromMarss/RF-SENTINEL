@@ -2,7 +2,7 @@
 
 ## Scope and decision status
 
-This is the initial architecture for an unattended, RX-only spectrum-observation station on Raspberry Pi Compute Module 4 (CM4), Linux ARM64. It defines responsibility boundaries and contracts; the local prototype now implements the acquisition/reporting slice described below.
+This is the initial architecture for an unattended, RX-only spectrum-observation station on Raspberry Pi Compute Module 4 (CM4), Ubuntu Server. It defines responsibility boundaries and contracts. The current stable implementation is the continuous RTL-SDR acquisition, SQLite persistence, health/recovery/logging, reporting/visualization and Telegram-delivery slice; RFEvent detection, IQ/classification and broader SDR support remain roadmap work.
 
 `rtl_power` and `hackrf_sweep` are the first acquisition baseline candidates, not permanent dependencies. CM4 performance, device behavior, storage capacity, recovery timing, and future SoapySDR adoption remain subject to [hardware experiments](research/EXPERIMENTS.md). Decision status and evidence gates are recorded in [DECISIONS.md](DECISIONS.md); unresolved questions are in [ARCHITECTURE_QUESTIONS.md](ARCHITECTURE_QUESTIONS.md).
 
@@ -522,7 +522,7 @@ uncertainties are maintained in [ARCHITECTURE_QUESTIONS.md](ARCHITECTURE_QUESTIO
 
 ## Continuous acquisition
 
-Цільова й реалізована local-prototype модель — незалежний producer спектра та downstream consumers.
+Цільова й реалізована stable модель — незалежний producer спектра та downstream consumers.
 Режим `acquire` додає sweep domain model, MeasurementSink і operational health/logging.
 Один sweep — один timestamped spectrum frame; reporting не затримує наступний прийом.
 Hardware benchmark спростував target ≤10 с для повного 24–1766 МГц range через

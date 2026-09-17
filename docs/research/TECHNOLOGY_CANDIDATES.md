@@ -75,7 +75,7 @@ This document turns research into an options register. It does not select an arc
 
 | Candidate | Maturity | Advantages | Disadvantages | ARM64 / Raspberry Pi suitability | Hardware compatibility | Project risk | Recommended role |
 | --- | --- | --- | --- | --- | --- | --- |
-| systemd service units | Mature Linux standard | Boot start, restart policy, logs, dependency ordering, watchdog support | Linux-specific; application must expose useful health | Strong on target Linux | Device-neutral | Low | Primary service supervisor candidate |
+| systemd service units | Mature Linux standard | Boot start, restart policy, logs, dependency ordering, watchdog support | Linux-specific; application must expose useful health | Demonstrated on deployed Ubuntu Server CM4 | Device-neutral | Low | Primary operational service supervisor |
 | udev device rules/monitoring | Mature Linux subsystem | Stable permissions and device-arrival signals | Device identity and races still need design/testing | Strong on Linux | USB SDRs | Low–medium | Device permission/identity/reconnect support |
 | Container runtime | Mature but deployment dependent | Packaging isolation | USB/device, storage, boot, and resource complexity | Possible but needs evidence | Device-dependent passthrough | Medium | Defer pending operational requirement |
 
@@ -111,7 +111,7 @@ These are non-binding research recommendations derived from the facts above. The
 - What constitutes a legal and operationally appropriate optional IQ capture duration, retention limit, and authorization process?
 - Is simultaneous multi-SDR scanning necessary for the first architecture, and can the selected USB/power topology sustain it?
 - What Telegram operations are read-only versus configuration-changing, and what authorization/audit model is sufficient?
-- What systemd/udev behavior is available in the chosen CM4 OS image, and how will persistent physical SDR identity be established?
+- What additional systemd/udev behavior and persistent physical SDR identity policy are required beyond the deployed Ubuntu Server CM4 service?
 - Is there a justified classification use case with a locally relevant labeled corpus, repeatable test protocol, unknown handling, and CM4 inference budget?
 
 ## Key sources

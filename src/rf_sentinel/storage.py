@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 import sqlite3
 import struct
+import time
 from collections.abc import Iterator
+from threading import RLock
 from typing import Iterable
 from uuid import uuid4
 
@@ -108,7 +110,8 @@ def _metadata(sweep: SpectrumSweep) -> str:
 class SQLiteMeasurementSink(MeasurementSink):
     """One SQLite row per sweep, with atomic insert and durable reopen support."""
 
-    def __init__(self, path: str | Path, *, incident_retention: int = 1000):
+    def __init__(self, path: str | Path, *, incident_retention: int = 1000,
+                 monotonic=time.monotonic):
         if type(incident_retention) is not int or not 1 <= incident_retention <= 100_000:
             raise ValueError("incident_retention must be between 1 and 100000")
         self.path = Path(path)
@@ -117,6 +120,12 @@ class SQLiteMeasurementSink(MeasurementSink):
         self.failed_count = 0
         self.last_persisted_sweep_at: str | None = None
         self.storage_error: str | None = None
+        self._monotonic = monotonic
+        self._telemetry_lock = RLock()
+        self.write_count = 0
+        self.last_write_duration_seconds = None
+        self.max_write_duration_seconds = 0.0
+        self.total_write_duration_seconds = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             # Acquisition persistence runs on AsyncMeasurementSink's writer
@@ -182,6 +191,9 @@ class SQLiteMeasurementSink(MeasurementSink):
     def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt:
         if not isinstance(sweep, SpectrumSweep):
             raise MeasurementPersistenceError("Only SpectrumSweep records can be persisted")
+        timing_started = self._monotonic()
+        with self._telemetry_lock:
+            self.write_count += 1
         try:
             metadata = _metadata(sweep)
             started = _timestamp(sweep.started_at)
@@ -198,13 +210,21 @@ class SQLiteMeasurementSink(MeasurementSink):
                      len(sweep.frequencies_hz), frequencies if sweep.frequencies_hz else None,
                      len(sweep.powers), powers if sweep.powers else None),
                 )
-            self.persisted_count += 1
-            self.last_persisted_sweep_at = sweep.finished_at.isoformat()
-            self.storage_error = None
+            with self._telemetry_lock:
+                self.persisted_count += 1
+                self.last_persisted_sweep_at = sweep.finished_at.isoformat()
+                self.storage_error = None
         except (OSError, sqlite3.Error, TypeError, ValueError, struct.error) as error:
-            self.failed_count += 1
-            self.storage_error = "SQLite persistence failed"
+            with self._telemetry_lock:
+                self.failed_count += 1
+                self.storage_error = "SQLite persistence failed"
             raise MeasurementPersistenceError("Could not persist spectrum sweep") from error
+        finally:
+            duration = max(0.0, self._monotonic() - timing_started)
+            with self._telemetry_lock:
+                self.last_write_duration_seconds = duration
+                self.max_write_duration_seconds = max(self.max_write_duration_seconds, duration)
+                self.total_write_duration_seconds += duration
         return MeasurementReceipt(sweep.sweep_id, "persisted")
 
     def record_incident(self, *, component: str, classification: str,
@@ -253,11 +273,23 @@ class SQLiteMeasurementSink(MeasurementSink):
             db_size = self.path.stat().st_size
         except OSError:
             db_size = None
-        return {"last_persisted_sweep_at": self.last_persisted_sweep_at,
-                "persisted_sweeps": self.persisted_count,
-                "failed_persists": self.failed_count,
-                "sqlite_db_size_bytes": db_size,
-                "storage_error": self.storage_error}
+        with self._telemetry_lock:
+            return {"last_persisted_sweep_at": self.last_persisted_sweep_at,
+                    "persisted_sweeps": self.persisted_count,
+                    "failed_persists": self.failed_count,
+                    "sqlite_db_size_bytes": db_size,
+                    "storage_error": self.storage_error}
+
+    @property
+    def persistence_telemetry(self) -> dict:
+        with self._telemetry_lock:
+            return {"write_count": self.write_count,
+                    "last_write_duration_seconds": self.last_write_duration_seconds,
+                    "max_write_duration_seconds": self.max_write_duration_seconds,
+                    "total_write_duration_seconds": self.total_write_duration_seconds,
+                    "failed_persists": self.failed_count,
+                    "storage_error": self.storage_error,
+                    "status": "failed" if self.storage_error is not None else "ok"}
 
     def fetch_sweep(self, sweep_id: str) -> SpectrumSweep | None:
         try:

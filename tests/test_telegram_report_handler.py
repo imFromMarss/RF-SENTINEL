@@ -1,6 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from rf_sentinel.reporting import ReportData
+from rf_sentinel.observability import ObservabilityCoordinator
 from rf_sentinel.storage import SQLiteMeasurementSink
 from rf_sentinel.telegram import (
     LAST_HOUR_REPORT_BUTTON,
@@ -14,12 +17,16 @@ NOW = datetime(2026, 9, 9, 12, 34, 56, tzinfo=UTC)
 
 
 class PackageNotifier:
-    def __init__(self):
+    def __init__(self, status="sent", error=None):
         self.packages = []
+        self.status = status
+        self.error = error
 
     def send_package(self, package):
         self.packages.append(package)
-        return DeliveryResult("sent", {"report": 1, "waterfall": 2, "heatmap": 3})
+        if self.error is not None:
+            raise self.error
+        return DeliveryResult(self.status, {"report": 1, "waterfall": 2, "heatmap": 3})
 
 
 class SpyEngine:
@@ -101,3 +108,45 @@ def test_empty_real_storage_still_produces_report_package(tmp_path):
 
     assert handler.handle_update(update(user_id="unconfigured")).status == "delivered"
     assert notifier.packages[0].window_start == NOW - timedelta(hours=1)
+
+
+@pytest.mark.parametrize(
+    ("delivery_status", "handler_status", "metric"),
+    (("sent", "delivered", "success"),
+     ("partial", "partial", "partial"),
+     ("failed", "failed", "failure")),
+)
+def test_handler_telemetry_reflects_delivery_outcome(
+        tmp_path, delivery_status, handler_status, metric):
+    coordinator = ObservabilityCoordinator(clock=lambda: 0.0)
+    handler = TelegramReportHandler(
+        SpyEngine(empty_report()), PackageNotifier(delivery_status), tmp_path,
+        allowed_chat_ids=("100",), allowed_user_ids=("200",), timezone="UTC",
+        clock=lambda: NOW, coordinator=coordinator,
+    )
+
+    result = handler.handle_update(update())
+
+    assert result.status == handler_status
+    telemetry = coordinator.snapshot()["telegram"]["telegram_handler"]
+    assert telemetry[metric] == 1
+    assert telemetry["success"] == (1 if delivery_status == "sent" else 0)
+    assert telemetry["partial"] == (1 if delivery_status == "partial" else 0)
+    assert telemetry["failure"] == (1 if delivery_status == "failed" else 0)
+
+
+def test_handler_caught_internal_exception_is_failure_telemetry(tmp_path):
+    coordinator = ObservabilityCoordinator(clock=lambda: 0.0)
+    handler = TelegramReportHandler(
+        SpyEngine(empty_report()), PackageNotifier(error=RuntimeError("synthetic")), tmp_path,
+        allowed_chat_ids=("100",), allowed_user_ids=("200",), timezone="UTC",
+        clock=lambda: NOW, coordinator=coordinator,
+    )
+
+    result = handler.handle_update(update())
+
+    assert result.status == "failed"
+    telemetry = coordinator.snapshot()["telegram"]["telegram_handler"]
+    assert telemetry["success"] == 0
+    assert telemetry["partial"] == 0
+    assert telemetry["failure"] == 1

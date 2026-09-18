@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import pytest
 
 from rf_sentinel.errors import NotificationError
+from rf_sentinel.observability import ObservabilityCoordinator
 from rf_sentinel.telegram import TelegramNotifier
 from rf_sentinel.reporting import ReportPackage
 
@@ -125,6 +126,49 @@ def test_package_failure_keeps_artifacts_and_hides_secret(tmp_path):
     assert result.error_classification == "telegram"
     assert {path.name: path.read_bytes() for path in package(tmp_path).paths} == original
     assert token not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_metric"),
+    (("sent", "success"), ("partial", "partial"), ("failed", "failure")),
+)
+def test_delivery_outcome_telemetry_uses_delivery_result_status(
+        tmp_path, status, expected_metric):
+    connections = ([Connection(), Connection(), Connection()] if status == "sent" else
+                   [Connection(), Connection(status=503), Connection()] if status == "partial" else
+                   [Connection(status=503), Connection(status=503), Connection(status=503)])
+    coordinator = ObservabilityCoordinator(clock=lambda: 0.0)
+
+    def connect(host, timeout):
+        return connections.pop(0)
+
+    transport = TelegramNotifier("0:synthetic_dummy", "-1",
+                                 connection_factory=connect, coordinator=coordinator)
+    result = transport.send_package(package(tmp_path))
+
+    assert result.status == status
+    metric = coordinator.snapshot()["telegram"]["telegram_delivery"]
+    assert metric[expected_metric] == 1
+    assert metric["success"] == (1 if status == "sent" else 0)
+    assert metric["failure"] == (1 if status == "failed" else 0)
+    assert metric["partial"] == (1 if status == "partial" else 0)
+
+
+def test_delivery_exception_is_failure_telemetry(tmp_path):
+    class ExplodingNotifier(TelegramNotifier):
+        def _send_package(self, package):
+            raise RuntimeError("synthetic delivery exception")
+
+    coordinator = ObservabilityCoordinator(clock=lambda: 0.0)
+    transport = ExplodingNotifier("0:synthetic_dummy", "-1", coordinator=coordinator)
+
+    with pytest.raises(RuntimeError):
+        transport.send_package(package(tmp_path))
+
+    metric = coordinator.snapshot()["telegram"]["telegram_delivery"]
+    assert metric["success"] == 0
+    assert metric["partial"] == 0
+    assert metric["failure"] == 1
 
 
 @pytest.mark.parametrize("status,payload,failure", [

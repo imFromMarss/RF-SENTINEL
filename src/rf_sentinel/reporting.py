@@ -290,8 +290,9 @@ def completed_calendar_day(now: datetime, timezone: str = "Europe/Kyiv") -> tupl
 class SQLiteReportEngine:
     """Build report data from SQLite only, without an acquisition dependency."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, coordinator=None):
         self.path = Path(path)
+        self.coordinator = coordinator
 
     def build(self, start: datetime, end: datetime) -> ReportData:
         if (start.tzinfo is None or start.utcoffset() is None
@@ -301,14 +302,25 @@ class SQLiteReportEngine:
             raise ValueError("report window must be non-empty")
         snapshot = _PayloadFile()
         reader = SQLiteSweepReader(self.path)
-        ordered = []
-        counts = {outcome: 0 for outcome in ("success", "partial", "failed")}
-        expected = observed = 0
-        ranges = []
-        peak_frequency = peak_power = None
-        gaps = []
+        persisted = []
+        query_context = (self.coordinator.phase("query_load") if self.coordinator is not None
+                         else _NullSpan())
         try:
-            for item in reader.iter_sweeps(start, end):
+            with query_context:
+                for item in reader.iter_sweeps(start, end):
+                    persisted.append(item)
+        finally:
+            reader.close()
+        data_context = (self.coordinator.phase("data_build") if self.coordinator is not None
+                        else _NullSpan())
+        with data_context:
+            ordered = []
+            counts = {outcome: 0 for outcome in ("success", "partial", "failed")}
+            expected = observed = 0
+            ranges = []
+            peak_frequency = peak_power = None
+            gaps = []
+            for item in persisted:
                 counts[item.outcome] += 1
                 expected += item.coverage.expected_bins
                 observed += item.coverage.observed_bins
@@ -327,32 +339,30 @@ class SQLiteReportEngine:
                         item.sweep_id, item.started_at, item.finished_at, item.outcome,
                         item.coverage.fraction)
                 ordered.append(payload)
-        finally:
-            reader.close()
-        ordered = tuple(ordered)
-        payloads = ordered
-        coverage = observed / expected if expected else 0.0
-        frequency_range = ((min(value[0] for value in ranges), max(value[1] for value in ranges))
-                           if ranges else None)
-        if not ordered:
-            gaps.append(ReportGap(start, end, "window"))
-        else:
-            if ordered[0].started_at > start:
-                gaps.append(ReportGap(start, ordered[0].started_at, "leading",
-                                      next_sweep_id=ordered[0].sweep_id))
-            for previous, current in zip(ordered, ordered[1:]):
-                gap_start = max(previous.finished_at, start)
-                if current.started_at > gap_start:
-                    gaps.append(ReportGap(gap_start, current.started_at, "between",
-                                          previous.sweep_id, current.sweep_id))
-            if ordered[-1].finished_at < end:
-                gaps.append(ReportGap(ordered[-1].finished_at, end, "trailing",
-                                      previous_sweep_id=ordered[-1].sweep_id))
-        return ReportData(
-            start, end, len(ordered), counts["success"], counts["partial"], counts["failed"],
-            coverage, frequency_range, tuple(item.sweep_id for item in ordered),
-            peak_frequency, peak_power, payloads, tuple(gaps),
-        )
+            ordered = tuple(ordered)
+            payloads = ordered
+            coverage = observed / expected if expected else 0.0
+            frequency_range = ((min(value[0] for value in ranges), max(value[1] for value in ranges))
+                               if ranges else None)
+            if not ordered:
+                gaps.append(ReportGap(start, end, "window"))
+            else:
+                if ordered[0].started_at > start:
+                    gaps.append(ReportGap(start, ordered[0].started_at, "leading",
+                                          next_sweep_id=ordered[0].sweep_id))
+                for previous, current in zip(ordered, ordered[1:]):
+                    gap_start = max(previous.finished_at, start)
+                    if current.started_at > gap_start:
+                        gaps.append(ReportGap(gap_start, current.started_at, "between",
+                                              previous.sweep_id, current.sweep_id))
+                if ordered[-1].finished_at < end:
+                    gaps.append(ReportGap(ordered[-1].finished_at, end, "trailing",
+                                          previous_sweep_id=ordered[-1].sweep_id))
+            return ReportData(
+                start, end, len(ordered), counts["success"], counts["partial"], counts["failed"],
+                coverage, frequency_range, tuple(item.sweep_id for item in ordered),
+                peak_frequency, peak_power, payloads, tuple(gaps),
+            )
 
 
 def _report_limits(report: ReportData) -> tuple[float, float]:
@@ -953,7 +963,7 @@ def render_report_images(report: ReportData, waterfall: str | Path,
 
 
 def generate_report_package(report: ReportData, destination: str | Path,
-                            timezone: str = "Europe/Kyiv") -> ReportPackage:
+                            timezone: str = "Europe/Kyiv", *, coordinator=None) -> ReportPackage:
     """Write the complete four-file package from ReportData only."""
     directory = Path(destination)
     directory.mkdir(parents=True, exist_ok=True)
@@ -961,13 +971,26 @@ def generate_report_package(report: ReportData, destination: str | Path,
     report_txt = directory / "report.txt"
     waterfall = directory / "waterfall.png"
     heatmap = directory / "heatmap.png"
-    with report_json.open("w", encoding="utf-8") as stream:
-        _write_json(stream, report)
-        stream.write("\n")
-    report_txt.write_text(report.to_text(timezone) + "\n", encoding="utf-8")
-    render_report_images(report, waterfall, heatmap, timezone)
-    return ReportPackage(directory, report_json, report_txt, waterfall, heatmap,
-                         report.window_start, report.window_end)
+    render_context = coordinator.phase("render") if coordinator is not None else _NullSpan()
+    with render_context:
+        report_txt.write_text(report.to_text(timezone) + "\n", encoding="utf-8")
+        render_report_images(report, waterfall, heatmap, timezone)
+    package_context = coordinator.phase("package") if coordinator is not None else _NullSpan()
+    with package_context:
+        with report_json.open("w", encoding="utf-8") as stream:
+            _write_json(stream, report)
+            stream.write("\n")
+        package = ReportPackage(directory, report_json, report_txt, waterfall, heatmap,
+                                report.window_start, report.window_end)
+    return package
+
+
+class _NullSpan:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 def duration_text(seconds: float) -> str:

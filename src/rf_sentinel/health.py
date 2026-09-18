@@ -18,6 +18,7 @@ class AcquisitionHealth:
     cadence_budget_seconds: float
     recovery_delay_seconds: float
     application_status: str = "starting"
+    shutdown_status: str = "unknown"
     started_at: str | None = None
     last_sweep_started_at: str | None = None
     last_sweep_completed_at: str | None = None
@@ -53,6 +54,11 @@ class AcquisitionHealth:
     consecutive_report_failures: int = 0
     last_successful_report_at: str | None = None
     last_report_error_reason: str | None = None
+    resource_telemetry: dict | None = None
+    resource_aggregates: dict | None = None
+    cadence_telemetry: dict | None = None
+    queue_telemetry: dict | None = None
+    persistence_telemetry: dict | None = None
 
     @classmethod
     def started(cls) -> "AcquisitionHealth":

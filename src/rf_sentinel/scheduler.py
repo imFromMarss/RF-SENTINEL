@@ -115,7 +115,7 @@ class ScheduledReportRunner:
                  delivery_attempts: int = 1, sleeper: Callable[[float], object] | None = None,
                  storage=None, health_path: str | Path | None = None,
                  state: AcquisitionHealth | None = None,
-                 health_owner: HealthOwner | None = None):
+                 health_owner: HealthOwner | None = None, coordinator=None):
         if delivery_attempts < 1:
             raise ValueError("delivery_attempts must be positive")
         self.report_engine = report_engine
@@ -128,6 +128,7 @@ class ScheduledReportRunner:
         self.sleeper = sleeper
         self.state_path = self.data_dir / "reports" / "scheduled" / "delivery-state.json"
         self.health_owner = health_owner
+        self.coordinator = coordinator
         self.health_path = Path(health_path or self.data_dir / "status" / "health.json")
         self.state = state or (health_owner.state if health_owner is not None else
                                load_health_snapshot(self.health_path))
@@ -213,12 +214,19 @@ class ScheduledReportRunner:
         key = self._key(kind, start, end)
         if key in self._delivered:
             return False
+        report_context = (self.coordinator.span("report")
+                          if self.coordinator is not None else _NullSpan())
         try:
-            report = self.report_engine.build(start, end)
-            destination = (self.data_dir / "reports" / "scheduled" / kind /
-                           f"{start.astimezone(self.zone):%Y%m%dT%H%M%S}-"
-                           f"{end.astimezone(self.zone):%Y%m%dT%H%M%S}")
-            package = generate_report_package(report, destination, self.timezone)
+            with report_context:
+                report = self.report_engine.build(start, end)
+                destination = (self.data_dir / "reports" / "scheduled" / kind /
+                               f"{start.astimezone(self.zone):%Y%m%dT%H%M%S}-"
+                               f"{end.astimezone(self.zone):%Y%m%dT%H%M%S}")
+                if self.coordinator is None:
+                    package = generate_report_package(report, destination, self.timezone)
+                else:
+                    package = generate_report_package(report, destination, self.timezone,
+                                                      coordinator=self.coordinator)
         except MeasurementPersistenceError:
             logger.error("Scheduled %s report persistence failed", kind)
             self._failure("report_persistence", "Не вдалося зберегти стан запланованого звіту")
@@ -244,6 +252,8 @@ class ScheduledReportRunner:
         try:
             delivery = None
             for attempt in range(self.delivery_attempts):
+                if attempt and self.coordinator is not None:
+                    self.coordinator.record_retry("telegram_delivery")
                 delivery = self.notifier.send_package(package)
                 if getattr(delivery, "status", None) == "sent":
                     break
@@ -305,6 +315,14 @@ def run_report_scheduler(runner: ScheduledReportRunner, stop: Event,
 
 
 class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _NullSpan:
     def __enter__(self):
         return self
 

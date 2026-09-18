@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
+import time
 from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, Callable, Protocol
@@ -71,7 +72,7 @@ class TelegramReportHandler:
     def __init__(self, report_engine, notifier, data_dir: str | Path,
                  *, allowed_chat_ids: tuple[str, ...] = (),
                  allowed_user_ids: tuple[str, ...] = (),
-                 timezone: str = "Europe/Kyiv", clock=None):
+                 timezone: str = "Europe/Kyiv", clock=None, coordinator=None):
         self.report_engine = report_engine
         self.notifier = notifier
         self.data_dir = Path(data_dir)
@@ -79,19 +80,25 @@ class TelegramReportHandler:
         self.allowed_user_ids = frozenset(str(value) for value in allowed_user_ids)
         self.timezone = timezone
         self.clock = clock or (lambda: datetime.now(UTC))
+        self.coordinator = coordinator
 
     @classmethod
-    def from_settings(cls, settings, notifier, *, clock=None):
+    def from_settings(cls, settings, notifier, *, clock=None, coordinator=None):
         from rf_sentinel.reporting import SQLiteReportEngine
 
         allowed_chats = settings.telegram_allowed_chat_ids or (
             (settings.telegram_chat_id,) if settings.telegram_chat_id else ()
         )
+        report_engine = SQLiteReportEngine(settings.sweeps_path)
+        try:
+            report_engine.coordinator = coordinator
+        except AttributeError:
+            pass
         return cls(
-            SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
+            report_engine, notifier, settings.data_dir,
             allowed_chat_ids=allowed_chats,
             allowed_user_ids=settings.telegram_allowed_user_ids,
-            timezone=settings.timezone, clock=clock,
+            timezone=settings.timezone, clock=clock, coordinator=coordinator,
         )
 
     @staticmethod
@@ -125,18 +132,26 @@ class TelegramReportHandler:
 
         end = self.clock()
         start, end = last_hour_window(end)
-        try:
-            report = self.report_engine.build(start, end)
-            destination = self.data_dir / "reports" / "last-hour" / end.strftime(
-                "%Y%m%dT%H%M%S.%fZ")
-            package = generate_report_package(report, destination, self.timezone)
-            delivery = self.notifier.send_package(package)
-            return InboundReportResult("delivered", delivery)
-        except Exception as error:
-            # The boundary exposes no paths, credentials, IDs, or raw exceptions.
-            logger.error("Telegram: last-hour report request failed (%s)",
-                         type(error).__name__)
-            return InboundReportResult("failed")
+        context = self.coordinator.span("telegram_handler") if self.coordinator else _NullSpan()
+        with context as telemetry:
+            try:
+                report_context = (self.coordinator.span("report")
+                                  if self.coordinator is not None else _NullSpan())
+                with report_context:
+                    report = self.report_engine.build(start, end)
+                    destination = self.data_dir / "reports" / "last-hour" / end.strftime(
+                        "%Y%m%dT%H%M%S.%fZ")
+                    package = generate_report_package(report, destination, self.timezone,
+                                                      coordinator=self.coordinator)
+                delivery = self.notifier.send_package(package)
+                telemetry.value = delivery.status
+                handler_status = {"sent": "delivered", "partial": "partial",
+                                  "failed": "failed"}.get(delivery.status, "failed")
+                return InboundReportResult(handler_status, delivery)
+            except Exception as error:
+                telemetry.value = "failed"
+                logger.error("Telegram: last-hour report request failed (%s)", type(error).__name__)
+                return InboundReportResult("failed")
 
 
 class TelegramPollingRuntime:
@@ -151,7 +166,8 @@ class TelegramPollingRuntime:
                  *, connection_factory=None, http_timeout: float = 15,
                  long_poll_timeout: int = 5, attempts: int = 3,
                  backoff_seconds: float = 5,
-                 sleeper: Callable[[float], object] | None = None):
+                 sleeper: Callable[[float], object] | None = None, coordinator=None,
+                 clock=None):
         if not token:
             raise NotificationError("Потрібні облікові дані Telegram")
         if not 0 < http_timeout <= 60:
@@ -172,7 +188,9 @@ class TelegramPollingRuntime:
         self.backoff_seconds = backoff_seconds
         self.sleeper = sleeper or self.stop.wait
         self.offset: int | None = None
+        self.clock = clock or time.monotonic
         self._transport_get_updates = getattr(handler.notifier, "get_updates", None)
+        self.coordinator = coordinator or getattr(handler, "coordinator", None)
 
     def _get_updates(self) -> list[dict]:
         if self._transport_get_updates is not None:
@@ -210,9 +228,11 @@ class TelegramPollingRuntime:
 
     def poll_once(self) -> int:
         """Fetch and dispatch one batch; return the number of accepted updates."""
+        started = self.clock()
         updates = None
         for attempt in range(1, self.attempts + 1):
             if self.stop.is_set():
+                self._record_polling(started, False)
                 return 0
             try:
                 updates = self._get_updates()
@@ -220,10 +240,14 @@ class TelegramPollingRuntime:
             except NotificationError:
                 if attempt == self.attempts:
                     logger.warning("Telegram inbound polling failed; monitoring continues")
+                    self._record_polling(started, False)
                     return 0
+                if self.coordinator is not None:
+                    self.coordinator.record_retry("telegram_polling")
                 logger.warning("Telegram inbound polling failed; retry %d/%d",
                                attempt + 1, self.attempts)
                 self.sleeper(self.backoff_seconds)
+        self._record_polling(started, True)
         accepted = 0
         for update in updates or ():
             update_id = update.get("update_id")
@@ -239,6 +263,10 @@ class TelegramPollingRuntime:
                 accepted += 1
         return accepted
 
+    def _record_polling(self, started, success):
+        if self.coordinator is not None:
+            self.coordinator.record_polling(max(0.0, self.clock() - started), success)
+
     def run(self) -> None:
         """Poll until stopped; failures never terminate the monitoring process."""
         while not self.stop.is_set():
@@ -246,7 +274,7 @@ class TelegramPollingRuntime:
 
 
 class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str, *, connection_factory=None):
+    def __init__(self, token: str, chat_id: str, *, connection_factory=None, coordinator=None):
         # Перевірка діє і для викликів поза точкою складання application.
         from rf_sentinel.config import Settings
 
@@ -256,6 +284,7 @@ class TelegramNotifier:
         self._token = token
         self._chat_id = chat_id
         self._connection_factory = connection_factory or http.client.HTTPSConnection
+        self.coordinator = coordinator
 
     def get_updates(self, offset: int | None, timeout: int, limit: int) -> list[dict]:
         """Fetch inbound updates through the same Bot API transport boundary."""
@@ -386,6 +415,13 @@ class TelegramNotifier:
         Each item is independent; retry/backoff remains at the existing
         workflow boundary around this single delivery operation.
         """
+        context = self.coordinator.span("telegram_delivery") if self.coordinator else _NullSpan()
+        with context as telemetry:
+            result = self._send_package(package)
+            telemetry.value = result.status
+            return result
+
+    def _send_package(self, package: "ReportPackage") -> DeliveryResult:
         message_ids: dict[str, int | None] = {
             "report": None, "waterfall": None, "heatmap": None,
         }
@@ -416,3 +452,14 @@ class TelegramNotifier:
     deliver = send_package
     deliver_package = send_package
     send_report_package = send_package
+
+
+class _NullSpan:
+    def __init__(self):
+        self.value = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False

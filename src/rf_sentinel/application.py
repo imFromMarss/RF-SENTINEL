@@ -7,42 +7,88 @@ from pathlib import Path
 import signal
 import socket
 import sys
-from threading import Event, Thread
+import time
+from threading import Event, Lock, Thread
 
 from rf_sentinel.config import Settings
 from rf_sentinel.errors import SentinelError
 
 
-def configure_logging(data_dir: Path, max_bytes: int = 5_000_000, backups: int = 3) -> None:
+def configure_logging(data_dir: Path, max_bytes: int = 5_000_000, backups: int = 3,
+                      level: str = "INFO") -> None:
     from rf_sentinel.observability import configure_operational_logging
-    configure_operational_logging(data_dir / "logs", max_bytes, backups)
+    configure_operational_logging(data_dir / "logs", max_bytes, backups, level)
 
 
 def _shutdown_signal(signum, frame) -> None:
     raise KeyboardInterrupt
 
 
-def _start_telegram_polling(settings: Settings, stop: Event, notifier):
+def _bounded_close(resource, *, deadline: float, thread_name: str):
+    """Close one station-owned resource without waiting past an absolute deadline."""
+    outcome = {"started_at": time.monotonic()}
+
+    def close_resource():
+        try:
+            resource.close()
+        except BaseException as error:
+            outcome["error"] = error
+        finally:
+            # Only the helper can state when downstream close actually ended.
+            # Caller observation after join is not a completion timestamp.
+            outcome["completed_at"] = time.monotonic()
+
+    close_thread = Thread(target=close_resource, name=thread_name, daemon=True)
+    close_thread.start()
+    close_thread.join(max(0.0, deadline - time.monotonic()))
+    if close_thread.is_alive():
+        return "incomplete", TimeoutError(f"{thread_name} did not close before deadline")
+    completed_at = outcome.get("completed_at")
+    if completed_at is None or completed_at > deadline:
+        return "incomplete", TimeoutError(f"{thread_name} completed after deadline")
+    if "error" in outcome:
+        return "failed", outcome["error"]
+    return "complete", None
+
+
+def _start_telegram_polling(settings: Settings, stop: Event, notifier, *, on_failure=None):
     """Attach inbound Telegram to a long-running application mode."""
     if not settings.telegram_enabled:
         return None
     from rf_sentinel.telegram import TelegramPollingRuntime, TelegramReportHandler
 
-    handler = TelegramReportHandler.from_settings(settings, notifier)
+    coordinator = getattr(notifier, "coordinator", None)
+    handler = TelegramReportHandler.from_settings(settings, notifier, coordinator=coordinator)
     runtime = TelegramPollingRuntime(
         settings.telegram_bot_token, handler, stop,
         attempts=settings.telegram_attempts,
         backoff_seconds=settings.telegram_backoff_seconds,
+        coordinator=coordinator,
     )
-    thread = Thread(target=runtime.run, name="telegram-inbound", daemon=True)
+    def run_managed():
+        try:
+            runtime.run()
+        except BaseException as error:
+            if on_failure is None:
+                raise
+            on_failure(error)
+            return
+        if not stop.is_set() and on_failure is not None:
+            on_failure(None)
+
+    thread = Thread(target=run_managed, name="telegram-inbound", daemon=True)
     thread.start()
     return thread
 
 
-def _stop_telegram_polling(thread, stop: Event) -> None:
+def _stop_telegram_polling(thread, stop: Event, *, deadline: float | None = None) -> None:
     stop.set()
     if thread is not None:
-        thread.join(timeout=20)
+        stop_runtime = getattr(thread, "stop", None)
+        if stop_runtime is not None:
+            stop_runtime()
+        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        thread.join(timeout=timeout)
 
 
 class _StationProcessLock:
@@ -75,7 +121,8 @@ class _StationProcessLock:
 
 def run_station(settings: Settings) -> int:
     """Acquire the station lock, then run the unified station lifecycle."""
-    configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
+    configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups,
+                      settings.log_level)
     lock = _StationProcessLock(settings.data_dir / "station.lock")
     if not lock.acquire():
         logging.getLogger("rf_sentinel.application").error(
@@ -91,7 +138,8 @@ def _run_station_lifecycle(settings: Settings) -> int:
     """Run acquisition, scheduled reports, and inbound Telegram in one process."""
     from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumAcquisitionWorker, SweepProfile
     from rf_sentinel.health import AcquisitionHealth, HealthOwner
-    from rf_sentinel.observability import AcquisitionObserver
+    from rf_sentinel.observability import (AcquisitionObserver, LinuxResourceSampler,
+                                           ObservabilityCoordinator, RunSummaryWriter)
     from rf_sentinel.reporting import SQLiteReportEngine
     from rf_sentinel.rtl_power import RTLPowerScanner
     from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler
@@ -99,6 +147,13 @@ def _run_station_lifecycle(settings: Settings) -> int:
     from rf_sentinel.telegram import TelegramNotifier
 
     stop = Event()
+    coordinator = ObservabilityCoordinator()
+    summary = RunSummaryWriter(settings.data_dir / "status" / "run-summary.json")
+    try:
+        summary.write_start_marker()
+    except (OSError, ValueError, TypeError):
+        logging.getLogger("rf_sentinel.application").exception(
+            "Run summary startup marker write failed; station continues")
     health_path = settings.data_dir / "status" / "health.json"
     profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,
                            settings.acquisition_bin_hz)
@@ -110,31 +165,86 @@ def _run_station_lifecycle(settings: Settings) -> int:
         settings.sweeps_path, incident_retention=settings.incident_retention)
     report_storage = SQLiteMeasurementSink(
         settings.sweeps_path, incident_retention=settings.incident_retention)
-    sink = AsyncMeasurementSink(acquisition_storage, close_downstream=False,
+    # The async sink is the sole lifecycle owner of acquisition storage.  Its
+    # bounded close drains the writer and closes SQLite against one deadline.
+    sink = AsyncMeasurementSink(acquisition_storage,
                                 thread_name="station-measurement-writer")
     observer = AcquisitionObserver(health_path, profile,
                                    settings.acquisition_cadence_budget_seconds,
                                    settings.acquisition_recovery_seconds, storage=acquisition_storage,
-                                   health_owner=health)
+                                   health_owner=health, coordinator=coordinator)
     worker = SpectrumAcquisitionWorker(
         RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain, stop=stop), sink,
         profile, observer, stop, settings.acquisition_cadence_budget_seconds,
         settings.acquisition_recovery_seconds,
+        sink_lifecycle_owner="station",
     )
-    notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
+    notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id,
+                                 coordinator=coordinator)
                 if settings.telegram_enabled else None)
+    report_engine = SQLiteReportEngine(settings.sweeps_path)
+    try:
+        report_engine.coordinator = coordinator
+    except AttributeError:
+        pass
     runner = ScheduledReportRunner(
-        SQLiteReportEngine(settings.sweeps_path), notifier, settings.data_dir,
+        report_engine, notifier, settings.data_dir,
         timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
         storage=report_storage, health_path=health_path, state=state, health_owner=health,
+        coordinator=coordinator,
     )
+    resource_sampler = LinuxResourceSampler(
+        health, settings.resource_sampling_interval_seconds)
+    component_failures = []
+    component_failure_lock = Lock()
+    final_sink_snapshot = None
+    exit_code = 0
+
+    def record_component_failure(label, error, *, category=None, code=None, message=None,
+                                 only_if_stop_unset=False):
+        with component_failure_lock:
+            if only_if_stop_unset and stop.is_set():
+                return False
+            component_failures.append({
+                "timestamp": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+                "component": label,
+                "category": category or type(error).__name__,
+                "code": code if code is not None else getattr(error, "code", None),
+                "message": message if message is not None else str(error),
+                "correlation_id": getattr(error, "correlation_id", None),
+            })
+            state.application_status = "failed"
+            stop.set()
+            return True
 
     def run_component(label, operation):
         try:
             operation()
-        except BaseException:
+        except BaseException as error:
+            record_component_failure(label, error)
             logging.getLogger("rf_sentinel.application").exception(
                 "Station component stopped unexpectedly: %s", label)
+        else:
+            message = f"{label} runtime exited before coordinated stop"
+            if record_component_failure(
+                    label, RuntimeError(message), category="runtime",
+                    code="premature_exit", message=message,
+                    only_if_stop_unset=True):
+                logging.getLogger("rf_sentinel.application").error(message)
+
+    def telegram_runtime_failure(error):
+        if error is None:
+            record_component_failure(
+                "telegram", RuntimeError("Telegram runtime exited before coordinated stop"),
+                category="runtime", code="premature_exit",
+                message="Telegram runtime exited before coordinated stop",
+            )
+            logging.getLogger("rf_sentinel.application").error(
+                "Telegram runtime exited before coordinated stop")
+        else:
+            record_component_failure("telegram", error)
+            logging.getLogger("rf_sentinel.application").error(
+                "Telegram runtime stopped unexpectedly: %s", type(error).__name__)
 
     acquisition_thread = Thread(target=run_component, args=("acquisition", worker.run),
                                  name="station-acquisition")
@@ -154,37 +264,222 @@ def _run_station_lifecycle(settings: Settings) -> int:
             "RF Sentinel station started: acquisition, reports, and Telegram lifecycle shared")
         acquisition_thread.start()
         report_thread.start()
+        resource_sampler.start()
         if settings.telegram_enabled:
-            inbound_thread = _start_telegram_polling(settings, stop, notifier)
+            inbound_thread = _start_telegram_polling(
+                settings, stop, notifier, on_failure=telegram_runtime_failure)
         while not stop.wait(0.2):
             if not acquisition_thread.is_alive() and not report_thread.is_alive():
                 stop.set()
     finally:
+        shutdown_deadline = time.monotonic() + 30
+
+        def shutdown_failure(component, reason, code="incomplete"):
+            component_failures.append({
+                "timestamp": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+                "component": component,
+                "category": "shutdown",
+                "code": code,
+                "message": reason,
+            })
+            state.application_status = "failed"
+            state.shutdown_status = "incomplete"
+
+        def remaining_shutdown_budget():
+            return max(0.0, shutdown_deadline - time.monotonic())
+
         stop.set()
-        acquisition_thread.join(timeout=30)
-        report_thread.join(timeout=10)
-        _stop_telegram_polling(inbound_thread, stop)
-        if acquisition_thread.is_alive() or report_thread.is_alive():
-            logging.getLogger("rf_sentinel.application").error(
-                "Station shutdown exceeded component deadline")
         try:
-            sink.close(timeout=10)
-        except BaseException:
-            logging.getLogger("rf_sentinel.application").exception(
-                "Station measurement sink close failed")
+            sampler_stopped = resource_sampler.stop(timeout_seconds=remaining_shutdown_budget())
+        except BaseException as error:
+            sampler_stopped = False
+            shutdown_failure("resource-sampler", f"Resource telemetry sampler failed to stop: {type(error).__name__}")
+        if not sampler_stopped:
+            if not any(item["component"] == "resource-sampler" for item in component_failures):
+                shutdown_failure("resource-sampler", "Resource telemetry sampler did not stop before shared shutdown deadline")
         try:
-            acquisition_storage.close()
-        except BaseException:
-            logging.getLogger("rf_sentinel.application").exception(
-                "Station acquisition SQLite close failed")
+            acquisition_thread.join(timeout=remaining_shutdown_budget())
+        except BaseException as error:
+            shutdown_failure(
+                "acquisition", f"Acquisition worker join failed: {type(error).__name__}",
+                code="shutdown_error")
         try:
-            report_storage.close()
-        except BaseException:
+            acquisition_stopped = not acquisition_thread.is_alive()
+        except BaseException as error:
+            acquisition_stopped = False
+            shutdown_failure(
+                "acquisition", f"Acquisition worker alive check failed: {type(error).__name__}",
+                code="shutdown_error")
+        if not acquisition_stopped:
+            if not any(item["component"] == "acquisition" and
+                       item["category"] == "shutdown" for item in component_failures):
+                shutdown_failure(
+                    "acquisition", "Acquisition worker remained alive after shared shutdown deadline")
+        try:
+            report_thread.join(timeout=remaining_shutdown_budget())
+        except BaseException as error:
+            shutdown_failure(
+                "report-scheduler", f"Report scheduler join failed: {type(error).__name__}",
+                code="shutdown_error")
+        try:
+            report_stopped = not report_thread.is_alive()
+        except BaseException as error:
+            report_stopped = False
+            shutdown_failure(
+                "report-scheduler", f"Report scheduler alive check failed: {type(error).__name__}",
+                code="shutdown_error")
+        if not report_stopped and not any(
+                item["component"] == "report-scheduler" and
+                item["category"] == "shutdown" for item in component_failures):
+            shutdown_failure("report-scheduler", "Report scheduler remained alive after shared shutdown deadline")
+        try:
+            _stop_telegram_polling(inbound_thread, stop, deadline=shutdown_deadline)
+        except BaseException as error:
+            shutdown_failure(
+                "telegram", f"Telegram runtime stop/join failed: {type(error).__name__}",
+                code="shutdown_error")
             logging.getLogger("rf_sentinel.application").exception(
-                "Station report SQLite close failed")
+                "Telegram runtime stop/join failed")
+        try:
+            telegram_alive = inbound_thread is not None and inbound_thread.is_alive()
+        except BaseException as error:
+            telegram_alive = False
+            shutdown_failure(
+                "telegram", f"Telegram runtime alive check failed: {type(error).__name__}",
+                code="shutdown_error")
+            logging.getLogger("rf_sentinel.application").exception(
+                "Telegram runtime alive check failed")
+        if telegram_alive:
+            shutdown_failure(
+                "telegram", "Telegram polling thread remained alive after shared shutdown deadline")
+        if acquisition_stopped:
+            try:
+                sink.close(deadline=shutdown_deadline)
+            except BaseException as error:
+                shutdown_failure(
+                    "storage", f"Measurement sink failed to stop cleanly: {type(error).__name__}",
+                    code="shutdown_error")
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Station measurement sink close failed")
+        else:
+            shutdown_failure(
+                "storage",
+                "Measurement sink close skipped because acquisition producer may still enqueue",
+            )
+        incidents = []
+        incident_source = "available"
+        try:
+            # The existing incident table is already retention-bounded.  Read
+            # its chronological view and let the summary keep only the newest
+            # bounded tail.
+            incidents = report_storage.query_incidents()
+        except BaseException:
+            incident_source = "unavailable"
+            logging.getLogger("rf_sentinel.application").exception(
+                "Run summary incident history read failed; shutdown continues")
+        try:
+            report_close_status, report_close_error = _bounded_close(
+                report_storage, deadline=shutdown_deadline,
+                thread_name="station-report-storage-close")
+        except BaseException as error:
+            shutdown_failure(
+                "report-storage", f"Station report SQLite close failed: {type(error).__name__}",
+                code="shutdown_error")
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station report SQLite bounded close failed")
+        else:
+            if report_close_status != "complete":
+                error_name = type(report_close_error).__name__
+                reason = ("Station report SQLite close did not finish before shared shutdown "
+                          "deadline" if report_close_status == "incomplete" else
+                          f"Station report SQLite close failed: {error_name}")
+                shutdown_failure(
+                    "report-storage", reason,
+                    code=("incomplete" if report_close_status == "incomplete"
+                          else "shutdown_error"))
+                if report_close_status == "failed":
+                    logging.getLogger("rf_sentinel.application").error(
+                        "Station report SQLite close failed: %s", error_name)
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    return 0
+
+        # All owned storage close outcomes are known before the one final
+        # capture.  Health and run-summary consume this same detached value.
+        storage_shutdown_incomplete = any(
+            item["component"] in {"storage", "report-storage"}
+            and item["category"] == "shutdown"
+            for item in component_failures
+        )
+        state.application_status = "failed" if component_failures else "stopped"
+        state.shutdown_status = "incomplete" if component_failures else "complete"
+        try:
+            final_sink_snapshot = observer.capture_final_sink_snapshot(sink)
+            if final_sink_snapshot is not None and storage_shutdown_incomplete:
+                final_sink_snapshot["shutdown_complete"] = False
+                final_sink_snapshot["shutdown_status"] = "incomplete"
+        except BaseException as error:
+            shutdown_failure(
+                "storage", f"Final measurement sink snapshot failed: {type(error).__name__}")
+            logging.getLogger("rf_sentinel.application").exception(
+                "Final measurement sink snapshot capture failed")
+        if final_sink_snapshot is None and not any(
+                item["component"] == "storage" and item["category"] == "shutdown"
+                for item in component_failures):
+            shutdown_failure("storage", "Final measurement sink snapshot unavailable")
+
+        sink_failure = summary._sink_shutdown_failure(final_sink_snapshot)
+        final_non_clean = bool(component_failures or sink_failure is not None)
+        state.application_status = "failed" if final_non_clean else "stopped"
+        state.shutdown_status = "incomplete" if final_non_clean else "complete"
+        if final_sink_snapshot is not None:
+            try:
+                observer.publish_final_sink_snapshot(final_sink_snapshot)
+            except BaseException as error:
+                shutdown_failure("health-publication",
+                                 f"Final health snapshot publication failed: {type(error).__name__}",
+                                 code="publication_failed")
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Final measurement sink health snapshot publication failed")
+                try:
+                    # The publication failure itself changes the canonical
+                    # outcome. Reuse the same detached sink snapshot to make
+                    # that non-clean result visible when the writer recovers.
+                    observer.publish_final_sink_snapshot(final_sink_snapshot)
+                except BaseException:
+                    logging.getLogger("rf_sentinel.application").exception(
+                        "Corrective health publication after health failure failed")
+        else:
+            try:
+                observer.save()
+            except BaseException as error:
+                shutdown_failure("health-publication",
+                                 f"Final health snapshot publication failed: {type(error).__name__}",
+                                 code="publication_failed")
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Final health publication without sink snapshot failed")
+        try:
+            summary.write(settings=settings, state=state, coordinator=coordinator,
+                          status=("failed" if component_failures else "stopped"),
+                          component_failures=component_failures,
+                          incidents=incidents, incident_source=incident_source,
+                          sink_snapshot=final_sink_snapshot)
+        except (OSError, ValueError, TypeError):
+            exit_code = 1
+            state.application_status = "failed"
+            logging.getLogger("rf_sentinel.application").exception(
+                "Run summary write failed; shutdown continues")
+            try:
+                # Health was already published before the summary attempt.
+                # Correct it with the same detached sink snapshot; never
+                # resample or re-close the sink on this failure path.
+                if final_sink_snapshot is not None:
+                    observer.publish_final_sink_snapshot(final_sink_snapshot)
+                else:
+                    observer.save()
+            except BaseException:
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Corrective health publication after run summary failure failed")
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -206,7 +501,8 @@ def main(argv: list[str] | None = None) -> int:
             from rf_sentinel.scheduler import ScheduledReportRunner, run_report_scheduler
             from rf_sentinel.telegram import TelegramNotifier
 
-            configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups)
+            configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups,
+                              settings.log_level)
             from rf_sentinel.storage import SQLiteMeasurementSink
             notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
                         if settings.telegram_enabled else None)
@@ -250,11 +546,11 @@ def main(argv: list[str] | None = None) -> int:
             send_failure_reports=args.mode == "survey",
         )
         if args.mode == "survey":
-            configure_logging(settings.data_dir)
+            configure_logging(settings.data_dir, level=settings.log_level)
             outcome = workflow.run()
             print(f"Огляд: {outcome.scan_status}; Telegram: {outcome.notification_status}")
             return 0 if outcome.scan_status == "success" else 1
-        configure_logging(settings.data_dir)
+        configure_logging(settings.data_dir, level=settings.log_level)
         logger = logging.getLogger("rf_sentinel.application")
         logger.info("RF Sentinel запущено; конфігурацію перевірено; monitoring активний")
         stop = Event()
@@ -284,18 +580,23 @@ def main(argv: list[str] | None = None) -> int:
 def run_acquisition(settings: Settings) -> int:
     """Складає незалежний acquisition без імпорту reporting і Telegram."""
     from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumAcquisitionWorker, SweepProfile
-    from rf_sentinel.observability import AcquisitionObserver, configure_operational_logging
+    from rf_sentinel.health import AcquisitionHealth, HealthOwner
+    from rf_sentinel.observability import (AcquisitionObserver, LinuxResourceSampler,
+                                           configure_operational_logging)
     from rf_sentinel.rtl_power import RTLPowerScanner
     from rf_sentinel.storage import SQLiteMeasurementSink
 
     configure_operational_logging(settings.data_dir / "logs", settings.log_max_bytes,
-                                  settings.log_backups)
+                                  settings.log_backups, settings.log_level)
     profile = SweepProfile(settings.acquisition_low_hz, settings.acquisition_high_hz,
                            settings.acquisition_bin_hz)
     stop = Event()
     previous = {}
     storage = None
     sink = None
+    health = None
+    resource_sampler = None
+    worker = None
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.getsignal(sig)
@@ -303,25 +604,56 @@ def run_acquisition(settings: Settings) -> int:
         storage = SQLiteMeasurementSink(settings.sweeps_path,
                                         incident_retention=settings.incident_retention)
         sink = AsyncMeasurementSink(storage, close_downstream=False)
+        health = HealthOwner(
+            settings.data_dir / "status" / "health.json",
+            AcquisitionHealth("rtl_power", profile.low_hz, profile.high_hz, profile.bin_hz,
+                              settings.acquisition_cadence_budget_seconds,
+                              settings.acquisition_recovery_seconds),
+        )
         observer = AcquisitionObserver(settings.data_dir / "status" / "health.json", profile,
                                        settings.acquisition_cadence_budget_seconds,
-                                       settings.acquisition_recovery_seconds, storage=storage)
-        SpectrumAcquisitionWorker(
+                                       settings.acquisition_recovery_seconds, storage=storage,
+                                       health_owner=health)
+        resource_sampler = LinuxResourceSampler(
+            health, settings.resource_sampling_interval_seconds)
+        health.save()
+        resource_sampler.start()
+        worker = SpectrumAcquisitionWorker(
             RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain), sink,
             profile, observer, stop, settings.acquisition_cadence_budget_seconds,
             settings.acquisition_recovery_seconds,
-        ).run()
+        )
+        worker.run()
         return 0
     except OSError:
         logging.getLogger(__name__).error("Помилка запису operational artifacts")
         return 1
     finally:
+        if resource_sampler is not None:
+            resource_sampler.stop(timeout_seconds=5)
         if sink is not None:
             try:
-                sink.close(timeout=10)
+                deadline = getattr(worker, "shutdown_deadline", None)
+                if deadline is None:
+                    sink.close(timeout=10)
+                else:
+                    sink.close(deadline=deadline)
             except BaseException:
                 logging.getLogger(__name__).exception(
                     "Acquisition measurement sink close failed")
+        final_sink_snapshot = None
+        if health is not None and sink is not None:
+            try:
+                final_sink_snapshot = observer.capture_final_sink_snapshot(sink)
+            except BaseException:
+                logging.getLogger(__name__).exception(
+                    "Final acquisition measurement sink snapshot capture failed")
+            if final_sink_snapshot is not None:
+                try:
+                    observer.publish_final_sink_snapshot(final_sink_snapshot)
+                except BaseException:
+                    logging.getLogger(__name__).exception(
+                        "Final acquisition measurement sink health snapshot publication failed")
         if storage is not None:
             try:
                 storage.close()

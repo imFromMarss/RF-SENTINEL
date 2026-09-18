@@ -10,6 +10,28 @@ from typing import Mapping
 from rf_sentinel.errors import ConfigurationError
 
 
+# This is the single policy used when configuration is exported to operational
+# artifacts.  Keep identifier-bearing fields here even though they are not
+# credentials: they are still personal/authorization data.
+SENSITIVE_CONFIG_FIELD_NAMES = frozenset({
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "telegram_allowed_chat_ids",
+    "telegram_allowed_user_ids",
+})
+SENSITIVE_CONFIG_FIELD_MARKERS = ("token", "secret", "password", "credential")
+
+
+def is_sensitive_config_field(name: object) -> bool:
+    """Return whether a config field must not be exported in run summaries."""
+    normalized = str(name).strip().lower().replace("-", "_")
+    if normalized in SENSITIVE_CONFIG_FIELD_NAMES:
+        return True
+    if any(marker in normalized for marker in SENSITIVE_CONFIG_FIELD_MARKERS):
+        return True
+    return normalized.endswith(("_chat_id", "_user_id", "_chat_ids", "_user_ids"))
+
+
 def validate_device(index: int, gain: float | None) -> None:
     if type(index) is not int or not 0 <= index <= 255:
         raise ConfigurationError("Індекс RTL-пристрою має бути цілим числом від 0 до 255")
@@ -46,6 +68,8 @@ class Settings:
     log_max_bytes: int = 5_000_000
     log_backups: int = 3
     incident_retention: int = 1000
+    resource_sampling_interval_seconds: float = 15
+    log_level: str = "INFO"
 
     def __post_init__(self) -> None:
         validate_device(self.rtl_device_index, self.rtl_gain)
@@ -60,6 +84,12 @@ class Settings:
             raise ConfigurationError("Некоректні межі rotation журналу")
         if type(self.incident_retention) is not int or not 1 <= self.incident_retention <= 100_000:
             raise ConfigurationError("Некоректна межа incident history")
+        if (type(self.resource_sampling_interval_seconds) not in (int, float)
+                or not math.isfinite(self.resource_sampling_interval_seconds)
+                or not 0.1 <= self.resource_sampling_interval_seconds <= 3600):
+            raise ConfigurationError("Інтервал resource sampling має бути від 0.1 до 3600 секунд")
+        if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ConfigurationError("RF_SENTINEL_LOG_LEVEL має бути DEBUG, INFO, WARNING або ERROR")
         if (
             type(self.report_interval_minutes) is not int
             or not 1 <= self.report_interval_minutes <= 1440
@@ -114,7 +144,7 @@ class Settings:
 
         def read(name: str, default: str) -> str:
             if acquisition_only and not (
-                name.startswith(("ACQUISITION_", "RTL_", "LOG_", "INCIDENT_")) or name == "DATA_DIR"
+                name.startswith(("ACQUISITION_", "RTL_", "LOG_", "INCIDENT_", "RESOURCE_")) or name == "DATA_DIR"
             ):
                 return default
             return source.get("RF_SENTINEL_" + name, default).strip()
@@ -132,7 +162,10 @@ class Settings:
                 log_max_bytes=int(read("LOG_MAX_BYTES", "5000000")),
                 log_backups=int(read("LOG_BACKUPS", "3")),
                 incident_retention=int(read("INCIDENT_RETENTION", "1000")),
+                resource_sampling_interval_seconds=float(
+                    read("RESOURCE_SAMPLING_INTERVAL_SECONDS", "15")),
             )
+            log_level = read("LOG_LEVEL", "INFO").upper()
             interval = int(read("REPORT_INTERVAL_MINUTES", "30"))
             device = int(read("RTL_DEVICE_INDEX", "0"))
             gain_text = read("RTL_GAIN", "auto")
@@ -181,4 +214,5 @@ class Settings:
             survey_recovery_seconds=recovery,
             timezone=read("TIMEZONE", "Europe/Kyiv"),
             **acquisition,
+            log_level=log_level,
         )

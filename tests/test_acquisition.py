@@ -101,6 +101,135 @@ def test_cadence_sink_no_overlap(tmp_path, duration, expected):
     assert health["last_sweep_cadence_seconds"] == max(60, duration)
 
 
+def test_source_duration_excludes_observer_overhead_and_preserves_cadence(tmp_path):
+    class DeterministicObserver:
+        def __init__(self, clock):
+            self.clock = clock
+            self.started_at = []
+            self.completed_timing = []
+
+        def start(self, _now):
+            self.clock.time += 3
+
+        def sweep_started(self, _now, cadence):
+            self.started_at.append((self.clock.time, cadence))
+            self.clock.time += 5
+
+        def completed(self, _sweep, *, timing, **_kwargs):
+            self.completed_timing.append(timing)
+            self.clock.set()
+
+        def failure(self, _duration, _recovery, _error):
+            raise AssertionError("unexpected acquisition failure")
+
+        def shutdown(self, _failed):
+            pass
+
+    clock = ClockStop()
+    observer = DeterministicObserver(clock)
+
+    def acquire(_profile):
+        clock.time += 7
+        return frame(7)
+
+    SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), LatestSweepSink(),
+                              SweepProfile(), observer, clock,
+                              monotonic=lambda: clock.time, now=lambda: NOW).run()
+
+    assert observer.started_at == [(3, None)]
+    assert observer.completed_timing == [{"source_duration_seconds": 7}]
+
+
+def test_source_duration_is_recorded_before_acquisition_failure(tmp_path):
+    clock = ClockStop()
+    observed = {}
+    worker = None
+
+    class FailureObserver:
+        def start(self, _now):
+            clock.time += 3
+
+        def sweep_started(self, _now, _cadence):
+            clock.time += 5
+
+        def failure(self, duration, _recovery, _error):
+            observed["cycle_duration"] = duration
+            observed["source_duration"] = worker._timing["source_duration_seconds"]
+            clock.set()
+
+        def shutdown(self, _failed):
+            pass
+
+    def acquire(_profile):
+        clock.time += 7
+        raise ScanError("synthetic failure")
+
+    worker = SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), LatestSweepSink(),
+                                       SweepProfile(), FailureObserver(), clock,
+                                       monotonic=lambda: clock.time, now=lambda: NOW)
+    worker.run()
+
+    assert observed == {"cycle_duration": 12, "source_duration": 7}
+
+
+def test_active_acquire_stop_is_not_accounted_or_recovered(tmp_path):
+    stop = ClockStop()
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60)
+
+    def acquire(_profile):
+        # Simulate the source noticing coordinated shutdown while acquire is active.
+        stop.set()
+        raise ScanError("Завершення прийому", reason="stopped")
+
+    SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), LatestSweepSink(),
+                              SweepProfile(), observer, stop,
+                              monotonic=lambda: stop.time, now=lambda: NOW).run()
+
+    assert observer.state.failed_sweeps == 0
+    assert observer.state.total_sweeps == 0
+    assert stop.waits == []
+    assert observer.state.application_status == "stopped"
+
+
+def test_stopped_scan_error_without_stop_is_a_real_failure(tmp_path):
+    class StopAfterFailure(ClockStop):
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            self.set()
+            return True
+
+    stop = StopAfterFailure()
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60)
+
+    def acquire(_profile):
+        raise ScanError("Завершення прийому", reason="stopped")
+
+    SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), LatestSweepSink(),
+                              SweepProfile(), observer, stop,
+                              monotonic=lambda: stop.time, now=lambda: NOW).run()
+
+    assert observer.state.failed_sweeps == 1
+    assert observer.state.total_sweeps == 1
+    assert stop.waits == [60]
+
+
+def test_unrelated_exception_keeps_worker_failure_semantics(tmp_path):
+    stop = ClockStop()
+    observer = AcquisitionObserver(tmp_path / "health.json", SweepProfile(), 10, 60)
+
+    def acquire(_profile):
+        raise RuntimeError("unrelated failure")
+
+    with pytest.raises(RuntimeError, match="unrelated failure"):
+        SpectrumAcquisitionWorker(SimpleNamespace(acquire=acquire), LatestSweepSink(),
+                                  SweepProfile(), observer, stop,
+                                  monotonic=lambda: stop.time, now=lambda: NOW).run()
+
+    assert observer.state.failed_sweeps == 0
+    assert observer.state.total_sweeps == 0
+    assert observer.state.application_status == "failed"
+
+
 def test_failure_recovery_and_secret_safe_logs(tmp_path, caplog):
     clock = ClockStop()
     calls = []
@@ -232,6 +361,86 @@ def test_async_sink_failure_is_observable_during_worker_shutdown(tmp_path):
     assert not sink._writer.is_alive()
     assert observer.state.application_status == "failed"
     assert json.loads((tmp_path / "health.json").read_text())["failed_persists"] == 0
+
+
+def test_standalone_worker_owns_sink_close_and_final_snapshot():
+    calls = []
+    stop = ClockStop()
+
+    class Sink:
+        def store_sweep(self, _sweep):
+            return None
+
+        def close(self):
+            calls.append("close")
+
+    class Observer:
+        def start(self, _now):
+            pass
+
+        def sweep_started(self, _now, _cadence):
+            pass
+
+        def completed(self, _sweep, **_kwargs):
+            pass
+
+        def shutdown(self, failed):
+            assert failed is False
+            calls.append("shutdown")
+
+        def persist_final_sink_snapshot(self, _sink):
+            calls.append("snapshot")
+
+    def acquire(_profile):
+        stop.set()
+        return frame()
+
+    worker = SpectrumAcquisitionWorker(
+        SimpleNamespace(acquire=acquire), Sink(), SweepProfile(), Observer(), stop)
+    worker.run()
+
+    assert worker.sink_lifecycle_owner == "worker"
+    assert calls == ["close", "shutdown", "snapshot"]
+
+
+def test_station_managed_worker_leaves_sink_lifecycle_to_station():
+    calls = []
+    stop = ClockStop()
+
+    class Sink:
+        def store_sweep(self, _sweep):
+            return None
+
+        def close(self):
+            calls.append("close")
+
+    class Observer:
+        def start(self, _now):
+            pass
+
+        def sweep_started(self, _now, _cadence):
+            pass
+
+        def completed(self, _sweep, **_kwargs):
+            pass
+
+        def shutdown(self, failed):
+            assert failed is False
+            calls.append("shutdown")
+
+        def persist_final_sink_snapshot(self, _sink):
+            calls.append("snapshot")
+
+    def acquire(_profile):
+        stop.set()
+        return frame()
+
+    worker = SpectrumAcquisitionWorker(
+        SimpleNamespace(acquire=acquire), Sink(), SweepProfile(), Observer(), stop,
+        sink_lifecycle_owner="station")
+    worker.run()
+
+    assert calls == ["shutdown"]
 
 
 def test_storage_metrics_are_observable(tmp_path):

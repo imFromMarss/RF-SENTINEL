@@ -813,15 +813,13 @@ def _canonical_time_grid(report: ReportData,
     slot_times = tuple(report.window_start + timedelta(seconds=index * quantum)
                        for index in range(slot_count))
     assigned: list[ReportSweep | None] = [None] * slot_count
-    tolerance = quantum / 2 + 1e-6
     for sweep in data_rows:
+        if not report.window_start <= sweep.started_at < report.window_end:
+            raise ValueError("Sweep falls outside the canonical report time grid")
         offset = (sweep.started_at - report.window_start).total_seconds()
-        index = int(round(offset / quantum))
+        index = int(math.floor(offset / quantum))
         if not 0 <= index < slot_count:
             raise ValueError("Sweep falls outside the canonical report time grid")
-        error = abs(offset - index * quantum)
-        if error > tolerance:
-            raise ValueError("Sweep cannot be assigned unambiguously to a time slot")
         if assigned[index] is not None:
             raise ValueError("Multiple sweeps assigned to one canonical time slot")
         assigned[index] = sweep

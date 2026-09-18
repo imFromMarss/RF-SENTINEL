@@ -9,6 +9,7 @@ from rf_sentinel.reporting import (SQLiteReportEngine, _closest_frequency_index,
                                    _keenerd_frequency_tape,
                                    _canonical_time_grid, _row_quantum_seconds,
                                    _canonical_time_ticks,
+                                   generate_report_package,
                                    render_report_heatmap,
                                    render_report_images, render_report_waterfall)
 from tests.test_report_data import START, make_sweep, store
@@ -230,6 +231,42 @@ def test_canonical_grid_assigns_each_sweep_once_and_renders_black_missing_rows(t
         assert image.getpixel((left, top)) != (0, 0, 0)
         assert image.getpixel((left, top + 1)) != (0, 0, 0)
         assert image.getpixel((left, top + 2)) == (0, 0, 0)
+
+
+def test_canonical_grid_assigns_in_window_final_sweep_to_final_slot(tmp_path):
+    from tests.test_report_package import report
+
+    start = datetime(2026, 9, 17, 17, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    base = report()
+    sweeps = tuple(
+        replace(
+            base.sweeps[0],
+            sweep_id=f"hourly-{index}",
+            started_at=start + timedelta(seconds=35.797321 + index * 60),
+            finished_at=start + timedelta(seconds=76.172548 + index * 60),
+        )
+        for index in range(60)
+    )
+    data = replace(
+        base,
+        window_start=start,
+        window_end=end,
+        sweep_count=60,
+        success_count=60,
+        time_ordering=tuple(sweep.sweep_id for sweep in sweeps),
+        sweeps=sweeps,
+        gaps=(),
+    )
+
+    slots, assigned, quantum = _canonical_time_grid(data, sweeps)
+
+    assert quantum == 60
+    assert len(slots) == 60
+    assert assigned[-1] is sweeps[-1]
+    package = generate_report_package(data, tmp_path / "hourly", "UTC")
+    assert package.waterfall.exists()
+    assert package.heatmap.exists()
 
 
 def test_row_quantum_rounding_ignores_boundary_jitter():

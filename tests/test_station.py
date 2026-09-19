@@ -1,11 +1,22 @@
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from threading import Barrier, Event, Thread, enumerate as enumerate_threads
 
 import pytest
 
 from rf_sentinel.application import _StationProcessLock, run_station
 from rf_sentinel.config import Settings
+
+
+def _station_test_sweep():
+    from rf_sentinel.acquisition import SpectrumSweep
+
+    started = datetime(2026, 9, 18, tzinfo=UTC)
+    return SpectrumSweep(
+        started, started + timedelta(seconds=1), 1, 24_000_000, 24_250_000,
+        (24_125_000,), 250_000, (-42.0,), "rtl_power",
+    )
 
 
 def test_station_composes_one_acquisition_and_report_runtime(monkeypatch, tmp_path):
@@ -103,6 +114,77 @@ def test_station_does_not_start_legacy_survey_path(monkeypatch, tmp_path):
     assert summary["failures"]["components"] == []
 
 
+def test_station_partial_startup_failure_closes_unstarted_async_sink(monkeypatch, tmp_path):
+    acquisition = __import__("rf_sentinel.acquisition", fromlist=["AsyncMeasurementSink"])
+    original_sink = acquisition.AsyncMeasurementSink
+    captured = {}
+
+    def sink_factory(*args, **kwargs):
+        sink = original_sink(*args, **kwargs)
+        captured["sink"] = sink
+        return sink
+
+    def fail_runner(*args, **kwargs):
+        raise RuntimeError("report runner construction failed")
+
+    monkeypatch.setattr("rf_sentinel.application.configure_logging", lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.rtl_power.RTLPowerScanner",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr("rf_sentinel.acquisition.AsyncMeasurementSink", sink_factory)
+    monkeypatch.setattr("rf_sentinel.scheduler.ScheduledReportRunner", fail_runner)
+    monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
+
+    with pytest.raises(RuntimeError, match="report runner construction failed"):
+        run_station(Settings(data_dir=tmp_path))
+
+    sink = captured["sink"]
+    assert sink._writer_started is False
+    assert not sink._writer.is_alive()
+    assert sink._closed is True
+    assert sink.telemetry_snapshot()["downstream_close_status"] == "complete"
+
+
+def test_station_async_writer_terminal_failure_requests_stop(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, _scanner, sink, _profile, _observer, stop, *args, **kwargs):
+            self.sink = sink
+            self.stop = stop
+            captured["stop"] = stop
+
+        def run(self):
+            captured["receipt"] = self.sink.store_sweep(_station_test_sweep())
+            assert self.stop.wait(2)
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def fail_persistence(self, sweep):
+        raise OSError("synthetic persistence failure")
+
+    monkeypatch.setattr("rf_sentinel.application.configure_logging", lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.rtl_power.RTLPowerScanner",
+                        lambda *args, **kwargs: object())
+    monkeypatch.setattr("rf_sentinel.acquisition.SpectrumAcquisitionWorker", FakeWorker)
+    monkeypatch.setattr("rf_sentinel.scheduler.ScheduledReportRunner", FakeRunner)
+    monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler",
+                        lambda runner, stop: stop.wait())
+    monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
+    monkeypatch.setattr("rf_sentinel.storage.SQLiteMeasurementSink.store_sweep",
+                        fail_persistence)
+
+    assert run_station(Settings(data_dir=tmp_path)) == 1
+    assert captured["stop"].is_set()
+    assert captured["receipt"].status == "failed"
+    summary = __import__("json").loads(
+        (tmp_path / "status" / "run-summary.json").read_text())
+    assert any(item["component"] == "measurement-writer"
+               and item["code"] == "writer_failure"
+               for item in summary["failures"]["components"])
+
+
 @pytest.mark.parametrize("component", ["acquisition", "report-scheduler"])
 @pytest.mark.parametrize("outcome", ["coordinated", "premature", "exception"])
 def test_station_managed_component_return_semantics(
@@ -144,7 +226,7 @@ def test_station_managed_component_return_semantics(
     monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler", fake_scheduler)
     monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == (0 if outcome == "coordinated" else 1)
     assert captured["stop"].is_set()
 
     summary = __import__("json").loads(
@@ -203,7 +285,7 @@ def test_station_simultaneous_component_returns_record_one_premature_exit(
     monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler", fake_scheduler)
     monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
 
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
@@ -248,7 +330,7 @@ def test_station_telegram_thread_still_alive_is_non_clean(monkeypatch, tmp_path)
                         lambda settings, stop, notifier, **kwargs: telegram)
 
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert summary["application"]["status"] in {"partial", "failed"}
     assert summary["failures"]["status"] != "clean"
@@ -292,7 +374,7 @@ def test_station_resource_sampler_incomplete_is_non_clean(monkeypatch, tmp_path)
     monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
     monkeypatch.setattr("rf_sentinel.observability.LinuxResourceSampler", IncompleteSampler)
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert summary["application"]["status"] in {"partial", "failed"}
     assert summary["failures"]["status"] != "clean"
@@ -302,6 +384,85 @@ def test_station_resource_sampler_incomplete_is_non_clean(monkeypatch, tmp_path)
     health = __import__("json").loads((tmp_path / "status" / "health.json").read_text())
     assert health["application_status"] == "failed"
     assert health["shutdown_status"] == "incomplete"
+
+
+def test_station_supervisor_reaps_rtl_power_when_acquisition_is_stuck(
+        monkeypatch, tmp_path):
+    from rf_sentinel.rtl_power import RTLPowerScanner
+
+    real_thread = Thread
+    captured = {}
+    scanner = RTLPowerScanner()
+
+    class ActiveProcess:
+        returncode = None
+        terminated = False
+        killed = False
+        reaped = False
+        waits = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if not self.killed:
+                raise subprocess.TimeoutExpired("rtl_power", timeout)
+            self.reaped = True
+            return self.returncode
+
+    process = ActiveProcess()
+    scanner._register_process(process)
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            captured["stop"] = args[4]
+
+        def run(self):
+            raise AssertionError("stuck acquisition thread must not invoke its target")
+
+    class FakeRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class StuckAcquisitionThread:
+        def start(self):
+            captured["stop"].set()
+
+        def join(self, timeout=None):
+            assert timeout >= 0
+
+        def is_alive(self):
+            return True
+
+    def thread_factory(*args, name=None, **kwargs):
+        if name == "station-acquisition":
+            return StuckAcquisitionThread()
+        return real_thread(*args, name=name, **kwargs)
+
+    monkeypatch.setattr("rf_sentinel.application.configure_logging", lambda *args: None)
+    monkeypatch.setattr("rf_sentinel.application.Thread", thread_factory)
+    monkeypatch.setattr("rf_sentinel.rtl_power.RTLPowerScanner",
+                        lambda *args, **kwargs: scanner)
+    monkeypatch.setattr("rf_sentinel.acquisition.SpectrumAcquisitionWorker", FakeWorker)
+    monkeypatch.setattr("rf_sentinel.scheduler.ScheduledReportRunner", FakeRunner)
+    monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler",
+                        lambda runner, stop: stop.wait())
+    monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
+
+    assert run_station(Settings(data_dir=tmp_path)) == 1
+    assert process.terminated and process.killed and process.reaped
+    assert process.waits == 2
+    assert scanner.active_process is None
+    still_owned = _StationProcessLock(tmp_path / "station.lock")
+    assert not still_owned.acquire()
 
 
 @pytest.mark.parametrize("stuck_component", ["station-acquisition", "station-reports"])
@@ -345,6 +506,7 @@ def test_station_worker_incomplete_is_non_clean(monkeypatch, tmp_path, stuck_com
 
     def thread_factory(*args, name=None, **kwargs):
         if name == stuck_component:
+            captured["stuck_daemon"] = kwargs.get("daemon")
             return StuckThread()
         return real_thread(*args, name=name, **kwargs)
 
@@ -357,14 +519,17 @@ def test_station_worker_incomplete_is_non_clean(monkeypatch, tmp_path, stuck_com
     monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler", lambda runner, stop: stop.wait())
     monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     expected = "acquisition" if stuck_component == "station-acquisition" else "report-scheduler"
     assert any(item["component"] == expected and item["code"] == "incomplete"
                for item in summary["failures"]["components"])
     health = __import__("json").loads((tmp_path / "status" / "health.json").read_text())
     assert (health["application_status"], health["shutdown_status"]) == ("failed", "incomplete")
-    assert captured["sink_closes"] == (0 if expected == "acquisition" else 1)
+    assert captured["sink_closes"] == 1
+    assert captured["stuck_daemon"] is True
+    still_owned = _StationProcessLock(tmp_path / "station.lock")
+    assert not still_owned.acquire()
 
 
 def _install_fast_station_fakes(monkeypatch):
@@ -443,7 +608,7 @@ def test_station_telegram_premature_return_is_non_clean(monkeypatch, tmp_path):
     _install_managed_telegram_runtime(monkeypatch, lambda stop: None)
 
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
     failures = [item for item in summary["failures"]["components"]
@@ -462,7 +627,7 @@ def test_station_telegram_runtime_exception_is_non_clean_and_finalizes(monkeypat
     _install_managed_telegram_runtime(monkeypatch, explode)
 
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
     failures = [item for item in summary["failures"]["components"]
@@ -492,7 +657,7 @@ def test_station_telegram_stop_exception_is_non_clean(monkeypatch, tmp_path):
     monkeypatch.setattr("rf_sentinel.application._start_telegram_polling",
                         lambda *args, **kwargs: StopFailure())
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
     assert any(item["component"] == "telegram" and item["code"] == "shutdown_error"
@@ -517,7 +682,7 @@ def test_station_telegram_join_exception_is_non_clean(monkeypatch, tmp_path):
     monkeypatch.setattr("rf_sentinel.application._start_telegram_polling",
                         lambda *args, **kwargs: JoinFailure())
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
     assert any(item["component"] == "telegram" and item["code"] == "shutdown_error"
@@ -526,10 +691,17 @@ def test_station_telegram_join_exception_is_non_clean(monkeypatch, tmp_path):
     assert (health["application_status"], health["shutdown_status"]) == ("failed", "incomplete")
 
 
-def test_station_telegram_alive_check_exception_is_non_clean(monkeypatch, tmp_path):
+def test_station_telegram_alive_check_exception_retains_lock_until_terminal(
+        monkeypatch, tmp_path):
     _install_fast_station_fakes(monkeypatch)
+    import time as real_time
+
+    terminal = Event()
+    retained = []
 
     class AliveCheckFailure:
+        alive_checks = 0
+
         def stop(self):
             pass
 
@@ -537,20 +709,125 @@ def test_station_telegram_alive_check_exception_is_non_clean(monkeypatch, tmp_pa
             pass
 
         def is_alive(self):
-            raise RuntimeError("alive check failed")
+            self.alive_checks += 1
+            if self.alive_checks == 1:
+                raise RuntimeError("alive check failed")
+            return not terminal.is_set()
+
+    telegram = AliveCheckFailure()
+    application = __import__("rf_sentinel.application", fromlist=["_retain_station_lock"])
+    retain_station_lock = application._retain_station_lock
+
+    def capture_survivors(lock, survivors):
+        retained.extend(survivors)
+        retain_station_lock(lock, survivors)
 
     monkeypatch.setattr("rf_sentinel.application._start_telegram_polling",
-                        lambda *args, **kwargs: AliveCheckFailure())
+                        lambda *args, **kwargs: telegram)
+    monkeypatch.setattr("rf_sentinel.application._retain_station_lock", capture_survivors)
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
-    summary = __import__("json").loads(
-        (tmp_path / "status" / "run-summary.json").read_text())
-    assert any(item["component"] == "telegram" and item["code"] == "shutdown_error"
-               and "alive check" in item["message"]
-               for item in summary["failures"]["components"])
-    assert summary["acquisition"]["shutdown_status"] == "complete"
-    health = __import__("json").loads((tmp_path / "status" / "health.json").read_text())
-    assert (health["application_status"], health["shutdown_status"]) == ("failed", "incomplete")
+    reusable = _StationProcessLock(tmp_path / "station.lock")
+    try:
+        assert run_station(settings) == 1
+        assert telegram in retained
+        assert not reusable.acquire()
+        summary = __import__("json").loads(
+            (tmp_path / "status" / "run-summary.json").read_text())
+        assert any(item["component"] == "telegram" and item["code"] == "shutdown_error"
+                   and "alive check" in item["message"]
+                   for item in summary["failures"]["components"])
+        assert summary["acquisition"]["shutdown_status"] == "complete"
+        health = __import__("json").loads((tmp_path / "status" / "health.json").read_text())
+        assert (health["application_status"], health["shutdown_status"]) == (
+            "failed", "incomplete")
+    finally:
+        terminal.set()
+
+    release_deadline = real_time.monotonic() + 2
+    while real_time.monotonic() < release_deadline and not reusable.acquire():
+        real_time.sleep(0.01)
+    assert reusable._stream is not None
+    reusable.release()
+
+
+def test_station_lock_guardian_join_exception_retains_lock_until_terminal(tmp_path):
+    import time as real_time
+    from rf_sentinel.application import _retain_station_lock
+
+    terminal = Event()
+    join_failed = Event()
+
+    class JoinFailure:
+        def is_alive(self):
+            return not terminal.is_set()
+
+        def join(self, timeout=None):
+            join_failed.set()
+            raise RuntimeError("join failed")
+
+    held = _StationProcessLock(tmp_path / "station.lock")
+    assert held.acquire()
+    _retain_station_lock(held, (JoinFailure(),))
+    assert join_failed.wait(1)
+
+    reusable = _StationProcessLock(tmp_path / "station.lock")
+    try:
+        assert not reusable.acquire()
+    finally:
+        terminal.set()
+
+    release_deadline = real_time.monotonic() + 3
+    while real_time.monotonic() < release_deadline and not reusable.acquire():
+        real_time.sleep(0.01)
+    assert reusable._stream is not None
+    reusable.release()
+
+
+def test_station_lock_owner_survives_guardian_thread_termination(
+        monkeypatch, tmp_path):
+    import time as real_time
+    import rf_sentinel.application as application
+
+    terminal = Event()
+    guardian_finished = Event()
+
+    class Survivor:
+        def is_alive(self):
+            return not terminal.is_set()
+
+        def join(self, timeout=None):
+            pass
+
+    class TerminatedGuardian:
+        def __init__(self, *, target, name, daemon):
+            assert name == "station-lock-guardian"
+            assert daemon is True
+
+        def start(self):
+            thread = Thread(target=guardian_finished.set, daemon=True)
+            thread.start()
+            thread.join()
+
+    survivor = Survivor()
+    held = _StationProcessLock(tmp_path / "station.lock")
+    assert held.acquire()
+    with monkeypatch.context() as context:
+        context.setattr(application, "Thread", TerminatedGuardian)
+        application._retain_station_lock(held, (survivor,))
+    assert guardian_finished.is_set()
+    assert held in application._retained_station_locks
+
+    reusable = _StationProcessLock(tmp_path / "station.lock")
+    assert not reusable.acquire()
+    terminal.set()
+    application._retain_station_lock(held, (survivor,))
+
+    release_deadline = real_time.monotonic() + 2
+    while real_time.monotonic() < release_deadline and not reusable.acquire():
+        real_time.sleep(0.01)
+    assert reusable._stream is not None
+    assert held not in application._retained_station_locks
+    reusable.release()
 
 
 def test_station_is_single_sink_owner_with_exact_finalization_sequence(monkeypatch, tmp_path):
@@ -688,7 +965,7 @@ def test_station_owner_accounts_sink_shutdown_failure_once(monkeypatch, tmp_path
     monkeypatch.setattr("rf_sentinel.scheduler.run_report_scheduler", lambda runner, stop: stop.wait())
     monkeypatch.setattr("rf_sentinel.reporting.SQLiteReportEngine", lambda *args: object())
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
     assert events == ["producer-finished", "close", "capture"]
@@ -716,7 +993,7 @@ def test_station_downstream_close_failure_is_non_clean(monkeypatch, tmp_path):
 
     monkeypatch.setattr(storage.SQLiteMeasurementSink, "close", fail_first_close)
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert any(item["component"] == "storage" and item["code"] == "shutdown_error"
                for item in summary["failures"]["components"])
@@ -783,17 +1060,86 @@ def test_station_downstream_close_hang_is_bounded_before_single_capture(monkeypa
     monkeypatch.setattr(observer.AcquisitionObserver, "capture_final_sink_snapshot", capture_once)
 
     started = actual_monotonic()
+    reusable = _StationProcessLock(tmp_path / "station.lock")
     try:
-        assert run_station(Settings(data_dir=tmp_path)) == 0
+        assert run_station(Settings(data_dir=tmp_path)) == 1
+        returned_elapsed = actual_monotonic() - started
+        assert not reusable.acquire()
     finally:
         release.set()
-    assert actual_monotonic() - started < 1.0
+    release_deadline = actual_monotonic() + 2
+    while actual_monotonic() < release_deadline and not reusable.acquire():
+        real_time.sleep(0.01)
+    assert reusable._stream is not None
+    reusable.release()
+    assert returned_elapsed < 1.0
     assert captures == ["capture"]
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     health = __import__("json").loads((tmp_path / "status" / "health.json").read_text())
     assert summary["acquisition"]["shutdown_status"] == "incomplete"
     assert summary["failures"]["status"] != "clean"
     assert (health["application_status"], health["shutdown_status"]) == ("failed", "incomplete")
+
+
+def test_station_report_close_survivor_retains_lock_until_terminal(monkeypatch, tmp_path):
+    import time as real_time
+
+    actual_monotonic = real_time.monotonic
+    _install_fast_station_fakes(monkeypatch)
+    acquisition = __import__("rf_sentinel.acquisition", fromlist=["AsyncMeasurementSink"])
+    original_sink = acquisition.AsyncMeasurementSink
+    release = Event()
+    close_started = Event()
+    expired = Event()
+    storages = []
+
+    class SharedClock:
+        def __call__(self):
+            return 131.0 if expired.is_set() else 100.0
+
+    clock = SharedClock()
+
+    class Storage:
+        def __init__(self, *_args, **_kwargs):
+            self.name = "acquisition" if not storages else "report"
+            storages.append(self)
+
+        def close(self):
+            if self.name == "report":
+                close_started.set()
+                expired.set()
+                release.wait()
+
+        def query_incidents(self):
+            return []
+
+        def storage_status(self):
+            return {}
+
+        @property
+        def persistence_telemetry(self):
+            return {}
+
+    def sink_factory(downstream, **kwargs):
+        return original_sink(downstream, deadline_monotonic=clock, **kwargs)
+
+    monkeypatch.setattr("rf_sentinel.application.time.monotonic", clock)
+    monkeypatch.setattr("rf_sentinel.storage.SQLiteMeasurementSink", Storage)
+    monkeypatch.setattr("rf_sentinel.acquisition.AsyncMeasurementSink", sink_factory)
+
+    reusable = _StationProcessLock(tmp_path / "station.lock")
+    try:
+        assert run_station(Settings(data_dir=tmp_path)) == 1
+        assert close_started.is_set()
+        assert not reusable.acquire()
+    finally:
+        release.set()
+
+    release_deadline = actual_monotonic() + 2
+    while actual_monotonic() < release_deadline and not reusable.acquire():
+        real_time.sleep(0.01)
+    assert reusable._stream is not None
+    reusable.release()
 
 
 def test_station_report_storage_close_uses_no_budget_after_shared_deadline(
@@ -990,7 +1336,7 @@ def test_station_late_report_storage_close_is_non_clean_before_final_capture(
     monkeypatch.setattr(observer.AcquisitionObserver,
                         "capture_final_sink_snapshot", capture_once)
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
 
     summary = __import__("json").loads(
         (tmp_path / "status" / "run-summary.json").read_text())
@@ -1047,7 +1393,7 @@ def test_station_multiple_component_failures_are_bounded_and_non_clean(monkeypat
                         lambda *args, **kwargs: StuckTelegram())
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
 
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert {item["component"] for item in summary["failures"]["components"]} >= {
         "resource-sampler", "telegram"}
@@ -1073,7 +1419,7 @@ def test_final_snapshot_is_captured_once_and_summary_survives_health_failure(mon
     monkeypatch.setattr("rf_sentinel.observability.AcquisitionObserver.publish_final_sink_snapshot",
                         fail_health_publication)
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert calls == ["capture", ("health", "complete"), ("health", "complete")]
     assert summary["acquisition"]["shutdown_status"] == "complete"
@@ -1093,7 +1439,7 @@ def test_incomplete_snapshot_survives_health_publication_failure(monkeypatch, tm
     monkeypatch.setattr("rf_sentinel.observability.AcquisitionObserver.publish_final_sink_snapshot",
                         lambda self, value: (_ for _ in ()).throw(OSError("health disk full")))
 
-    assert run_station(Settings(data_dir=tmp_path)) == 0
+    assert run_station(Settings(data_dir=tmp_path)) == 1
     summary = __import__("json").loads((tmp_path / "status" / "run-summary.json").read_text())
     assert summary["acquisition"]["shutdown_status"] == "incomplete"
     assert summary["acquisition"]["queue_telemetry"] == snapshot["queue"]
@@ -1248,7 +1594,7 @@ def test_station_component_exception_is_accounted_in_final_summary(monkeypatch, 
     monkeypatch.setattr("rf_sentinel.application._start_telegram_polling", fake_start_telegram)
 
     settings = Settings(data_dir=tmp_path, telegram_bot_token="123:test", telegram_chat_id="1")
-    assert run_station(settings) == 0
+    assert run_station(settings) == 1
     assert captured["stop"].is_set()
     assert scheduler_stopped.is_set()
     assert telegram_stopped.is_set()

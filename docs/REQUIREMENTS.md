@@ -130,7 +130,7 @@ Where a numeric threshold depends on the specific CM4, storage, SDR, antenna, sp
 
 ## Current validation and next evidence milestone
 
-The canonical hardware-free baseline is **387 passed, 2 skipped**. Hardware tests are explicit opt-in only. The next major milestone is **Observability & CM4 Capacity Preparation**: CPU/RSS/I/O/temperature telemetry, sweep duration/cadence/jitter, reporting/Telegram impact on acquisition, storage/queue behavior, process/CPU-isolation assessment, and evidence-based CM4 capacity/platform decisions. These are not yet implemented capabilities.
+Hardware tests are explicit opt-in only. CPU/RSS/I/O/temperature, sweep duration/cadence/jitter, reporting/Telegram timing and overlap, and storage/queue telemetry are implemented current-state observability. The next evidence milestone is a representative CM4 capacity/platform verdict and process/CPU-isolation assessment; instrumentation does not itself establish those hardware-specific limits.
 
 ## Open acceptance baselines
 

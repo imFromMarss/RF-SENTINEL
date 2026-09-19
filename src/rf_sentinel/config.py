@@ -47,6 +47,8 @@ class Settings:
     telegram_chat_id: str = field(default="", repr=False)
     telegram_allowed_chat_ids: tuple[str, ...] = ()
     telegram_allowed_user_ids: tuple[str, ...] = ()
+    # Legacy environment/API compatibility. Current calendar reports do not
+    # use a fixed interval; keep accepting the field for existing deployments.
     report_interval_minutes: int = 30
     rtl_device_index: int = 0
     rtl_gain: float | None = None

@@ -122,21 +122,26 @@ class SQLiteMeasurementSink(MeasurementSink):
         self.storage_error: str | None = None
         self._monotonic = monotonic
         self._telemetry_lock = RLock()
+        # sqlite3 transaction state belongs to the connection, not to the
+        # calling thread.  Keep every logical operation on this writable
+        # connection inside one ownership boundary.
+        self._db_lock = RLock()
         self.write_count = 0
         self.last_write_duration_seconds = None
         self.max_write_duration_seconds = 0.0
         self.total_write_duration_seconds = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            # Acquisition persistence runs on AsyncMeasurementSink's writer
-            # thread; the observer may use this same connection for metrics
-            # and incidents on the application thread.
-            self._db = sqlite3.connect(self.path, check_same_thread=False)
-            self._db.execute("PRAGMA busy_timeout=5000")
-            self._db.execute("PRAGMA foreign_keys=ON")
-            self._db.execute("PRAGMA journal_mode=WAL")
-            self._db.execute("PRAGMA synchronous=FULL")
-            self._initialize()
+            with self._db_lock:
+                # Acquisition persistence runs on AsyncMeasurementSink's writer
+                # thread; the observer may use this same connection for metrics
+                # and incidents on the application thread.
+                self._db = sqlite3.connect(self.path, check_same_thread=False)
+                self._db.execute("PRAGMA busy_timeout=5000")
+                self._db.execute("PRAGMA foreign_keys=ON")
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=FULL")
+                self._initialize()
         except (OSError, sqlite3.Error) as error:
             raise MeasurementPersistenceError("Could not open SQLite measurement store") from error
 
@@ -200,16 +205,17 @@ class SQLiteMeasurementSink(MeasurementSink):
             finished = _timestamp(sweep.finished_at)
             frequencies = _pack(sweep.frequencies_hz)
             powers = _pack(sweep.powers)
-            with self._db:
-                self._db.execute(
-                    """INSERT INTO sweeps
-                    (sweep_id, started_at_us, finished_at_us, outcome, metadata_json,
-                     frequency_count, frequencies_blob, power_count, powers_blob)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (sweep.sweep_id, started, finished, sweep.outcome, metadata,
-                     len(sweep.frequencies_hz), frequencies if sweep.frequencies_hz else None,
-                     len(sweep.powers), powers if sweep.powers else None),
-                )
+            with self._db_lock:
+                with self._db:
+                    self._db.execute(
+                        """INSERT INTO sweeps
+                        (sweep_id, started_at_us, finished_at_us, outcome, metadata_json,
+                         frequency_count, frequencies_blob, power_count, powers_blob)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (sweep.sweep_id, started, finished, sweep.outcome, metadata,
+                         len(sweep.frequencies_hz), frequencies if sweep.frequencies_hz else None,
+                         len(sweep.powers), powers if sweep.powers else None),
+                    )
             with self._telemetry_lock:
                 self.persisted_count += 1
                 self.last_persisted_sweep_at = sweep.finished_at.isoformat()
@@ -234,21 +240,23 @@ class SQLiteMeasurementSink(MeasurementSink):
         record = IncidentRecord(str(uuid4()), timestamp.isoformat(), component, classification,
                                 safe_message, correlation_id, recovery_result)
         try:
-            with self._db:
-                self._db.execute(
-                    """INSERT INTO incidents
-                    (incident_id, timestamp_us, component, classification, safe_message,
-                     correlation_id, recovery_result) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (record.incident_id, _timestamp(timestamp), record.component,
-                     record.classification, record.safe_message, record.correlation_id,
-                     record.recovery_result),
-                )
-                self._db.execute(
-                    """DELETE FROM incidents WHERE incident_id IN (
-                    SELECT incident_id FROM incidents ORDER BY timestamp_us DESC, incident_id DESC
-                    LIMIT -1 OFFSET ?)""", (self.incident_retention,))
+            with self._db_lock:
+                with self._db:
+                    self._db.execute(
+                        """INSERT INTO incidents
+                        (incident_id, timestamp_us, component, classification, safe_message,
+                         correlation_id, recovery_result) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (record.incident_id, _timestamp(timestamp), record.component,
+                         record.classification, record.safe_message, record.correlation_id,
+                         record.recovery_result),
+                    )
+                    self._db.execute(
+                        """DELETE FROM incidents WHERE incident_id IN (
+                        SELECT incident_id FROM incidents ORDER BY timestamp_us DESC, incident_id DESC
+                        LIMIT -1 OFFSET ?)""", (self.incident_retention,))
         except (OSError, sqlite3.Error, TypeError, ValueError) as error:
-            self.storage_error = "SQLite incident history unavailable"
+            with self._telemetry_lock:
+                self.storage_error = "SQLite incident history unavailable"
             raise MeasurementPersistenceError("Could not persist incident record") from error
         return record
 
@@ -262,7 +270,8 @@ class SQLiteMeasurementSink(MeasurementSink):
             sql += " LIMIT ?"
             params = (limit,)
         try:
-            rows = self._db.execute(sql, params).fetchall()
+            with self._db_lock:
+                rows = self._db.execute(sql, params).fetchall()
         except sqlite3.Error as error:
             raise MeasurementPersistenceError("Could not read incident history") from error
         return [IncidentRecord(row[0], datetime.fromtimestamp(row[1] / 1_000_000, UTC).isoformat(),
@@ -293,9 +302,10 @@ class SQLiteMeasurementSink(MeasurementSink):
 
     def fetch_sweep(self, sweep_id: str) -> SpectrumSweep | None:
         try:
-            row = self._db.execute(
-                "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
-                "FROM sweeps WHERE sweep_id = ?", (sweep_id,)).fetchone()
+            with self._db_lock:
+                row = self._db.execute(
+                    "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
+                    "FROM sweeps WHERE sweep_id = ?", (sweep_id,)).fetchone()
             return None if row is None else self._decode(row)
         except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
             raise MeasurementPersistenceError("Could not read spectrum sweep") from error
@@ -303,11 +313,12 @@ class SQLiteMeasurementSink(MeasurementSink):
     def query_sweeps(self, start: datetime, end: datetime) -> list[SpectrumSweep]:
         try:
             start_us, end_us = _timestamp(start), _timestamp(end)
-            rows = self._db.execute(
-                "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
-                "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
-                "ORDER BY started_at_us, sweep_id", (start_us, end_us))
-            return [self._decode(row) for row in rows]
+            with self._db_lock:
+                rows = self._db.execute(
+                    "SELECT metadata_json, frequency_count, frequencies_blob, power_count, powers_blob "
+                    "FROM sweeps WHERE started_at_us >= ? AND started_at_us < ? "
+                    "ORDER BY started_at_us, sweep_id", (start_us, end_us))
+                return [self._decode(row) for row in rows]
         except (sqlite3.Error, TypeError, ValueError, KeyError, struct.error, json.JSONDecodeError) as error:
             raise MeasurementPersistenceError("Could not query spectrum sweeps") from error
 
@@ -316,7 +327,8 @@ class SQLiteMeasurementSink(MeasurementSink):
 
     def close(self) -> None:
         try:
-            self._db.close()
+            with self._db_lock:
+                self._db.close()
         except sqlite3.Error as error:
             raise MeasurementPersistenceError("Could not close SQLite measurement store") from error
 
@@ -399,4 +411,5 @@ def _decode_sweep_row(row, *, compact: bool = False) -> SpectrumSweep:
         error_classification=None if error is None else ErrorClassification(**error),
     )
 
+# Compatibility import retained; SQLiteMeasurementSink is the canonical name.
 SQLiteSweepStore = SQLiteMeasurementSink

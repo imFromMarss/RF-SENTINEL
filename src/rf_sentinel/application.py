@@ -1,6 +1,7 @@
 """Точка складання application зі збереженою identity-only поведінкою."""
 
 import argparse
+from dataclasses import dataclass
 import fcntl
 import logging
 from pathlib import Path
@@ -24,7 +25,8 @@ def _shutdown_signal(signum, frame) -> None:
     raise KeyboardInterrupt
 
 
-def _bounded_close(resource, *, deadline: float, thread_name: str):
+def _bounded_close(resource, *, deadline: float, thread_name: str,
+                   survivor_registry: list | None = None):
     """Close one station-owned resource without waiting past an absolute deadline."""
     outcome = {"started_at": time.monotonic()}
 
@@ -42,6 +44,8 @@ def _bounded_close(resource, *, deadline: float, thread_name: str):
     close_thread.start()
     close_thread.join(max(0.0, deadline - time.monotonic()))
     if close_thread.is_alive():
+        if survivor_registry is not None:
+            survivor_registry.append(close_thread)
         return "incomplete", TimeoutError(f"{thread_name} did not close before deadline")
     completed_at = outcome.get("completed_at")
     if completed_at is None or completed_at > deadline:
@@ -119,6 +123,72 @@ class _StationProcessLock:
             self._stream = None
 
 
+_retained_station_locks: set[_StationProcessLock] = set()
+_retained_station_locks_guard = Lock()
+
+
+@dataclass(frozen=True)
+class _StationLifecycleResult:
+    exit_code: int
+    critical_survivors: tuple[object, ...] = ()
+
+
+def _retain_station_lock(lock: _StationProcessLock, survivors: tuple[object, ...]) -> None:
+    """Keep station ownership until surviving critical runtimes actually end."""
+    logger = logging.getLogger("rf_sentinel.application")
+    with _retained_station_locks_guard:
+        # Process-owned retention is independent of the guardian thread's
+        # lifetime.  The OS closes the descriptor if the process terminates.
+        _retained_station_locks.add(lock)
+
+    def release_after_survivors():
+        try:
+            for survivor in survivors:
+                while True:
+                    try:
+                        alive = survivor.is_alive()
+                    except BaseException:
+                        logger.exception(
+                            "Station lock guardian could not probe critical survivor")
+                        time.sleep(1.0)
+                        continue
+                    if not alive:
+                        break
+                    # The guardian is daemonized, so this never delays process
+                    # termination; finite joins also keep this helper compatible
+                    # with runtimes whose join contract requires a timeout.
+                    try:
+                        survivor.join(timeout=1.0)
+                    except BaseException:
+                        logger.exception(
+                            "Station lock guardian could not join critical survivor")
+                        time.sleep(1.0)
+                        continue
+                    # Some protocol implementations return immediately while
+                    # still alive; avoid spinning between probes.
+                    time.sleep(0.1)
+        except BaseException:
+            # The process-owned registry keeps the descriptor strongly held if
+            # the guardian itself exits before proving terminal state.
+            logger.exception("Station lock guardian stopped before terminal confirmation")
+            return
+        try:
+            lock.release()
+        except BaseException:
+            logger.exception("Station lock guardian failed to release station lock")
+            return
+        with _retained_station_locks_guard:
+            _retained_station_locks.discard(lock)
+
+    try:
+        Thread(target=release_after_survivors,
+               name="station-lock-guardian", daemon=True).start()
+    except BaseException:
+        # Thread creation/start failure is also fail-closed: the registry stays
+        # the durable process-lifetime owner of the open lock descriptor.
+        logger.exception("Station lock guardian failed to start")
+
+
 def run_station(settings: Settings) -> int:
     """Acquire the station lock, then run the unified station lifecycle."""
     configure_logging(settings.data_dir, settings.log_max_bytes, settings.log_backups,
@@ -128,13 +198,28 @@ def run_station(settings: Settings) -> int:
         logging.getLogger("rf_sentinel.application").error(
             "RF Sentinel station is already running; refusing second instance")
         return 1
+    release_lock = True
+    critical_survivors = []
     try:
-        return _run_station_lifecycle(settings)
+        result = _run_station_lifecycle(
+            settings, critical_survivors=critical_survivors)
+        if result.critical_survivors:
+            _retain_station_lock(lock, result.critical_survivors)
+            release_lock = False
+        return result.exit_code
+    except BaseException:
+        if critical_survivors:
+            _retain_station_lock(lock, tuple(dict.fromkeys(critical_survivors)))
+            release_lock = False
+        raise
     finally:
-        lock.release()
+        if release_lock:
+            lock.release()
 
 
-def _run_station_lifecycle(settings: Settings) -> int:
+def _run_station_lifecycle(
+        settings: Settings, *, critical_survivors: list | None = None,
+) -> _StationLifecycleResult:
     """Run acquisition, scheduled reports, and inbound Telegram in one process."""
     from rf_sentinel.acquisition import AsyncMeasurementSink, SpectrumAcquisitionWorker, SweepProfile
     from rf_sentinel.health import AcquisitionHealth, HealthOwner
@@ -161,44 +246,12 @@ def _run_station_lifecycle(settings: Settings) -> int:
                               settings.acquisition_cadence_budget_seconds,
                               settings.acquisition_recovery_seconds)
     health = HealthOwner(health_path, state)
-    acquisition_storage = SQLiteMeasurementSink(
-        settings.sweeps_path, incident_retention=settings.incident_retention)
-    report_storage = SQLiteMeasurementSink(
-        settings.sweeps_path, incident_retention=settings.incident_retention)
-    # The async sink is the sole lifecycle owner of acquisition storage.  Its
-    # bounded close drains the writer and closes SQLite against one deadline.
-    sink = AsyncMeasurementSink(acquisition_storage,
-                                thread_name="station-measurement-writer")
-    observer = AcquisitionObserver(health_path, profile,
-                                   settings.acquisition_cadence_budget_seconds,
-                                   settings.acquisition_recovery_seconds, storage=acquisition_storage,
-                                   health_owner=health, coordinator=coordinator)
-    worker = SpectrumAcquisitionWorker(
-        RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain, stop=stop), sink,
-        profile, observer, stop, settings.acquisition_cadence_budget_seconds,
-        settings.acquisition_recovery_seconds,
-        sink_lifecycle_owner="station",
-    )
-    notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id,
-                                 coordinator=coordinator)
-                if settings.telegram_enabled else None)
-    report_engine = SQLiteReportEngine(settings.sweeps_path)
-    try:
-        report_engine.coordinator = coordinator
-    except AttributeError:
-        pass
-    runner = ScheduledReportRunner(
-        report_engine, notifier, settings.data_dir,
-        timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
-        storage=report_storage, health_path=health_path, state=state, health_owner=health,
-        coordinator=coordinator,
-    )
-    resource_sampler = LinuxResourceSampler(
-        health, settings.resource_sampling_interval_seconds)
     component_failures = []
     component_failure_lock = Lock()
     final_sink_snapshot = None
     exit_code = 0
+    acquisition_storage = report_storage = sink = None
+    critical_survivors = [] if critical_survivors is None else critical_survivors
 
     def record_component_failure(label, error, *, category=None, code=None, message=None,
                                  only_if_stop_unset=False):
@@ -216,6 +269,14 @@ def _run_station_lifecycle(settings: Settings) -> int:
             state.application_status = "failed"
             stop.set()
             return True
+
+    def writer_terminal_failure(error):
+        if record_component_failure(
+                "measurement-writer", error, category="persistence",
+                code="writer_failure", message="Measurement writer persistence failed",
+                only_if_stop_unset=True):
+            logging.getLogger("rf_sentinel.application").error(
+                "Station measurement writer stopped after persistence failure")
 
     def run_component(label, operation):
         try:
@@ -246,13 +307,80 @@ def _run_station_lifecycle(settings: Settings) -> int:
             logging.getLogger("rf_sentinel.application").error(
                 "Telegram runtime stopped unexpectedly: %s", type(error).__name__)
 
-    acquisition_thread = Thread(target=run_component, args=("acquisition", worker.run),
-                                 name="station-acquisition")
-    report_thread = Thread(
-        target=run_component,
-        args=("report-scheduler", lambda: run_report_scheduler(runner, stop)),
-        name="station-reports",
-    )
+    try:
+        acquisition_storage = SQLiteMeasurementSink(
+            settings.sweeps_path, incident_retention=settings.incident_retention)
+        report_storage = SQLiteMeasurementSink(
+            settings.sweeps_path, incident_retention=settings.incident_retention)
+        # Construction is complete before this station-owned daemon writer is
+        # started. Bounded cleanup still drains it; daemon status is the hard
+        # process-termination fallback after the shared deadline.
+        sink = AsyncMeasurementSink(
+            acquisition_storage, thread_name="station-measurement-writer",
+            writer_daemon=True, start_immediately=False,
+            on_terminal_failure=writer_terminal_failure,
+        )
+        observer = AcquisitionObserver(
+            health_path, profile, settings.acquisition_cadence_budget_seconds,
+            settings.acquisition_recovery_seconds, storage=acquisition_storage,
+            health_owner=health, coordinator=coordinator)
+        scanner = RTLPowerScanner(settings.rtl_device_index, settings.rtl_gain, stop=stop)
+        worker = SpectrumAcquisitionWorker(
+            scanner, sink,
+            profile, observer, stop, settings.acquisition_cadence_budget_seconds,
+            settings.acquisition_recovery_seconds,
+            sink_lifecycle_owner="station",
+        )
+        notifier = (TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id,
+                                     coordinator=coordinator)
+                    if settings.telegram_enabled else None)
+        report_engine = SQLiteReportEngine(settings.sweeps_path)
+        try:
+            report_engine.coordinator = coordinator
+        except AttributeError:
+            pass
+        runner = ScheduledReportRunner(
+            report_engine, notifier, settings.data_dir,
+            timezone=settings.timezone, delivery_attempts=settings.telegram_attempts,
+            storage=report_storage, health_path=health_path, state=state, health_owner=health,
+            coordinator=coordinator,
+        )
+        resource_sampler = LinuxResourceSampler(
+            health, settings.resource_sampling_interval_seconds)
+        acquisition_thread = Thread(
+            target=run_component, args=("acquisition", worker.run),
+            name="station-acquisition", daemon=True)
+        report_thread = Thread(
+            target=run_component,
+            args=("report-scheduler", lambda: run_report_scheduler(runner, stop)),
+            name="station-reports", daemon=True,
+        )
+    except BaseException:
+        stop.set()
+        startup_deadline = time.monotonic() + 30
+        if sink is not None:
+            try:
+                sink.close(deadline=startup_deadline)
+            except BaseException:
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Station acquisition storage cleanup failed during startup")
+            finally:
+                try:
+                    critical_survivors.extend(
+                        getattr(sink, "lifecycle_survivors", ()))
+                except BaseException:
+                    logging.getLogger("rf_sentinel.application").exception(
+                        "Station startup survivor accounting failed")
+        elif acquisition_storage is not None:
+            _bounded_close(acquisition_storage, deadline=startup_deadline,
+                           thread_name="station-startup-acquisition-storage-close",
+                           survivor_registry=critical_survivors)
+        if report_storage is not None:
+            _bounded_close(report_storage, deadline=startup_deadline,
+                           thread_name="station-startup-report-storage-close",
+                           survivor_registry=critical_survivors)
+        raise
+
     inbound_thread = None
     previous = {}
     try:
@@ -262,6 +390,9 @@ def _run_station_lifecycle(settings: Settings) -> int:
         health.save()
         logging.getLogger("rf_sentinel.application").info(
             "RF Sentinel station started: acquisition, reports, and Telegram lifecycle shared")
+        start_sink = getattr(sink, "start", None)
+        if start_sink is not None:
+            start_sink()
         acquisition_thread.start()
         report_thread.start()
         resource_sampler.start()
@@ -289,6 +420,30 @@ def _run_station_lifecycle(settings: Settings) -> int:
             return max(0.0, shutdown_deadline - time.monotonic())
 
         stop.set()
+        stop_active_process = getattr(scanner, "stop_active_process", None)
+        if stop_active_process is not None:
+            try:
+                stop_active_process(deadline=shutdown_deadline)
+            except BaseException as error:
+                shutdown_failure(
+                    "rtl_power", f"Active rtl_power cleanup failed: {type(error).__name__}",
+                    code="shutdown_error")
+                logging.getLogger("rf_sentinel.application").exception(
+                    "Station supervisor failed to reap active rtl_power")
+        scanner_is_alive = getattr(scanner, "is_alive", None)
+        if scanner_is_alive is not None:
+            try:
+                scanner_active = scanner_is_alive()
+            except BaseException as error:
+                scanner_active = True
+                shutdown_failure(
+                    "rtl_power", f"Active rtl_power state check failed: {type(error).__name__}",
+                    code="shutdown_error")
+            if scanner_active:
+                critical_survivors.append(scanner)
+                if not any(item["component"] == "rtl_power" for item in component_failures):
+                    shutdown_failure(
+                        "rtl_power", "Active rtl_power remained unresolved after cleanup")
         try:
             sampler_stopped = resource_sampler.stop(timeout_seconds=remaining_shutdown_budget())
         except BaseException as error:
@@ -297,6 +452,9 @@ def _run_station_lifecycle(settings: Settings) -> int:
         if not sampler_stopped:
             if not any(item["component"] == "resource-sampler" for item in component_failures):
                 shutdown_failure("resource-sampler", "Resource telemetry sampler did not stop before shared shutdown deadline")
+            sampler_thread = getattr(resource_sampler, "_thread", None)
+            if sampler_thread is not None:
+                critical_survivors.append(sampler_thread)
         try:
             acquisition_thread.join(timeout=remaining_shutdown_budget())
         except BaseException as error:
@@ -310,7 +468,28 @@ def _run_station_lifecycle(settings: Settings) -> int:
             shutdown_failure(
                 "acquisition", f"Acquisition worker alive check failed: {type(error).__name__}",
                 code="shutdown_error")
+        # Close the narrow race where acquisition passed its stop check before
+        # the first supervisor lookup and registered rtl_power during join.
+        if scanner_is_alive is not None:
+            try:
+                late_scanner_active = scanner_is_alive()
+            except BaseException:
+                late_scanner_active = True
+            if late_scanner_active and stop_active_process is not None:
+                try:
+                    stop_active_process(deadline=shutdown_deadline)
+                    late_scanner_active = scanner_is_alive()
+                except BaseException as error:
+                    if not any(item["component"] == "rtl_power"
+                               for item in component_failures):
+                        shutdown_failure(
+                            "rtl_power",
+                            f"Late rtl_power cleanup failed: {type(error).__name__}",
+                            code="shutdown_error")
+            if late_scanner_active:
+                critical_survivors.append(scanner)
         if not acquisition_stopped:
+            critical_survivors.append(acquisition_thread)
             if not any(item["component"] == "acquisition" and
                        item["category"] == "shutdown" for item in component_failures):
                 shutdown_failure(
@@ -332,6 +511,8 @@ def _run_station_lifecycle(settings: Settings) -> int:
                 item["component"] == "report-scheduler" and
                 item["category"] == "shutdown" for item in component_failures):
             shutdown_failure("report-scheduler", "Report scheduler remained alive after shared shutdown deadline")
+        if not report_stopped:
+            critical_survivors.append(report_thread)
         try:
             _stop_telegram_polling(inbound_thread, stop, deadline=shutdown_deadline)
         except BaseException as error:
@@ -343,7 +524,10 @@ def _run_station_lifecycle(settings: Settings) -> int:
         try:
             telegram_alive = inbound_thread is not None and inbound_thread.is_alive()
         except BaseException as error:
-            telegram_alive = False
+            # An unreadable runtime state is unresolved, not proof of shutdown.
+            # Register it with the existing guardian so station ownership is
+            # retained until a later terminal-state check succeeds.
+            telegram_alive = True
             shutdown_failure(
                 "telegram", f"Telegram runtime alive check failed: {type(error).__name__}",
                 code="shutdown_error")
@@ -352,20 +536,17 @@ def _run_station_lifecycle(settings: Settings) -> int:
         if telegram_alive:
             shutdown_failure(
                 "telegram", "Telegram polling thread remained alive after shared shutdown deadline")
-        if acquisition_stopped:
-            try:
-                sink.close(deadline=shutdown_deadline)
-            except BaseException as error:
-                shutdown_failure(
-                    "storage", f"Measurement sink failed to stop cleanly: {type(error).__name__}",
-                    code="shutdown_error")
-                logging.getLogger("rf_sentinel.application").exception(
-                    "Station measurement sink close failed")
-        else:
+            critical_survivors.append(inbound_thread)
+        # Closing marks the sink terminal before draining. A late acquisition
+        # producer is rejected instead of leaving the writer open indefinitely.
+        try:
+            sink.close(deadline=shutdown_deadline)
+        except BaseException as error:
             shutdown_failure(
-                "storage",
-                "Measurement sink close skipped because acquisition producer may still enqueue",
-            )
+                "storage", f"Measurement sink failed to stop cleanly: {type(error).__name__}",
+                code="shutdown_error")
+            logging.getLogger("rf_sentinel.application").exception(
+                "Station measurement sink close failed")
         incidents = []
         incident_source = "available"
         try:
@@ -380,7 +561,8 @@ def _run_station_lifecycle(settings: Settings) -> int:
         try:
             report_close_status, report_close_error = _bounded_close(
                 report_storage, deadline=shutdown_deadline,
-                thread_name="station-report-storage-close")
+                thread_name="station-report-storage-close",
+                survivor_registry=critical_survivors)
         except BaseException as error:
             shutdown_failure(
                 "report-storage", f"Station report SQLite close failed: {type(error).__name__}",
@@ -427,6 +609,12 @@ def _run_station_lifecycle(settings: Settings) -> int:
                 for item in component_failures):
             shutdown_failure("storage", "Final measurement sink snapshot unavailable")
 
+        try:
+            sink_survivors = getattr(sink, "lifecycle_survivors", ())
+            critical_survivors.extend(sink_survivors)
+        except BaseException:
+            shutdown_failure("storage", "Measurement sink survivor state unavailable")
+
         sink_failure = summary._sink_shutdown_failure(final_sink_snapshot)
         final_non_clean = bool(component_failures or sink_failure is not None)
         state.application_status = "failed" if final_non_clean else "stopped"
@@ -458,8 +646,10 @@ def _run_station_lifecycle(settings: Settings) -> int:
                 logging.getLogger("rf_sentinel.application").exception(
                     "Final health publication without sink snapshot failed")
         try:
+            final_non_clean = bool(component_failures or sink_failure is not None)
+            exit_code = 1 if final_non_clean else 0
             summary.write(settings=settings, state=state, coordinator=coordinator,
-                          status=("failed" if component_failures else "stopped"),
+                          status=("failed" if final_non_clean else "stopped"),
                           component_failures=component_failures,
                           incidents=incidents, incident_source=incident_source,
                           sink_snapshot=final_sink_snapshot)
@@ -479,7 +669,7 @@ def _run_station_lifecycle(settings: Settings) -> int:
             except BaseException:
                 logging.getLogger("rf_sentinel.application").exception(
                     "Corrective health publication after run summary failure failed")
-    return exit_code
+    return _StationLifecycleResult(exit_code, tuple(dict.fromkeys(critical_survivors)))
 
 
 def main(argv: list[str] | None = None) -> int:

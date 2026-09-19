@@ -2,6 +2,13 @@ class SentinelError(Exception):
     """Помилка application з фіксованим безпечним повідомленням."""
 
 
+SAFE_SCAN_ERROR_CODES = frozenset({
+    "timeout", "output_too_large", "stderr_too_large", "subprocess_exit",
+    "tuner_pll", "executable_missing", "io_error", "incomplete_coverage",
+    "parser_malformed", "frame_count", "bin_width", "device_busy", "stopped",
+})
+
+
 class ConfigurationError(SentinelError):
     pass
 

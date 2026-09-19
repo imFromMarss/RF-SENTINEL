@@ -35,7 +35,7 @@ RF activity is often intermittent, spread across wide frequency ranges, and diff
 
 ## 5. Hardware platform
 
-The deployed target is a Raspberry Pi Compute Module 4 running Ubuntu Server. The service is `rf-sentinel.service`, enabled at boot, with current `main` deployed at the baseline HEAD. CM4 CPU/RSS/I/O/temperature capacity evidence and possible process/CPU isolation or platform split are the next major milestone, not completed functionality.
+The deployed target is a Raspberry Pi Compute Module 4 running Ubuntu Server. The service is `rf-sentinel.service`, enabled at boot, with current `main` deployed at the baseline HEAD. CPU/RSS/I/O/temperature, cadence, queue, persistence and component-overlap instrumentation is implemented; representative CM4 capacity evidence and any process/CPU isolation or platform-split decision remain open.
 
 ## 6. SDR hardware
 

@@ -14,7 +14,9 @@ from rf_sentinel.acquisition import (AsyncMeasurementSink, ErrorClassification, 
 from rf_sentinel.config import Settings
 from rf_sentinel.errors import ConfigurationError, MeasurementPersistenceError, ScanError
 from rf_sentinel.observability import AcquisitionObserver, OperationalFormatter
+from rf_sentinel.reporting import SQLiteReportEngine
 from rf_sentinel.rtl_power import RTLPowerScanner
+from rf_sentinel.storage import SQLiteMeasurementSink
 
 NOW = datetime(2026, 9, 8, tzinfo=UTC)
 
@@ -211,6 +213,84 @@ def test_stopped_scan_error_without_stop_is_a_real_failure(tmp_path):
     assert observer.state.failed_sweeps == 1
     assert observer.state.total_sweeps == 1
     assert stop.waits == [60]
+
+
+def test_failed_attempt_is_persisted_without_rf_payload_and_is_not_a_missing_slot(tmp_path):
+    class StopAfterRecoveryWait(ClockStop):
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            self.set()
+            return True
+
+    stop = StopAfterRecoveryWait()
+    path = tmp_path / "sweeps.sqlite3"
+    storage = SQLiteMeasurementSink(path)
+    sink = AsyncMeasurementSink(storage, close_downstream=False)
+    observer = AcquisitionObserver(
+        tmp_path / "health.json", SweepProfile(), 10, 60, storage)
+
+    def fail(_profile):
+        raise ScanError("synthetic secret", reason="timeout")
+
+    try:
+        SpectrumAcquisitionWorker(
+            SimpleNamespace(acquire=fail), sink, SweepProfile(), observer, stop,
+            monotonic=lambda: stop.time, now=lambda: NOW,
+            sink_lifecycle_owner="station",
+        ).run()
+        sink.close(timeout=2)
+
+        persisted = storage.query_sweeps(NOW - timedelta(seconds=1),
+                                         NOW + timedelta(seconds=1))
+        incidents = storage.query_incidents()
+        report = SQLiteReportEngine(path).build(
+            NOW - timedelta(seconds=1), NOW + timedelta(seconds=1))
+        missing = SQLiteReportEngine(path).build(
+            NOW + timedelta(minutes=1), NOW + timedelta(minutes=2))
+
+        assert len(persisted) == 1
+        attempt = persisted[0]
+        assert attempt.status == "failed"
+        assert attempt.frequencies_hz == attempt.powers == ()
+        assert attempt.actual_profile is None
+        assert attempt.coverage == SweepCoverage("none", 3484, 0, 0.0)
+        assert attempt.error_classification == ErrorClassification("acquisition", "timeout")
+        assert attempt.correlation_id == incidents[0].correlation_id
+        assert (report.failed_count, report.sweep_count) == (1, 1)
+        assert (missing.failed_count, missing.sweep_count) == (0, 0)
+        assert missing.gaps[0].kind == "window"
+    finally:
+        if sink._writer.is_alive():
+            sink.close(timeout=2)
+        storage.close()
+
+
+def test_successful_acquisition_persistence_failure_does_not_create_failed_sweep(tmp_path):
+    path = tmp_path / "sweeps.sqlite3"
+    incident_storage = SQLiteMeasurementSink(path)
+    observer = AcquisitionObserver(
+        tmp_path / "health.json", SweepProfile(), 10, 60, incident_storage)
+    persistence_error = MeasurementPersistenceError("synthetic persistence failure")
+
+    class RejectingSink:
+        def store_sweep(self, sweep):
+            from rf_sentinel.acquisition import MeasurementReceipt
+            return MeasurementReceipt(sweep.sweep_id, "failed", persistence_error)
+
+    try:
+        with pytest.raises(MeasurementPersistenceError):
+            SpectrumAcquisitionWorker(
+                SimpleNamespace(acquire=lambda _profile: frame()), RejectingSink(),
+                SweepProfile(), observer, ClockStop(), now=lambda: NOW,
+                sink_lifecycle_owner="station",
+            ).run()
+
+        assert incident_storage.query_sweeps(
+            NOW - timedelta(seconds=1), NOW + timedelta(minutes=1)) == []
+        assert observer.state.failed_sweeps == 0
+        assert observer.state.application_status == "failed"
+    finally:
+        incident_storage.close()
 
 
 def test_unrelated_exception_keeps_worker_failure_semantics(tmp_path):
@@ -479,23 +559,65 @@ def test_kill_fallback_reaps_child(monkeypatch):
     def spawn(command, **kwargs):
         process = FakeProcess(command, **kwargs)
         process.returncode = None
+        waits = []
         def terminate():
             process.terminated = True
         def wait(timeout=None):
-            if timeout:
+            waits.append(timeout)
+            if len(waits) == 1:
                 raise subprocess.TimeoutExpired(command, timeout)
             process.waited = True
+            process.returncode = -9
         process.terminate = terminate
         process.wait = wait
+        process.waits = waits
         processes.append(process)
         return process
     monkeypatch.setattr(subprocess, "Popen", spawn)
     def interrupt(_):
         raise KeyboardInterrupt
     monkeypatch.setattr("rf_sentinel.rtl_power.time.sleep", interrupt)
+    scanner = RTLPowerScanner()
     with pytest.raises(KeyboardInterrupt):
-        RTLPowerScanner().acquire(SweepProfile())
+        scanner.acquire(SweepProfile())
     assert processes[0].terminated and processes[0].killed and processes[0].waited
+    assert processes[0].waits == [2, 2]
+    assert scanner.active_process is None
+
+
+def test_kill_fallback_reap_timeout_remains_bounded(monkeypatch):
+    import subprocess
+    from tests.test_rtl_power import FakeProcess
+    processes = []
+
+    def spawn(command, **kwargs):
+        process = FakeProcess(command, **kwargs)
+        process.returncode = None
+        process.waits = []
+
+        def wait(timeout=None):
+            assert timeout is not None
+            process.waits.append(timeout)
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        process.wait = wait
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(
+        "rf_sentinel.rtl_power.time.sleep",
+        lambda _: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    scanner = RTLPowerScanner()
+    with pytest.raises(ScanError) as error:
+        scanner.acquire(SweepProfile())
+
+    assert error.value.reason == "io_error"
+    assert processes[0].terminated and processes[0].killed
+    assert processes[0].waits == [2, 2]
+    assert scanner.active_process is processes[0]
 
 
 def test_log_rotation_is_bounded(tmp_path):

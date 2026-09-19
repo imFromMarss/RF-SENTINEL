@@ -14,14 +14,14 @@ Stable baseline включає continuous RTL-SDR acquisition через supervi
 
 Stable functionality також включає canonical pixel-to-pixel waterfall, canonical time-slot grid із black rows для missing slots, Keenerd-compatible heatmap, Telegram report delivery як document/file, immutable calibration artifact model і bounded RTL-SDR characterization workflows: baseline, CW points, resumable CW matrix та frequency-accuracy/tuner diagnostics.
 
-Hardware-free validation: **387 passed, 2 skipped**. Skipped checks є opt-in:
+Hardware-free validation: **577 passed, 2 skipped**. Skipped checks є opt-in:
 
 - real RTL-SDR test requires `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
 Calibration artifact model є stable, але actual/reference source measurement, calibration correction application, LibreVNA raw/reference receiver, normalization/interpolation, cable/source corrections та uncertainty/stability work — WIP/roadmap. Characterization не є calibrated measurement system і не повинно трактуватися як absolute-power measurement.
 
-Наступний великий milestone — **Observability & CM4 Capacity Preparation**: CPU/RSS/I/O/temperature telemetry, sweep duration/cadence/jitter, вплив reporting і Telegram на acquisition, storage/queue behavior, evidence-based рішення щодо process/CPU isolation та CM4 capacity/можливої зміни або розділення платформи. Ці можливості ще не заявляються як реалізовані.
+Operational observability реалізована: health/run summary містять resource, cadence, queue, persistence, report/Telegram timing та overlap telemetry; rotated structured logs і bounded incidents доповнюють ці snapshots. Ці метрики дають evidence для окремого capacity decision, але самі по собі не доводять універсальну CM4 capacity і не приймають рішення про process/CPU isolation.
 
 ## CLI matrix
 
@@ -38,7 +38,7 @@ Calibration artifact model є stable, але actual/reference source measurement
 
 ## Current acquisition
 
-Default acquisition profile: `24 MHz`–`1766 MHz`, `ACQUISITION_BIN_HZ=500000`, cadence budget `60 s`, recovery delay `60 s`. `250 kHz` не є current default. Worker виконує послідовні sweep-и; overlap і catch-up відсутні. Failed acquisition attempts persist у SQLite як rows з terminal status `failed`; missing intervals не створюють synthetic SQLite records. Missing intervals спостерігаються через report gaps, cadence/health counters і logs. Report renderer не вигадує synthetic RF data: canonical time grid містить окремі missing slots, які raster-яться як black/empty rows, без RF interpolation між sweep-ами або missing slots. Normal report використовує canonical pixel-to-pixel waterfall і Keenerd-compatible heatmap; Matplotlib renderer залишається fallback лише для no-data/empty path.
+Default acquisition profile: `24 MHz`–`1766 MHz`, `ACQUISITION_BIN_HZ=500000`, cadence budget `60 s`, recovery delay `60 s`. `250 kHz` не є current default. Worker виконує послідовні sweep-и; overlap і catch-up відсутні. Successful attempt має RF payload і стає durable лише після SQLite commit. `ScanError`/timeout/parser/coverage failure persist як `failed` row із requested profile, timestamps, safe error classification, `coverage=none` і без RF payload; correlated incident, health і log лишають operational evidence. Missing slot не має sweep row та відображається report gap/cadence telemetry і black/empty time-grid row. Persistence failure після successful acquisition є окремим storage failure: вона не створює `failed` sweep і не робить RF payload durable; її фіксують sink/persistence telemetry, health, structured log і non-clean run summary. Report renderer не вигадує synthetic RF data і не інтерполює між sweep-ами або missing slots.
 
 Acquisition не генерує reports і не виконує Telegram delivery у своєму path. Report generation/delivery не завершує acquisition. Деталі: [continuous acquisition](docs/CONTINUOUS_ACQUISITION.md).
 
@@ -46,7 +46,7 @@ Acquisition не генерує reports і не виконує Telegram delivery
 
 Scheduler формує completed hourly reports на початку наступної години та daily reports о 00:00 у configured timezone (default `Europe/Kyiv`). Report windows half-open; failed rows присутні в timeline та outcome counts. Деталі storage/report semantics і Telegram authorization: [STATUS](docs/STATUS.md) та [DECISIONS](docs/DECISIONS.md).
 
-Поточний deployment: CM4 / Ubuntu Server із `systemd` service `rf-sentinel.service`, автоматичним стартом при boot і deployed `main` на baseline HEAD. Operational artifacts: `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/logs/rf-sentinel.log`. Unit/deployment environment є operational artifact target, а не committed repository unit. Lifecycle policy: `.local*` і `.local-validation/` — disposable local validation; runtime data — operational; canonical characterization/calibration datasets — довгоживучі й не повинні випадково трактуватися як disposable. Runbook: [DEPLOYMENT](docs/DEPLOYMENT.md).
+Поточний deployment: CM4 / Ubuntu Server із `systemd` service `rf-sentinel.service`, автоматичним стартом при boot і deployed `main` на baseline HEAD. Operational artifacts: `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/status/run-summary.json`, `runtime/logs/rf-sentinel.log` і `runtime/reports/`. Unit/deployment environment є operational artifact target, а не committed repository unit. Lifecycle policy: усі `.local*` paths — disposable validation area; canonical characterization/calibration datasets є long-lived source records і мають зберігатися поза `.local*`; runtime DB/status/log/report artifacts — operational і керуються deployment/backup/retention policy. Цей cleanup datasets не переміщує. Runbook: [DEPLOYMENT](docs/DEPLOYMENT.md).
 
 ## Документація
 

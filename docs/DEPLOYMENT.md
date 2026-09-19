@@ -61,7 +61,7 @@ Canonical foreground start:
 .venv/bin/python -m rf_sentinel station
 ```
 
-Keep this process under an operator terminal during manual validation. Stop with Ctrl+C or SIGTERM. The runtime sets a stop event, interrupts active `rtl_power`, drains bounded acquisition work, joins components within deadlines and closes SQLite connections. Logs report if a component exceeds its shutdown deadline.
+Keep this process under an operator terminal during manual validation. Stop with Ctrl+C or SIGTERM. The runtime sets a stop event, interrupts active `rtl_power`, and uses one shared 30-second absolute deadline to join components, drain/close acquisition storage and close the report connection. Clean coordinated shutdown exits `0`. Component, persistence, finalization or deadline failure writes failed/incomplete health and run summary and exits `1`; Ctrl+C handled by the CLI exits `130`. If a station-owned critical helper survives the deadline, the process-level station lock remains held until that helper actually terminates, preventing an overlapping replacement instance.
 
 ## Logs, health and artifacts
 
@@ -72,11 +72,11 @@ find "${RF_SENTINEL_DATA_DIR:-runtime}" -maxdepth 3 -type f -print
 tail -f "${RF_SENTINEL_DATA_DIR:-runtime}/logs/rf-sentinel.log"
 ```
 
-On the deployed target the primary artifacts are `runtime/sweeps.sqlite3`, `runtime/status/health.json` and `runtime/logs/rf-sentinel.log`; reports are under `runtime/reports/`. Failed sweeps and report failures remain observable in health/logs/incidents; do not delete them while diagnosing. Log rotation defaults to 5,000,000 bytes with 3 backups.
+On the deployed target the primary artifacts are `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/status/run-summary.json` and `runtime/logs/rf-sentinel.log`; reports are under `runtime/reports/`. Failed acquisition attempts are payload-free failed rows correlated with incidents; missing slots have no row. Persistence/finalization failures appear in health/run summary, sink telemetry and logs. Do not delete these artifacts while diagnosing. Log rotation defaults to 5,000,000 bytes with 3 backups.
 
 ## Storage and operations
 
-Reserve disk headroom for SQLite WAL/activity, report artifacts and temporary report payload/render work. Large reports can use temporary disk substantially; retention/cleanup policy remains production-hardening work. `.local*` / `.local-validation/` are disposable local validation only; runtime data is operational; canonical characterization/calibration datasets are long-lived and must not be treated as disposable. Monitor free space and SQLite size, back up artifacts before maintenance, and avoid placing `DATA_DIR` on an unreliable or nearly full filesystem.
+Reserve disk headroom for SQLite WAL/activity, report artifacts and temporary report payload/render work. Large reports can use temporary disk substantially; retention/cleanup policy remains production-hardening work. Every `.local*` path is a disposable validation area. Canonical characterization/calibration datasets are long-lived source records and must live outside `.local*`; this reconciliation does not move existing datasets. `DATA_DIR` database/status/log/report files are operational artifacts governed by deployment backup and retention. Monitor free space and SQLite size, back up artifacts before maintenance, and avoid placing `DATA_DIR` on an unreliable or nearly full filesystem.
 
 ## Validation
 
@@ -86,7 +86,7 @@ Hardware-free suite:
 .venv/bin/python -m pytest -q
 ```
 
-Expected: `387 passed, 2 skipped`. Explicit hardware checks:
+Expected: `577 passed, 2 skipped`. Explicit hardware checks:
 
 ```sh
 RF_SENTINEL_TEST_HARDWARE=1 .venv/bin/python -m pytest -q -m hardware

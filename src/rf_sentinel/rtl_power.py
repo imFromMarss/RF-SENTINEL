@@ -9,6 +9,7 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 from rf_sentinel.acquisition import (DeviceIdentity, SpectrumSweep, SweepCoverage,
@@ -93,9 +94,99 @@ class RTLPowerScanner:
         self._device_index = device_index
         self._gain = gain
         self._stop = stop
+        self._process_lock = Lock()
+        self._active_process = None
+        self._shutdown_requested = False
 
     def acquire(self, profile: SweepProfile) -> SpectrumSweep:
         return _sweep_from_result(self._scan(profile))
+
+    @staticmethod
+    def _stop_process(process, *, deadline: float | None = None) -> None:
+        """Terminate and reap rtl_power without an unbounded final wait."""
+        def wait_timeout():
+            return 2 if deadline is None else min(2, max(0.0, deadline - time.monotonic()))
+
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=wait_timeout())
+            except subprocess.TimeoutExpired:
+                raise ScanError(
+                    "Не вдалося завершити rtl_power у відведений час",
+                    reason="io_error",
+                ) from None
+            return
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=wait_timeout())
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=wait_timeout())
+        except subprocess.TimeoutExpired:
+            raise ScanError(
+                "Не вдалося примусово завершити rtl_power у відведений час",
+                reason="io_error",
+            ) from None
+
+    def _register_process(self, process) -> bool:
+        with self._process_lock:
+            self._active_process = process
+            return not self._shutdown_requested
+
+    def _start_process(self, command, **kwargs):
+        """Atomically gate process creation against station shutdown."""
+        with self._process_lock:
+            if self._shutdown_requested:
+                raise ScanError("Завершення прийому", reason="stopped")
+            process = subprocess.Popen(command, **kwargs)
+            self._active_process = process
+            return process
+
+    def _clear_process(self, process) -> None:
+        with self._process_lock:
+            if self._active_process is process:
+                self._active_process = None
+
+    def _stop_owned_process(self, process, *, deadline: float | None = None) -> None:
+        self._stop_process(process, deadline=deadline)
+        self._clear_process(process)
+
+    @property
+    def active_process(self):
+        """Return the supervisor-visible rtl_power handle, if ownership is active."""
+        with self._process_lock:
+            return self._active_process
+
+    def stop_active_process(self, *, deadline: float | None = None) -> bool:
+        """Boundedly terminate, kill, and reap the currently owned rtl_power."""
+        with self._process_lock:
+            self._shutdown_requested = True
+            process = self._active_process
+        if process is None:
+            return True
+        self._stop_owned_process(process, deadline=deadline)
+        return True
+
+    def is_alive(self) -> bool:
+        """Implement the station critical-owner protocol."""
+        return self.active_process is not None
+
+    def join(self, timeout: float | None = None) -> None:
+        """Retry bounded child cleanup while the station lock remains owned."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        try:
+            self.stop_active_process(deadline=deadline)
+        except ScanError:
+            return
 
     def _scan(self, profile: ScanProfile | SweepProfile,
               raw_path: Path | None = None) -> ScanResult:
@@ -139,46 +230,38 @@ class RTLPowerScanner:
                     if raw_path is not None else tempfile.TemporaryFile()
                 )
                 # Файлові буфери обмежують використання RAM; raw CSV зберігається і при відмові.
-                with subprocess.Popen(
+                process = self._start_process(
                     command, shell=False, stdin=subprocess.DEVNULL, stdout=output,
                     stderr=diagnostics, env=child_env,
-                ) as process:
-                    try:
-                        while process.poll() is None:
-                            if self._stop is not None and self._stop.is_set():
-                                raise ScanError("Завершення прийому", reason="stopped")
-                            if time.monotonic() - started > timeout_seconds:
-                                raise ScanError(
-                                    "Перевищено час очікування сканування rtl_power",
-                                    reason="timeout",
-                                )
-                            if os.fstat(output.fileno()).st_size > MAX_CSV_BYTES:
-                                raise ScanError(
-                                    "Дані rtl_power перевищили ліміт розміру",
-                                    reason="output_too_large",
-                                )
-                            if os.fstat(diagnostics.fileno()).st_size > 1024 * 1024:
-                                raise ScanError(
-                                    "Діагностика rtl_power перевищила ліміт розміру",
-                                    reason="stderr_too_large",
-                                )
-                            time.sleep(0.05)
-                    finally:
-                        if process.poll() is None:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait()
-                        else:
-                            process.wait()
-                    if process.returncode != 0:
-                        raise ScanError(
-                            "Помилка rtl_power; перевірте доступність пристрою",
-                            reason="subprocess_exit",
-                            returncode=process.returncode,
-                        )
+                )
+                try:
+                    while process.poll() is None:
+                        if self._stop is not None and self._stop.is_set():
+                            raise ScanError("Завершення прийому", reason="stopped")
+                        if time.monotonic() - started > timeout_seconds:
+                            raise ScanError(
+                                "Перевищено час очікування сканування rtl_power",
+                                reason="timeout",
+                            )
+                        if os.fstat(output.fileno()).st_size > MAX_CSV_BYTES:
+                            raise ScanError(
+                                "Дані rtl_power перевищили ліміт розміру",
+                                reason="output_too_large",
+                            )
+                        if os.fstat(diagnostics.fileno()).st_size > 1024 * 1024:
+                            raise ScanError(
+                                "Діагностика rtl_power перевищила ліміт розміру",
+                                reason="stderr_too_large",
+                            )
+                        time.sleep(0.05)
+                finally:
+                    self._stop_owned_process(process)
+                if process.returncode != 0:
+                    raise ScanError(
+                        "Помилка rtl_power; перевірте доступність пристрою",
+                        reason="subprocess_exit",
+                        returncode=process.returncode,
+                    )
                 diagnostics.seek(0)
                 diagnostic = diagnostics.read(1024 * 1024 + 1)
                 tuner = "R820T" if b"R820T" in diagnostic else "невідомо"

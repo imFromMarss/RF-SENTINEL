@@ -26,6 +26,8 @@ FAILURE_NOTIFICATION = (
 RECOVERY_NOTIFICATION = "RF Sentinel: моніторинг спектра відновлено."
 
 
+# Public names retained for the legacy ``schedule`` workflow and downstream
+# compatibility. They are not part of the canonical station scheduler.
 HealthState = AcquisitionHealth
 write_status = write_health_snapshot
 
@@ -83,20 +85,6 @@ def run_continuous(run_survey: Callable, recovery_seconds: float, stop: Event,
     run_continuous_loop(cycle, recovery_seconds, stop, start, result, failure, shutdown,
                         retry_exceptions=(SentinelError,))
     return state
-
-
-def run_schedule(run_survey: Callable, interval_seconds: float, stop: Event) -> None:
-    if not 0 < interval_seconds <= 86400:
-        raise ValueError("Некоректний інтервал scheduler")
-    while not stop.is_set():
-        try:
-            outcome = run_survey()
-            logger.info("Огляд завершено: scan=%s, Telegram=%s",
-                        outcome.scan_status, outcome.notification_status)
-        except SentinelError:
-            logger.error("Огляд завершився помилкою; наступна спроба після інтервалу")
-        # Фіксована затримка не допускає overlap та catch-up storm.
-        stop.wait(interval_seconds)
 
 
 class ScheduledReportRunner:

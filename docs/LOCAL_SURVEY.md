@@ -38,4 +38,4 @@ Hardware-free validation:
 .venv/bin/python -m pytest -q
 ```
 
-Expected stable baseline: `387 passed, 2 skipped`. Real RTL-SDR і 30-minute hardware test запускаються лише explicit opt-in; див. [DEPLOYMENT.md](DEPLOYMENT.md).
+Expected stable baseline: `577 passed, 2 skipped`. Real RTL-SDR і 30-minute hardware test запускаються лише explicit opt-in; див. [DEPLOYMENT.md](DEPLOYMENT.md).

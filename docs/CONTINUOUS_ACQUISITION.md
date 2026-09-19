@@ -29,24 +29,31 @@ Flow: `RTLPowerScanner.acquire` → `SpectrumAcquisitionWorker` → bounded `Asy
 - `partial` — persisted attempt із degraded quality/partial coverage;
 - `failed` — persisted metadata без payload, `coverage.status=none`, `quality.status=unavailable` та `error_classification`.
 
-Failed acquisition attempts persist у SQLite як rows з outcome `failed`; parser failure і persistence failure також залишаються observable через health counters, incident history та logs. Missing intervals не створюють synthetic SQLite records: вони визначаються/спостерігаються через report gaps, cadence/health counters і logs. Committed SQLite rows є authoritative; bounded queue може втратити queued-but-not-persisted frames після hard crash.
+Canonical terminal-attempt contract:
+
+- successful acquisition створює `success` sweep із RF payload; enqueue/receipt `accepted` ще не є durability claim, authoritative є лише committed SQLite row;
+- `ScanError`, timeout, parser або coverage failure створює `failed` sweep із requested profile, attempt timestamps, safe `error_classification`, `coverage.status=none`, `quality.status=unavailable` і порожніми frequency/power arrays. Це metadata outcome, не synthetic RF data. Correlation ID зв'язує row з acquisition incident; health і structured log містять operational state;
+- missing slot не створює sweep. Reporting відрізняє його як відсутність row у canonical time slot/report gap; cadence telemetry окремо рахує missed slots;
+- persistence failure після successful acquisition не змінює acquisition result на `failed` і не створює інший sweep. Непідтверджений payload не є durable; failure належить persistence boundary і залишається у queue/persistence telemetry, health, structured log та non-clean run summary. Якщо не вдалося persist саме failed-attempt row, correlated acquisition incident/health усе ще описують attempt, а persistence failure окремо робить lifecycle non-clean.
+
+Таким чином failed-attempt row і missing slot однозначно різні, а жоден failure path не вигадує RF bins. Committed SQLite rows є authoritative; bounded queue може втратити queued-but-not-persisted frames після hard crash.
 
 ## Recovery і shutdown
 
 Scan/parser failure переводить стан у `recovering` і планує повтор після configurable recovery delay (default `60 s`), без tight retry. Повторні failure alerts пригнічуються; recovery success observable. Ctrl+C/SIGINT і SIGTERM set stop event, переривають wait і active `rtl_power`, не дозволяють новий цикл. Child завершується bounded sequence `terminate` → до 2 s wait → `kill` → `reap`.
 
-У `station` acquisition thread має deadline join до 30 s, report thread — до 10 s; sink drain/close має timeout 10 s і SQLite connections закриваються окремо. Shutdown deterministic/bounded; перевищення deadline логуються.
+У `station` всі producer joins, active `rtl_power` cleanup, sink drain/close, Telegram/report/resource helpers і окремі SQLite closes ділять один absolute 30-second shutdown deadline. Clean coordinated stop повертає exit code `0`; component, persistence, finalization або deadline failure записує non-clean health/run summary і повертає `1`. Critical runtime threads мають daemon fallback, але station lock не звільняється, доки unresolved station-owned survivor фактично не завершився; це не дозволяє overlapping replacement instance.
 
 ## Storage/lifecycle boundary
 
-Після PR #10 межа така:
+Поточна межа ownership така:
 
-- acquisition має окремий writable `SQLiteMeasurementSink` connection;
+- acquisition має окремий writable `SQLiteMeasurementSink` connection; async writer серіалізує sweep commits, а connection-scoped lock також захищає incident/telemetry operations на цьому connection;
 - report scheduler має окремий writable SQLite connection для incident/state-related persistence;
 - `SQLiteReportEngine` читає через окремий read-only SQLite connection (`mode=ro`, `PRAGMA query_only=ON`);
 - report generation не виконується в acquisition path;
 - report generation/delivery failure не повинен завершувати acquisition;
-- scheduler і acquisition мають окреме bounded shutdown lifecycle.
+- `station` є єдиним lifecycle owner: sink володіє acquisition connection, station окремо закриває report connection; standalone `acquire` зберігає власний bounded lifecycle.
 
 `WAL`, busy timeout і async bounded queue допомагають співіснуванню writer/readers. Report engine stream-ить rows і тримає numeric payload у temporary snapshot; `to_dict()` — compatibility API, не preferred large-report path.
 
@@ -60,6 +67,6 @@ Scheduler формує completed hourly window на початку кожної 
 
 ## Observability
 
-`DATA_DIR/sweeps.sqlite3` містить persisted sweep rows та bounded incidents. `DATA_DIR/status/health.json` містить counters/status, timestamps і report/acquisition health. `DATA_DIR/logs/rf-sentinel.log` — rotated JSON Lines; secrets, Telegram URL і response body не логуються. Missing intervals представлені report gaps і окремими black/empty raster slots, а не synthetic RF rows. Renderer не створює synthetic missing rows і не інтерполює RF values між sweep-ами чи missing slots. Для no-data/empty report зберігається Matplotlib fallback.
+`DATA_DIR/sweeps.sqlite3` містить persisted sweep rows та bounded incidents. `DATA_DIR/status/health.json` містить counters/status, resource samples/aggregates, cadence/jitter, queue/persistence, report/Telegram timing і overlap telemetry. `DATA_DIR/status/run-summary.json` фіксує terminal lifecycle, bounded incident tail, component failures і detached final sink snapshot. `DATA_DIR/logs/rf-sentinel.log` — rotated JSON Lines; secrets, Telegram URL і response body не логуються. Missing intervals представлені report gaps і окремими black/empty raster slots, а не synthetic RF rows. Це operational observability, а не завершений hardware capacity verdict.
 
 `LatestSweepSink` — тільки lightweight test implementation, не production history.

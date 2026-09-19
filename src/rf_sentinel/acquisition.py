@@ -11,7 +11,8 @@ from typing import Callable, Literal, Protocol, TypeVar
 from uuid import uuid4
 
 from rf_sentinel.errors import (ConfigurationError, MeasurementPersistenceError,
-                                MeasurementQueueFullError, MeasurementSinkError, ScanError)
+                                MeasurementQueueFullError, MeasurementSinkError,
+                                SAFE_SCAN_ERROR_CODES, ScanError)
 
 
 @dataclass(frozen=True)
@@ -202,7 +203,9 @@ class AsyncMeasurementSink:
     def __init__(self, downstream: MeasurementSink, *, max_queue: int = 32,
                  enqueue_timeout: float = 0.1, thread_name: str = "measurement-writer",
                  close_downstream: bool = True, monotonic=time.monotonic,
-                 deadline_monotonic=time.monotonic):
+                 deadline_monotonic=time.monotonic, writer_daemon: bool = False,
+                 start_immediately: bool = True,
+                 on_terminal_failure: Callable[[BaseException], None] | None = None):
         if type(max_queue) is not int or max_queue < 1:
             raise ConfigurationError("Розмір черги MeasurementSink має бути додатним")
         if not math.isfinite(enqueue_timeout) or enqueue_timeout < 0:
@@ -228,7 +231,9 @@ class AsyncMeasurementSink:
         self._downstream_close_status = ("not_started" if close_downstream
                                          else "not_owned")
         self._downstream_close_failure: BaseException | None = None
-        self._writer = Thread(target=self._write_loop, name=thread_name, daemon=False)
+        self._on_terminal_failure = on_terminal_failure
+        self._writer = Thread(target=self._write_loop, name=thread_name, daemon=writer_daemon)
+        self._writer_started = False
         self.accepted_count = self.persisted_count = 0
         self.rejected_count = self.failed_count = 0
         self.enqueue_count = 0
@@ -240,7 +245,19 @@ class AsyncMeasurementSink:
         self.max_backpressure_wait_seconds = 0.0
         self.total_backpressure_wait_seconds = 0.0
         self.high_water_mark = 0
-        self._writer.start()
+        if start_immediately:
+            self.start()
+
+    def start(self):
+        """Start the writer after its lifecycle owner has finished construction."""
+        with self._condition:
+            if self._writer_started:
+                return self
+            if self._closing or self._closed:
+                raise MeasurementSinkError("MeasurementSink is closed")
+            self._writer.start()
+            self._writer_started = True
+        return self
 
     @property
     def failure(self) -> BaseException | None:
@@ -304,13 +321,23 @@ class AsyncMeasurementSink:
                     else type(self._downstream_close_failure).__name__),
             }
 
+    @property
+    def lifecycle_survivors(self) -> tuple[Thread, ...]:
+        """Return live station-owned writer/close helpers for lock accounting."""
+        with self._condition:
+            candidates = (self._writer, self._downstream_close_thread)
+            return tuple(thread for thread in candidates
+                         if thread is not None and thread.is_alive())
+
     def store_sweep(self, sweep: SpectrumSweep) -> MeasurementReceipt:
         enqueue_started = self._monotonic()
         receipt = MeasurementReceipt(sweep.sweep_id, "accepted")
         with self._condition:
-            if self._closing or self._closed:
+            if not self._writer_started or self._closing or self._closed:
                 receipt.status = "rejected"
-                receipt.error = MeasurementSinkError("MeasurementSink is closed")
+                receipt.error = MeasurementSinkError(
+                    "MeasurementSink is not started" if not self._writer_started
+                    else "MeasurementSink is closed")
                 self.rejected_count += 1
                 return receipt
             if self._failure is not None:
@@ -377,6 +404,7 @@ class AsyncMeasurementSink:
             status: MeasurementStatus
             error: BaseException | None
             persistence_exception = False
+            terminal_failure = None
             try:
                 if self._failure is not None:
                     status, error = "failed", self._failure
@@ -392,6 +420,7 @@ class AsyncMeasurementSink:
                     if self._failure is None:
                         self._failure = MeasurementPersistenceError(
                             "MeasurementSink persistence failed")
+                        terminal_failure = self._failure
                     error = self._failure
                 receipt.status = status
                 receipt.error = error
@@ -415,6 +444,13 @@ class AsyncMeasurementSink:
                 should_exit = ((self._closing or self._failure is not None)
                                and self._pending == 0 and self._active_enqueues == 0)
                 self._condition.notify_all()
+            if terminal_failure is not None and self._on_terminal_failure is not None:
+                try:
+                    self._on_terminal_failure(terminal_failure)
+                except BaseException:
+                    # Persistence is already terminal and observable through the
+                    # sink; a supervisor callback must not corrupt receipt state.
+                    pass
             if should_exit:
                 return
 
@@ -513,7 +549,7 @@ class AsyncMeasurementSink:
             return self._downstream_close_thread
 
     def close(self, timeout: float | None = None, *, deadline: float | None = None) -> None:
-        """Drain and stop the non-daemon writer within one absolute deadline."""
+        """Drain and stop the writer within one absolute deadline."""
         if timeout is not None and deadline is not None:
             raise ValueError("Specify either timeout or deadline, not both")
         if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
@@ -536,8 +572,9 @@ class AsyncMeasurementSink:
         except BaseException as exc:
             error = exc
         remaining = max(0.0, close_deadline - self._deadline_monotonic())
-        self._writer.join(remaining)
-        if self._writer.is_alive():
+        if self._writer_started:
+            self._writer.join(remaining)
+        if self._writer_started and self._writer.is_alive():
             error = error or TimeoutError("MeasurementSink writer did not stop")
             with self._condition:
                 self._close_failure = error
@@ -650,6 +687,7 @@ class SpectrumAcquisitionWorker:
     def run(self):
         previous_started = None
         started = None
+        attempt_started_at = None
 
         def acquire():
             return self.source.acquire(self.profile)
@@ -673,20 +711,53 @@ class SpectrumAcquisitionWorker:
             # failure even if shutdown races with its delivery.
             if isinstance(error, ScanError) and error.reason == "stopped" and self.stop.is_set():
                 return False
-            self.observer.failure(self.monotonic() - started, self.recovery_seconds, error)
+            duration = max(0.0, self.monotonic() - started)
+            finished_at = self.now()
+            code = error.reason if error.reason in SAFE_SCAN_ERROR_CODES else "unknown"
+            expected_bins = max(
+                1, round((self.profile.high_hz - self.profile.low_hz) / self.profile.bin_hz))
+            state = getattr(self.observer, "state", None)
+            failed_sweep = SpectrumSweep(
+                attempt_started_at, finished_at, duration, 0, 0, (), 0, (),
+                getattr(state, "backend", None) or "unknown",
+                status="failed",
+                sequence=getattr(state, "total_sweeps", 0) + 1,
+                correlation_id=getattr(self.observer, "current_correlation_id", None),
+                requested_profile=SweepProfileMetadata(
+                    self.profile.low_hz, self.profile.high_hz, self.profile.bin_hz,
+                    self.profile.integration_seconds, self.profile.duration_seconds),
+                coverage=SweepCoverage("none", expected_bins, 0, 0.0),
+                quality=SweepQuality("unavailable"),
+                error_classification=ErrorClassification("acquisition", code),
+            )
+            persistence_error = None
+            try:
+                receipt = self.sink.store_sweep(failed_sweep)
+                if receipt is not None and receipt.status in ("rejected", "failed"):
+                    persistence_error = receipt.error or MeasurementSinkError(
+                        f"MeasurementSink {receipt.status}")
+            except BaseException as sink_error:
+                persistence_error = sink_error
+            # The acquisition outcome remains authoritative even when its
+            # terminal metadata cannot be persisted. Persistence is a separate
+            # station failure and must never manufacture a second RF outcome.
+            self.observer.failure(duration, self.recovery_seconds, error)
+            if persistence_error is not None:
+                raise persistence_error
             return True
 
         def wait_after_success(_sweep):
             return max(0, self.cadence_budget_seconds - (self.monotonic() - started))
 
         def cycle():
-            nonlocal started, previous_started
+            nonlocal started, previous_started, attempt_started_at
             started = self.monotonic()
             if self.stop.is_set():
                 raise ScanError("Завершення прийому", reason="stopped")
             cadence = None if previous_started is None else started - previous_started
             previous_started = started
-            self.observer.sweep_started(self.now(), cadence)
+            attempt_started_at = self.now()
+            self.observer.sweep_started(attempt_started_at, cadence)
             source_started = self.monotonic()
             try:
                 sweep = acquire()

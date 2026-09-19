@@ -21,7 +21,7 @@ import sys
 import tempfile
 from collections import OrderedDict
 
-from rf_sentinel.errors import MeasurementSinkError
+from rf_sentinel.errors import MeasurementSinkError, SAFE_SCAN_ERROR_CODES
 from rf_sentinel.health import AcquisitionHealth, HealthOwner, write_health_snapshot
 from rf_sentinel.config import is_sensitive_config_field
 
@@ -957,6 +957,11 @@ class AcquisitionObserver:
         self._correlation_id = None
         self.coordinator = coordinator
 
+    @property
+    def current_correlation_id(self):
+        """Correlation shared by the terminal sweep row and incident."""
+        return self._correlation_id
+
     def _sync_storage(self):
         if self.storage is None:
             return
@@ -1079,10 +1084,8 @@ class AcquisitionObserver:
             self._failure_locked(duration, recovery, error)
 
     def _failure_locked(self, duration, recovery, error):
-        safe_reasons = {"timeout", "output_too_large", "stderr_too_large", "subprocess_exit",
-                        "tuner_pll", "executable_missing", "io_error", "incomplete_coverage",
-                        "parser_malformed", "frame_count", "bin_width", "device_busy"}
-        self.state.last_error_reason = error.reason if getattr(error, "reason", None) in safe_reasons else "unknown"
+        self.state.last_error_reason = (
+            error.reason if getattr(error, "reason", None) in SAFE_SCAN_ERROR_CODES else "unknown")
         self.state.last_subprocess_returncode = error.returncode if type(error.returncode) is int else None
         self.state.application_status = "recovering"
         self.state.total_sweeps += 1

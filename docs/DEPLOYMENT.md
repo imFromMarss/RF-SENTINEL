@@ -1,6 +1,6 @@
 # Deployment runbook — current state
 
-Це practical runbook для deployed Raspberry Pi Compute Module 4 / Ubuntu Server. Поточний target працює з `rf-sentinel.service`, автоматично стартує при boot і розгорнутий із `main` на baseline HEAD `6db0a6637688bbaf030214412e972d9e3fb524d3`. Repository не містить unit як повністю відтворюваний deployment artifact; наведені нижче команди також придатні для foreground validation.
+Це practical runbook для Raspberry Pi Compute Module 4 / Ubuntu Server target. Він описує очікуваний `rf-sentinel.service`, automatic boot start і foreground validation; цей repository checkpoint не підтверджує фактичний deployment software HEAD `740ca6c` на CM4. Repository не містить unit як повністю відтворюваний deployment artifact.
 
 ## Prerequisites
 

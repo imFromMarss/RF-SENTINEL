@@ -15,6 +15,8 @@ Stable behavior включає:
 - resource sampling/aggregates, cadence/jitter/missed-slot counters, queue/persistence telemetry, report/Telegram phase timing and overlap metrics у health/run summary;
 - one shared bounded shutdown deadline, non-clean exit code `1` on component/finalization failure, and station-lock retention while any unresolved critical runtime survives.
 
+Software checkpoint: generic Architecture & Code Health cleanup завершений у HEAD `740ca6c191c6ac7d31c0ee6fab737562d4bf72e6`. Це завершений software state; подальший generic cleanup не продовжується без нового evidence.
+
 Terminal acquisition semantics are explicit: successful sweeps carry measured RF payload; retryable acquisition failures persist as correlated `failed` sweep metadata with no RF payload; missing slots have no sweep row; persistence failure is a separate storage/lifecycle failure and never manufactures a failed RF attempt. Reports therefore distinguish failed attempts by failed rows and missing slots by absent rows/gaps.
 
 ### Characterization persistence / resume
@@ -28,7 +30,7 @@ Current working-tree hardware-free suite: **577 passed, 2 skipped**. Skips:
 - real RTL-SDR requires explicit opt-in `RF_SENTINEL_TEST_HARDWARE=1`;
 - 30-minute full-range hardware test requires explicit opt-in `RF_SENTINEL_TEST_FULL_RANGE=1`.
 
-CM4 deployment/acquisition/reporting validation була виконана зовнішньо для цього baseline. Deployed target — CM4 / Ubuntu Server, `rf-sentinel.service`, automatic boot start, current `main` at the baseline HEAD. Repository не містить unit як reproducible deployment artifact; це не скасовує факт operational deployment.
+CM4 deployment/acquisition/reporting validation описана як external operational context для цього baseline. Цей audit не підтверджує, що HEAD `740ca6c` уже deployed на CM4. Repository не містить unit як reproducible deployment artifact.
 
 ## Validated externally
 
@@ -44,9 +46,30 @@ CM4 deployment/acquisition/reporting validation була виконана зов
 
 Observability instrumentation вже реалізована. Відкритим лишається evidence-based capacity verdict на representative CM4 workload і подальше рішення щодо process/CPU isolation чи platform split. Hardware-specific limits не є universal contract.
 
+## Open hardware evidence
+
+RTL-SDR/`rtl_power` reliability incident — **OPEN / DEFERRED**, pending new hardware evidence. Incident не resolved і не закривається hardware-free tests. Він не є blocker для завершеного generic software cleanup; подальші generic architecture changes не починаються без нового evidence.
+
+## Canonical ordered roadmap
+
+1. Measurement Runtime Architecture
+2. ReceiverSlot + Device Manager
+3. Hotplug / reconnect / hot-replace
+4. Critical / non-critical service split
+5. Mixed-criticality temporal scheduling
+6. CM4 capacity / resource validation
+7. RTL-SDR response characterization
+8. Relative correction / calibration semantics
+9. RF frontend architecture
+10. Optional dual-SDR pilot
+11. Measurement Contract Freeze
+12. Baseline
+13. ActivitySegment
+14. RFEvent
+
 ## Future roadmap
 
-RFEvent detection, calibration/reference characterization, IQ capture/classification, multi-SDR/HackRF, retention/production hardening, а також actual/reference source measurement, LibreVNA raw/reference receiver, correction application, normalization/interpolation, cable/source corrections та uncertainty/stability work. Characterization не є calibrated measurement system.
+RFEvent detection, calibration/reference characterization, IQ capture/classification, multi-SDR/HackRF, retention/production hardening, а також actual/reference source measurement, LibreVNA raw/reference receiver, correction application, normalization/interpolation, cable/source corrections та uncertainty/stability work remain roadmap/evidence-gated. RFEvent не є найближчим roadmap item. Characterization не є calibrated measurement system.
 
 Lifecycle policy: усі `.local*` paths — disposable local validation. Canonical characterization/calibration datasets є long-lived source records і мають зберігатися поза `.local*`; runtime DB/status/log/report artifacts — operational і підлягають deployment backup/retention. Existing datasets у цьому cleanup не переміщувалися.
 

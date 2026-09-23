@@ -128,9 +128,9 @@ Where a numeric threshold depends on the specific CM4, storage, SDR, antenna, sp
 - A guarantee that every RF transmission within a configured range will be detected; coverage depends on validated hardware, antenna, environment, scan profile, and operating conditions.
 - Detailed architecture, library, database, message-bus, user-interface, or deployment-technology selection at this requirements stage.
 
-## Current validation and next evidence milestone
+## Current validation and canonical roadmap
 
-Hardware tests are explicit opt-in only. CPU/RSS/I/O/temperature, sweep duration/cadence/jitter, reporting/Telegram timing and overlap, and storage/queue telemetry are implemented current-state observability. The next evidence milestone is a representative CM4 capacity/platform verdict and process/CPU-isolation assessment; instrumentation does not itself establish those hardware-specific limits.
+Hardware tests are explicit opt-in only. CPU/RSS/I/O/temperature, sweep duration/cadence/jitter, reporting/Telegram timing and overlap, and storage/queue telemetry are implemented current-state observability. Representative CM4 capacity/platform evidence and process/CPU-isolation assessment remain open; instrumentation does not itself establish those hardware-specific limits. The ordered roadmap is recorded in [STATUS.md](STATUS.md); CM4 capacity validation is roadmap item 6 and is not an already completed verdict.
 
 ## Open acceptance baselines
 

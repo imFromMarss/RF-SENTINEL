@@ -14,6 +14,8 @@ Stable baseline включає continuous RTL-SDR acquisition через supervi
 
 Stable functionality також включає canonical pixel-to-pixel waterfall, canonical time-slot grid із black rows для missing slots, Keenerd-compatible heatmap, Telegram report delivery як document/file, immutable calibration artifact model і bounded RTL-SDR characterization workflows: baseline, CW points, resumable CW matrix та frequency-accuracy/tuner diagnostics.
 
+Generic Architecture & Code Health cleanup завершений у software checkpoint `740ca6c191c6ac7d31c0ee6fab737562d4bf72e6`. Це repository checkpoint, а не підтвердження deployment на CM4.
+
 Hardware-free validation: **577 passed, 2 skipped**. Skipped checks є opt-in:
 
 - real RTL-SDR test requires `RF_SENTINEL_TEST_HARDWARE=1`;
@@ -46,7 +48,7 @@ Acquisition не генерує reports і не виконує Telegram delivery
 
 Scheduler формує completed hourly reports на початку наступної години та daily reports о 00:00 у configured timezone (default `Europe/Kyiv`). Report windows half-open; failed rows присутні в timeline та outcome counts. Деталі storage/report semantics і Telegram authorization: [STATUS](docs/STATUS.md) та [DECISIONS](docs/DECISIONS.md).
 
-Поточний deployment: CM4 / Ubuntu Server із `systemd` service `rf-sentinel.service`, автоматичним стартом при boot і deployed `main` на baseline HEAD. Operational artifacts: `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/status/run-summary.json`, `runtime/logs/rf-sentinel.log` і `runtime/reports/`. Unit/deployment environment є operational artifact target, а не committed repository unit. Lifecycle policy: усі `.local*` paths — disposable validation area; canonical characterization/calibration datasets є long-lived source records і мають зберігатися поза `.local*`; runtime DB/status/log/report artifacts — operational і керуються deployment/backup/retention policy. Цей cleanup datasets не переміщує. Runbook: [DEPLOYMENT](docs/DEPLOYMENT.md).
+Deployment target/runbook описує CM4 / Ubuntu Server із `systemd` service `rf-sentinel.service`, automatic boot start і operational artifacts: `runtime/sweeps.sqlite3`, `runtime/status/health.json`, `runtime/status/run-summary.json`, `runtime/logs/rf-sentinel.log` і `runtime/reports/`. Цей checkpoint не підтверджує, що software HEAD `740ca6c` уже deployed на CM4. Unit/deployment environment є operational artifact target, а не committed repository unit. Lifecycle policy: усі `.local*` paths — disposable validation area; canonical characterization/calibration datasets є long-lived source records і мають зберігатися поза `.local*`; runtime DB/status/log/report artifacts — operational і керуються deployment/backup/retention policy. Цей cleanup datasets не переміщує. Runbook: [DEPLOYMENT](docs/DEPLOYMENT.md).
 
 ## Документація
 
